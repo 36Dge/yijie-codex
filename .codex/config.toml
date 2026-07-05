@@ -1,0 +1,7 @@
+[workspace]
+name = "yijie-codex"
+stack = "Codex Runtime fork management"
+
+[rules]
+no_business_logic = true
+no_platform_tokens = true
