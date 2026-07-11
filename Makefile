@@ -1,4 +1,4 @@
-.PHONY: sync apply-patches build test lint generate
+.PHONY: sync apply-patches build test runtime-test lint generate
 
 sync:
 	./scripts/sync-upstream.sh
@@ -10,6 +10,9 @@ build:
 	./scripts/build-all.sh
 
 test:
+	./scripts/test-fork-management.sh
+
+runtime-test:
 	./scripts/test-runtime.sh
 
 lint:
