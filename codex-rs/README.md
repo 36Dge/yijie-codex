@@ -1,3 +1,3 @@
-# Codex Source Placeholder
+# Codex CLI
 
-Codex upstream source will be placed here after fork/clone strategy is confirmed.
+[**Codex CLI Documentation**](https://developers.openai.com/codex/cli)

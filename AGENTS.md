@@ -8,14 +8,16 @@
 
 `yijie-codex` 是 Codex Runtime 的易界 fork 管理仓库，负责固定上游版本、维护最小补丁集、构建 Runtime、执行兼容性验证和记录易界侧变更。
 
-当前仓库只有 fork 管理骨架：
+当前已完成 Runtime Baseline 0：
 
-- `UPSTREAM.md` 尚未配置上游地址和固定版本；
-- `codex-rs/` 尚未放入可构建的上游源码；
-- `.yijie/patches/` 尚无正式补丁；
-- 构建和 Runtime 测试脚本在源码缺失时会明确退出，不能把该结果视为验证通过。
+- 上游固定为 `https://github.com/openai/codex.git`；
+- tag 固定为 `rust-v0.144.6`，完整 commit 为 `5d1fbf26c43abc65a203928b2e31561cb039e06d`；
+- `codex-rs/` 是该 commit 的上游子树，`LICENSE` 和 `NOTICE` 同步保留；
+- `.yijie/patches/` 为空，脚本会验证零 patch；
+- macOS Apple Silicon release build、267 个 stable app-server JSON Schema、Schema 重生成比较和无凭据 stdio 初始化握手已通过；
+- 构建产物和 Runtime manifest 位于被忽略的 `.yijie/build/`，Schema 位于 `.yijie/schemas/app-server/`。
 
-Codex 不得擅自 clone 上游、添加或改写远端、选择版本、同步源码或创建核心补丁。执行这些动作前必须取得用户对上游地址、目标 tag/commit 和变更范围的明确确认。
+Baseline 0 不表示 Agent Host、真实模型 turn、MCP 工具、Desktop sidecar、签名或 cloud runner 已完成。Codex 不得擅自改变上游、固定版本、源码策略、transport、patch 集或发布目标；升级和核心修改仍必须取得用户明确确认。
 
 ## 仓库边界
 
@@ -27,9 +29,11 @@ Codex 不得擅自 clone 上游、添加或改写远端、选择版本、同步�
 
 ## 目录约定
 
-- `codex-rs/`：配置上游后承载上游 Runtime 工作树，尽量保留上游结构和工具链；
+- `codex-rs/`：固定 commit 的原样上游 Runtime 子树，不直接修改；
 - `.yijie/patches/`：按顺序保存必要且可审计的易界补丁；
 - `.yijie/config/`：保存不含秘密的 Runtime 配置样例；
+- `.yijie/schemas/app-server/`：固定 Runtime 生成、canonicalized 且提交的 stable app-server Schema；
+- `.yijie/build/`：不提交的 binary、解析 lock、lock 报告和 Runtime manifest；
 - `scripts/`：上游同步、补丁应用、构建和测试入口；
 - `UPSTREAM.md`：上游地址、固定版本、同步时间和兼容性结论；
 - `CHANGELOG.yijie.md`：易界侧行为变化及升级影响；
@@ -58,14 +62,20 @@ Codex 不得擅自 clone 上游、添加或改写远端、选择版本、同步�
 
 ```bash
 make lint          # 检查仓库脚本语法
-make test          # 验证 fork 管理骨架和脚本约束
-make sync          # 仅在上游已确认并正确配置后执行
-make apply-patches # 仅在补丁集已确认后执行
-make build         # 需要 codex-rs/Cargo.toml
-make runtime-test  # 需要可构建的 Runtime 源码
+make test          # 验证固定元数据、源码材料、零 patch 和脚本约束
+make sync          # 获取固定 tag，并幂等物化 codex-rs/LICENSE/NOTICE
+make apply-patches # Baseline 0 验证源码一致且 patch 集为空
+make build         # 用固定 Rust 工具链为 host 或指定 target 构建 release binary
+make generate      # 从构建 binary 生成并 canonicalize stable app-server Schema
+make runtime-test  # Schema 重生成比较、无凭据 stdio 握手和 manifest
+make runtime-baseline # 串联 sync、build、generate 和 runtime-test
 ```
 
-`make test` 通过只代表 fork 管理骨架有效，不代表 Codex Runtime 已构建或兼容。`make build` 或 `make runtime-test` 因源码缺失而退出时，必须如实报告为“未执行 Runtime 验证”。
+`make test` 通过只代表 fork 管理和固定材料有效。只有 `make build`、`make generate` 和 `make runtime-test` 都通过，才能声称 Baseline 0 的目标平台验证完成。
+
+上游 release tag 的 `Cargo.lock` 对本地 workspace package 仍使用 `0.0.0`。构建只能在临时工作树内正规化这些本地 package 到 `0.144.6`，并通过 `verify-release-lock-drift.py` 证明没有其它 lock 漂移；禁止把解析后的 lock 写回 `codex-rs/`。
+
+`codex-rs/target/` 是本地缓存，不属于上游一致性比较。不得手工编辑 `.yijie/schemas/app-server/generated-json-schema/`，必须通过固定 binary 重新生成。
 
 ## 完成标准
 

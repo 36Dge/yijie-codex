@@ -1,4 +1,4 @@
-.PHONY: sync apply-patches build test runtime-test lint generate
+.PHONY: sync apply-patches build test runtime-test lint generate runtime-baseline
 
 sync:
 	./scripts/sync-upstream.sh
@@ -17,6 +17,9 @@ runtime-test:
 
 lint:
 	bash -n scripts/*.sh
+	./scripts/lint-python.sh
 
 generate:
-	echo "No generated assets yet"
+	./scripts/generate-app-server-schema.sh
+
+runtime-baseline: sync apply-patches build generate runtime-test

@@ -1,3 +1,10 @@
 [runtime]
 mode = "test"
-upstream_configured = false
+upstream_configured = true
+upstream_tag = "rust-v0.144.6"
+upstream_commit = "5d1fbf26c43abc65a203928b2e31561cb039e06d"
+
+[app_server]
+transport = "stdio"
+experimental_api = false
+credential_free_smoke = true

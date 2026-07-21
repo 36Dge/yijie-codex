@@ -1,6 +1,6 @@
 # yijie-codex
 
-Codex Runtime 的易界 fork 管理仓库。当前只初始化 fork 管理骨架，不 clone 上游源码。
+Codex Runtime 的易界 fork 管理仓库。仓库固定上游源码、维持最小补丁集、构建 Runtime，并验证易界 Agent Host 所依赖的 app-server 协议。
 
 ## 仓库职责
 
@@ -19,4 +19,40 @@ Codex Runtime 的易界 fork 管理仓库。当前只初始化 fork 管理骨架
 
 ## 当前状态
 
-上游仓库 URL 尚未配置，`codex-rs/` 为空占位。
+Runtime Baseline 0 已建立：
+
+- 上游固定为 `openai/codex` 的 `rust-v0.144.6`；
+- 完整 commit 为 `5d1fbf26c43abc65a203928b2e31561cb039e06d`；
+- `codex-rs/` 与该 commit 的上游子树字节级一致；
+- 易界 patch 集为空；
+- 首个发布目标为 `aarch64-apple-darwin`；
+- app-server 客户端基线使用稳定 API、JSONL-over-stdio；
+- 版本匹配的 JSON Schema 位于 `.yijie/schemas/app-server/`。
+
+构建产物写入 `.yijie/build/<platform>/<target>/`，不提交 Git。产物目录包含 Runtime binary、解析后的构建 lock、lock 正规化报告和 `runtime-manifest.json`。
+
+## Runtime Baseline 0
+
+Baseline 0 是“固定上游、零补丁、可重放源码、可构建 binary、可重生成协议 Schema、可完成无凭据 stdio 握手”的最小 Runtime 基线。它不表示 Agent Host、Desktop sidecar、真实模型回合或云端 runner 已完成。
+
+详细定义和完成标准见 [`docs/runtime-baseline-0.md`](docs/runtime-baseline-0.md)。
+
+## 开发与验证
+
+```bash
+make lint
+make test
+make sync
+make apply-patches
+make build
+make generate
+make runtime-test
+```
+
+`make runtime-baseline` 串联全部步骤。默认构建当前 Rust host target；发布 macOS Apple Silicon 基线时设置：
+
+```bash
+YIJIE_RUNTIME_TARGET=aarch64-apple-darwin make runtime-baseline
+```
+
+构建要求 Rust `1.95.0`。`make runtime-test` 不读取用户现有 Codex 登录态，也不调用真实模型或平台服务。

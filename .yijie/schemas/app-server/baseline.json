@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "upstreamTag": "rust-v0.144.6",
+  "upstreamCommit": "5d1fbf26c43abc65a203928b2e31561cb039e06d",
+  "runtimeVersion": "0.144.6",
+  "rustToolchain": "1.95.0",
+  "primaryReleaseTarget": "aarch64-apple-darwin",
+  "experimentalApi": false,
+  "transport": "stdio"
+}
