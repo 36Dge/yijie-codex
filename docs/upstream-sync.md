@@ -13,7 +13,7 @@
 7. 审查 Schema diff、binary/Schema/lock hash 和兼容性结果；
 8. 更新 `CHANGELOG.yijie.md`、兼容性文档和下游通知。
 
-`make sync` 会添加缺失的 `upstream` remote，但拒绝接受 URL 不一致的已有 fetch remote，并把 upstream push URL 固定为 `DISABLED`。tag 必须解引用到固定 commit。源码先在临时目录生成；只有目标内容不同且目标无本地改动时才替换。
+`make sync` 会添加缺失的 `upstream` remote，但拒绝接受 URL 不一致的已有 fetch remote，并把 upstream push URL 固定为 `DISABLED`。tag 必须解引用到固定 commit。源码先在临时目录生成；只有目标内容不同且目标无本地改动时才替换。源码一致性比较只忽略 `target/` 和 Finder 生成的 `.DS_Store`；其他新增、删除或修改仍会使门禁失败。
 
 ## 禁止事项
 

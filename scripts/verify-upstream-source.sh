@@ -29,7 +29,7 @@ git archive "$YIJIE_CODEX_UPSTREAM_COMMIT:$YIJIE_CODEX_UPSTREAM_SUBTREE" \
 git archive "$YIJIE_CODEX_UPSTREAM_COMMIT" LICENSE NOTICE \
   | tar -x -C "$verify_dir/root"
 
-if ! diff -qr --exclude target codex-rs "$verify_dir/codex-rs"; then
+if ! runtime_source_diff codex-rs "$verify_dir/codex-rs"; then
   echo "codex-rs differs from the pinned zero-patch upstream source." >&2
   exit 1
 fi

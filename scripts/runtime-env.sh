@@ -77,3 +77,12 @@ runtime_binary_path() {
     *) printf '%s/codex\n' "$artifact_dir" ;;
   esac
 }
+
+runtime_source_diff() {
+  local source_dir="$1"
+  local expected_dir="$2"
+
+  # Finder metadata and Cargo build output are local workstation artifacts,
+  # not part of the pinned upstream source tree.
+  diff -qr --exclude target --exclude .DS_Store "$source_dir" "$expected_dir"
+}

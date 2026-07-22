@@ -53,7 +53,7 @@ fi
 if [ -d codex-rs ] \
   && [ -f LICENSE ] \
   && [ -f NOTICE ] \
-  && diff -qr --exclude target codex-rs "$sync_dir/codex-rs" >/dev/null \
+  && runtime_source_diff codex-rs "$sync_dir/codex-rs" >/dev/null \
   && cmp -s LICENSE "$sync_dir/root/LICENSE" \
   && cmp -s NOTICE "$sync_dir/root/NOTICE"; then
   echo "Codex source already matches $YIJIE_CODEX_UPSTREAM_TAG ($YIJIE_CODEX_UPSTREAM_COMMIT)."

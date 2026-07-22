@@ -55,6 +55,26 @@ if [ "$YIJIE_CODEX_RUST_TOOLCHAIN" != "1.95.0" ]; then
   exit 1
 fi
 
+source_diff_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/yijie-source-diff-test.XXXXXX")"
+cleanup_source_diff_test() {
+  rm -rf -- "$source_diff_test_dir"
+}
+trap cleanup_source_diff_test EXIT
+mkdir -p "$source_diff_test_dir/actual/target" "$source_diff_test_dir/expected"
+printf 'same\n' >"$source_diff_test_dir/actual/source.txt"
+printf 'same\n' >"$source_diff_test_dir/expected/source.txt"
+printf 'finder metadata\n' >"$source_diff_test_dir/actual/.DS_Store"
+printf 'build output\n' >"$source_diff_test_dir/actual/target/local.txt"
+if ! runtime_source_diff "$source_diff_test_dir/actual" "$source_diff_test_dir/expected" >/dev/null; then
+  echo "Runtime source comparison must ignore local Finder and Cargo artifacts." >&2
+  exit 1
+fi
+printf 'changed\n' >"$source_diff_test_dir/actual/source.txt"
+if runtime_source_diff "$source_diff_test_dir/actual" "$source_diff_test_dir/expected" >/dev/null; then
+  echo "Runtime source comparison failed to detect a real source difference." >&2
+  exit 1
+fi
+
 python3 - .yijie/schemas/app-server/baseline.json <<'PY'
 import json
 import sys
@@ -84,4 +104,4 @@ if [ "${#patches[@]}" -ne 0 ]; then
   exit 1
 fi
 
-echo "Fork-management metadata, pinned source, and scripts are valid."
+echo "Fork-management metadata and scripts are valid."
