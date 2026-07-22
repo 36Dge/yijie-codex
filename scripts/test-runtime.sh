@@ -36,5 +36,9 @@ python3 "$repo_root/scripts/write-runtime-manifest.py" \
   --runtime-version "$YIJIE_CODEX_RUNTIME_VERSION" \
   --rust-toolchain "$YIJIE_CODEX_RUST_TOOLCHAIN" \
   --lock-normalization "$artifact_dir/lock-normalization.json"
+python3 "$repo_root/scripts/check_agent_host_contracts.py" \
+  --repo-root "$repo_root" \
+  --contracts-repo "${YIJIE_CONTRACTS_REPO:-$repo_root/../yijie-contracts}" \
+  --runtime-manifest "$manifest_path"
 
 echo "Runtime Baseline 0 compatibility checks passed for $target."

@@ -15,6 +15,7 @@
 - `codex-rs/` 是该 commit 的上游子树，`LICENSE` 和 `NOTICE` 同步保留；
 - `.yijie/patches/` 为空，脚本会验证零 patch；
 - macOS Apple Silicon release build、267 个 stable app-server JSON Schema、Schema 重生成比较和无凭据 stdio 初始化握手已通过；
+- sibling `yijie-contracts` 存在时，Runtime identity、Schema tree 与 Agent Host method/notification 投影会由 `make runtime-test` 双向校验；独立 checkout 缺少 sibling 时明确跳过；
 - 构建产物和 Runtime manifest 位于被忽略的 `.yijie/build/`，Schema 位于 `.yijie/schemas/app-server/`。
 
 Baseline 0 不表示 Agent Host、真实模型 turn、MCP 工具、Desktop sidecar、签名或 cloud runner 已完成。Codex 不得擅自改变上游、固定版本、源码策略、transport、patch 集或发布目标；升级和核心修改仍必须取得用户明确确认。

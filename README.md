@@ -56,3 +56,6 @@ YIJIE_RUNTIME_TARGET=aarch64-apple-darwin make runtime-baseline
 ```
 
 构建要求 Rust `1.95.0`。`make runtime-test` 不读取用户现有 Codex 登录态，也不调用真实模型或平台服务。
+相邻 `yijie-contracts` checkout 存在时，它还会严格校验
+`compatibility/agent-host-runtime-v1.json`；可用 `YIJIE_CONTRACTS_REPO` 指定其它位置，
+未检出 sibling 时该跨仓检查会输出 `SKIP`，不影响独立仓验证。

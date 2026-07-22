@@ -16,6 +16,9 @@ required=(
   docs/yijie-patch-policy.md
   docs/runtime-compatibility.md
   docs/runtime-baseline-0.md
+  scripts/check_agent_host_contracts.py
+  scripts/runtime_manifest.py
+  scripts/test_agent_host_contracts.py
 )
 for file in "${required[@]}"; do
   if [ ! -s "$file" ]; then
@@ -95,6 +98,8 @@ for key, value in expected.items():
     if baseline.get(key) != value:
         raise SystemExit(f"Unexpected app-server baseline metadata for {key}")
 PY
+
+python3 scripts/test_agent_host_contracts.py
 
 shopt -s nullglob
 patches=(.yijie/patches/*.patch)

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a bidirectional `yijie-contracts` compatibility gate that pins the Runtime source, stable Schema tree, and exact Agent Host method/notification projection while remaining optional for standalone checkouts.
 - Ignore local `.DS_Store` metadata consistently in upstream sync and zero-patch source verification while retaining all substantive source-drift checks.
 - Establish Runtime Baseline 0 on upstream `rust-v0.144.6` commit `5d1fbf26c43abc65a203928b2e31561cb039e06d`.
 - Materialize the exact upstream `codex-rs/` subtree with Apache-2.0 license and notice files.
