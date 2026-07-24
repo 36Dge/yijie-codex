@@ -49,6 +49,16 @@ Baseline 0 不表示 Agent Host、真实模型 turn、MCP 工具、Desktop sidec
 - 可追溯：修改上游源码或补丁集时同步更新 `UPSTREAM.md`、`CHANGELOG.yijie.md` 和相关文档；
 - 尊重上游生成物、格式化规则和 lockfile 策略，不手改可由上游工具生成的文件。
 
+## Contract First 与上游权威源
+
+- 每个任务先标记 `contract-impact = none | additive | semantic | breaking`；分类覆盖跨进程、跨仓、跨版本及持久化/重放边界，app-server method/notification、schema、能力、错误、权限和版本匹配变化都属于契约影响，`none` 必须说明理由；
+- 按 `breaking > semantic > additive > none` 的最高风险唯一选择；任一受支持交互可能失效即 breaking，不确定时不能假定 additive/none；
+- Codex app-server 以上游固定 Runtime 及其 canonical schema 为权威：先固定 Runtime 候选并生成 schema，再更新 `yijie-contracts` 的 Agent Host 兼容投影，最后由 Agent Host/客户端消费；
+- Runtime candidate commit 可以先合并以产生完整 SHA/canonical schema，但此时默认不启用、不得宣称为易界受支持 baseline；contracts 固定投影且 Host 完成消费验证后，才能晋升/发布为受支持版本；
+- 不在 `yijie-contracts` 或 Agent Host 中反向发明 Runtime 协议，也不允许 Runtime 改动绕过兼容投影评审；
+- Runtime tag/完整 commit、schema tree digest、contracts 投影 tag/完整 commit 和双向兼容结果必须可追踪；独立 CI 缺少 sibling 而跳过时必须报告为未完成；
+- 下游实现不得在兼容投影可消费并精确 pin 前合并或启用；兄弟元仓存在时同时遵循 `../yijie/docs/dev/contract-first.md`。
+
 ## 必须先确认的决策
 
 遇到以下事项时停止实现并向用户确认，不根据猜测作决定：
@@ -85,4 +95,5 @@ make runtime-baseline # 串联 sync、build、generate 和 runtime-test
 - 涉及上游源码时，`make build` 和 `make runtime-test` 也通过；
 - 新增或调整补丁已验证可从固定版本重复应用和回滚；
 - 上游版本、补丁顺序、兼容性结果和易界侧变更记录保持同步；
+- 当 `contract-impact != none` 或涉及 Runtime 协议/版本时，Runtime/投影不可变引用、schema digest、双向兼容和部署/回滚顺序可追踪；`none` 只需分类理由；
 - 未完成的 Runtime 验证、风险和人工步骤在交付说明中明确列出。
