@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write a deterministic manifest for a built Runtime Baseline 0 artifact."""
+"""Write a deterministic manifest for a patched Runtime Baseline 0 artifact."""
 
 import argparse
 import json
@@ -22,6 +22,7 @@ def main() -> int:
     parser.add_argument("--runtime-version", required=True)
     parser.add_argument("--rust-toolchain", required=True)
     parser.add_argument("--lock-normalization", required=True, type=Path)
+    parser.add_argument("--patch-dir", required=True, type=Path)
     args = parser.parse_args()
 
     binary = args.binary.resolve()
@@ -32,6 +33,9 @@ def main() -> int:
         raise SystemExit(f"Schema directory is missing: {schema_dir}")
     if not args.lock_normalization.is_file():
         raise SystemExit(f"Lock normalization report is missing: {args.lock_normalization}")
+    patch_files = sorted(args.patch_dir.glob("*.patch"))
+    if len(patch_files) != 1:
+        raise SystemExit("Runtime manifest requires the reviewed single-patch overlay")
 
     reported_version = subprocess.run(
         [str(binary), "--version"],
@@ -56,7 +60,13 @@ def main() -> int:
             "tag": args.upstream_tag,
             "commit": args.upstream_commit,
         },
-        "patches": [],
+        "patches": [
+            {
+                "path": f".yijie/patches/{patch.name}",
+                "sha256": sha256_file(patch),
+            }
+            for patch in patch_files
+        ],
         "buildLock": json.loads(args.lock_normalization.read_text(encoding="utf-8")),
         "rustToolchain": args.rust_toolchain,
         "runtime": {

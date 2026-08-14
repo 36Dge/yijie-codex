@@ -101,12 +101,14 @@ PY
 
 python3 scripts/test_agent_host_contracts.py
 
+expected_patch=".yijie/patches/0001-feat-126-filter-persistent-diagnostics.patch"
 shopt -s nullglob
 patches=(.yijie/patches/*.patch)
 shopt -u nullglob
-if [ "${#patches[@]}" -ne 0 ]; then
-  echo "Runtime Baseline 0 requires an empty patch set." >&2
+if [ "${#patches[@]}" -ne 1 ] || [ "${patches[0]}" != "$expected_patch" ]; then
+  echo "Runtime patch set does not match the reviewed FEAT-126 overlay." >&2
   exit 1
 fi
+./scripts/apply-yijie-patches.sh
 
 echo "Fork-management metadata and scripts are valid."

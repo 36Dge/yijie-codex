@@ -24,7 +24,7 @@ Runtime Baseline 0 已建立：
 - 上游固定为 `openai/codex` 的 `rust-v0.144.6`；
 - 完整 commit 为 `5d1fbf26c43abc65a203928b2e31561cb039e06d`；
 - `codex-rs/` 与该 commit 的上游子树字节级一致；
-- 易界 patch 集为空；
+- 构建时应用一个可重放的 FEAT-126 持久诊断日志安全 patch；
 - 首个发布目标为 `aarch64-apple-darwin`；
 - app-server 客户端基线使用稳定 API、JSONL-over-stdio；
 - 版本匹配的 JSON Schema 位于 `.yijie/schemas/app-server/`。
@@ -33,7 +33,7 @@ Runtime Baseline 0 已建立：
 
 ## Runtime Baseline 0
 
-Baseline 0 是“固定上游、零补丁、可重放源码、可构建 binary、可重生成协议 Schema、可完成无凭据 stdio 握手”的最小 Runtime 基线。它不表示 Agent Host、Desktop sidecar、真实模型回合或云端 runner 已完成。
+Baseline 0 固定不可变上游源码、协议 Schema 和工具链。易界 overlay 只在临时构建工作区应用，当前单一 patch 收紧本地 SQLite 诊断日志，不改变 app-server 协议面。它不表示 Desktop sidecar、真实模型回合或云端 runner 已完成。
 
 详细定义和完成标准见 [`docs/runtime-baseline-0.md`](docs/runtime-baseline-0.md)。
 

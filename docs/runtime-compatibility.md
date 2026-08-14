@@ -6,7 +6,7 @@
 |---|---|
 | tag 解引用为固定 commit | 通过 |
 | `codex-rs/`、`LICENSE`、`NOTICE` 与上游一致 | 通过 |
-| 易界 patch 集为空 | 通过 |
+| canonical source 零漂移、reviewed patch 可重放 | 通过 |
 | Rust `1.95.0` release build | 通过 |
 | macOS Apple Silicon binary 版本为 `0.144.6` | 通过 |
 | stable app-server Schema 生成 | 267 个 JSON 文件 |

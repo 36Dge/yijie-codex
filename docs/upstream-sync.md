@@ -8,7 +8,7 @@
 2. 取得用户对新 upstream URL、tag、完整 commit、升级窗口和 patch 策略的明确确认；
 3. 更新 `.yijie/upstream.env` 和 `UPSTREAM.md`；
 4. 执行 `make sync`；
-5. 执行 `make apply-patches`，Baseline 0 必须报告空 patch；
+5. 执行 `make apply-patches`，确认 reviewed patch set 能从固定上游独立重放且 canonical source 未改变；
 6. 执行 `make build && make generate && make runtime-test`；
 7. 审查 Schema diff、binary/Schema/lock hash 和兼容性结果；
 8. 更新 `CHANGELOG.yijie.md`、兼容性文档和下游通知。

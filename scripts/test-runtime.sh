@@ -35,6 +35,7 @@ python3 "$repo_root/scripts/write-runtime-manifest.py" \
   --upstream-commit "$YIJIE_CODEX_UPSTREAM_COMMIT" \
   --runtime-version "$YIJIE_CODEX_RUNTIME_VERSION" \
   --rust-toolchain "$YIJIE_CODEX_RUST_TOOLCHAIN" \
+  --patch-dir "$repo_root/.yijie/patches" \
   --lock-normalization "$artifact_dir/lock-normalization.json"
 python3 "$repo_root/scripts/check_agent_host_contracts.py" \
   --repo-root "$repo_root" \

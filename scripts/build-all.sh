@@ -8,8 +8,6 @@ cd "$repo_root"
 source "$repo_root/scripts/runtime-env.sh"
 load_upstream_metadata "$repo_root"
 
-"$repo_root/scripts/apply-yijie-patches.sh"
-
 target="${YIJIE_RUNTIME_TARGET:-$(runtime_host_target)}"
 if [ -z "$target" ]; then
   echo "Unable to determine the Rust host target." >&2
@@ -38,6 +36,7 @@ build_workspace="$build_dir/codex-rs"
 mkdir -p "$build_workspace"
 git archive "$YIJIE_CODEX_UPSTREAM_COMMIT:$YIJIE_CODEX_UPSTREAM_SUBTREE" \
   | tar -x -C "$build_workspace"
+"$repo_root/scripts/apply-yijie-patches.sh" "$build_workspace"
 
 # The release tag updates workspace.package.version but its checked-in lockfile
 # retains 0.0.0 for local packages. Resolve in the disposable workspace, then

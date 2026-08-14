@@ -25,7 +25,11 @@
 
 ## Patch 顺序
 
-Runtime Baseline 0 的易界 patch 集为空。`.yijie/patches/` 中出现任何 `*.patch` 都会使 Baseline 0 验证失败。
+固定上游源码物化保持零漂移。构建时按文件名字典序向临时工作区应用：
+
+1. `0001-feat-126-filter-persistent-diagnostics.patch`：阻止路径承载的 HTTP、stream、shell、feedback 和根级 app-server 配置诊断进入本地 SQLite；保留经审查的 state 与 app-server 子 target 日志。该 patch 不改变 app-server schema 或 transport。
+
+patch 的相对路径和 SHA-256 进入 Runtime manifest。`make apply-patches` 必须从上述固定 commit 独立重放成功，且不得修改 canonical `codex-rs/` 物化目录。
 
 ## Release lock 正规化
 
@@ -37,7 +41,7 @@ Runtime Baseline 0 的易界 patch 集为空。`.yijie/patches/` 中出现任何
 
 在 `2026-07-21` 对 macOS Apple Silicon 完成：
 
-- 固定源码和零 patch 比对：通过；
+- 固定源码零漂移和单 patch 重放：通过；
 - `codex-cli 0.144.6` release 构建：通过；
 - stable app-server JSON Schema 生成：267 个文件；
 - Schema 独立重生成一致性：通过；

@@ -13,7 +13,7 @@
 - 上游固定为 `https://github.com/openai/codex.git`；
 - tag 固定为 `rust-v0.144.6`，完整 commit 为 `5d1fbf26c43abc65a203928b2e31561cb039e06d`；
 - `codex-rs/` 是该 commit 的上游子树，`LICENSE` 和 `NOTICE` 同步保留；
-- `.yijie/patches/` 为空，脚本会验证零 patch；
+- `.yijie/patches/` 包含一个经授权的 FEAT-126 持久诊断日志安全 patch，脚本会验证独立重放和 digest；
 - macOS Apple Silicon release build、267 个 stable app-server JSON Schema、Schema 重生成比较和无凭据 stdio 初始化握手已通过；
 - sibling `yijie-contracts` 存在时，Runtime identity、Schema tree 与 Agent Host method/notification 投影会由 `make runtime-test` 双向校验；独立 checkout 缺少 sibling 时明确跳过；
 - 构建产物和 Runtime manifest 位于被忽略的 `.yijie/build/`，Schema 位于 `.yijie/schemas/app-server/`。
@@ -31,7 +31,7 @@ Baseline 0 不表示 Agent Host、真实模型 turn、MCP 工具、Desktop sidec
 ## 目录约定
 
 - `codex-rs/`：固定 commit 的原样上游 Runtime 子树，不直接修改；
-- `.yijie/patches/`：按顺序保存必要且可审计的易界补丁；
+- `.yijie/patches/`：按顺序保存必要且可审计的易界补丁，仅应用到临时构建工作区；
 - `.yijie/config/`：保存不含秘密的 Runtime 配置样例；
 - `.yijie/schemas/app-server/`：固定 Runtime 生成、canonicalized 且提交的 stable app-server Schema；
 - `.yijie/build/`：不提交的 binary、解析 lock、lock 报告和 Runtime manifest；
@@ -73,9 +73,9 @@ Baseline 0 不表示 Agent Host、真实模型 turn、MCP 工具、Desktop sidec
 
 ```bash
 make lint          # 检查仓库脚本语法
-make test          # 验证固定元数据、源码材料、零 patch 和脚本约束
+make test          # 验证固定元数据、源码材料、reviewed patch 和脚本约束
 make sync          # 获取固定 tag，并幂等物化 codex-rs/LICENSE/NOTICE
-make apply-patches # Baseline 0 验证源码一致且 patch 集为空
+make apply-patches # 验证源码一致且 reviewed patch 可独立重放
 make build         # 用固定 Rust 工具链为 host 或指定 target 构建 release binary
 make generate      # 从构建 binary 生成并 canonicalize stable app-server Schema
 make runtime-test  # Schema 重生成比较、无凭据 stdio 握手和 manifest
