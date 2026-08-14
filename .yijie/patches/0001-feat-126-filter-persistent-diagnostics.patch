@@ -2,13 +2,16 @@ diff --git a/state/src/log_db.rs b/state/src/log_db.rs
 index b4581edbd..2d3a93f77 100644
 --- a/state/src/log_db.rs
 +++ b/state/src/log_db.rs
-@@ -53,9 +53,17 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+@@ -53,9 +53,20 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
  pub fn default_filter() -> Targets {
      Targets::new()
          .with_default(LevelFilter::TRACE)
 +        .with_target("codex_app_server", LevelFilter::OFF)
-+        .with_target("codex_app_server::message_processor", LevelFilter::TRACE)
++        .with_target("codex_api::sse::responses", LevelFilter::OFF)
++        .with_target("codex_app_server::message_processor", LevelFilter::OFF)
 +        .with_target("codex_app_server::outgoing_message", LevelFilter::TRACE)
++        .with_target("codex_core::session::handlers", LevelFilter::OFF)
++        .with_target("codex_core::session::session", LevelFilter::OFF)
 +        .with_target("codex_core::shell_snapshot", LevelFilter::OFF)
 +        .with_target("codex_core::stream_events_utils", LevelFilter::OFF)
 +        .with_target("codex_http_client", LevelFilter::OFF)
@@ -24,13 +27,13 @@ diff --git a/state/src/log_db_filter_tests.rs b/state/src/log_db_filter_tests.rs
 index 6c9d75f4d..ad5b372ad 100644
 --- a/state/src/log_db_filter_tests.rs
 +++ b/state/src/log_db_filter_tests.rs
-@@ -48,3 +48,67 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
+@@ -48,3 +48,74 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
  
      let _ = tokio::fs::remove_dir_all(codex_home).await;
  }
 +
 +#[tokio::test]
-+async fn default_filter_drops_path_bearing_diagnostics_and_keeps_reviewed_state_logs() {
++async fn default_filter_drops_persistent_diagnostics_and_keeps_reviewed_state_logs() {
 +    let codex_home = std::env::temp_dir().join(format!(
 +        "codex-state-log-db-default-filter-{}",
 +        Uuid::new_v4()
@@ -59,8 +62,15 @@ index 6c9d75f4d..ad5b372ad 100644
 +        target: "hyper_util::client::legacy::pool",
 +        "dropped-http-pool-diagnostic"
 +    );
++    tracing::trace!(target: "codex_api::sse::responses", "dropped-sse-response");
 +    tracing::trace!(
 +        target: "codex_app_server::message_processor",
++        "dropped-message-processor"
++    );
++    tracing::trace!(target: "codex_core::session::handlers", "dropped-session-handler");
++    tracing::trace!(target: "codex_core::session::session", "dropped-session-state");
++    tracing::trace!(
++        target: "codex_app_server::outgoing_message",
 +        "retained-reviewed-app-server-log"
 +    );
 +    tracing::info!(target: "codex_state", "retained-state-log");
@@ -83,7 +93,7 @@ index 6c9d75f4d..ad5b372ad 100644
 +        vec![
 +            (
 +                "TRACE",
-+                "codex_app_server::message_processor",
++                "codex_app_server::outgoing_message",
 +                Some("retained-reviewed-app-server-log")
 +            ),
 +            ("INFO", "codex_state", Some("retained-state-log")),
