@@ -2,7 +2,7 @@ diff --git a/state/src/log_db.rs b/state/src/log_db.rs
 index b4581edbd..2d3a93f77 100644
 --- a/state/src/log_db.rs
 +++ b/state/src/log_db.rs
-@@ -53,9 +53,20 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+@@ -53,9 +53,22 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
  pub fn default_filter() -> Targets {
      Targets::new()
          .with_default(LevelFilter::TRACE)
@@ -14,7 +14,9 @@ index b4581edbd..2d3a93f77 100644
 +        .with_target("codex_core::session::session", LevelFilter::OFF)
 +        .with_target("codex_core::shell_snapshot", LevelFilter::OFF)
 +        .with_target("codex_core::stream_events_utils", LevelFilter::OFF)
++        .with_target("codex_core::util", LevelFilter::OFF)
 +        .with_target("codex_http_client", LevelFilter::OFF)
++        .with_target("codex_rollout::recorder", LevelFilter::OFF)
          .with_target("log", LevelFilter::OFF)
          .with_target("codex_otel.log_only", LevelFilter::OFF)
          .with_target("codex_otel.trace_safe", LevelFilter::OFF)
@@ -27,7 +29,7 @@ diff --git a/state/src/log_db_filter_tests.rs b/state/src/log_db_filter_tests.rs
 index 6c9d75f4d..ad5b372ad 100644
 --- a/state/src/log_db_filter_tests.rs
 +++ b/state/src/log_db_filter_tests.rs
-@@ -48,3 +48,74 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
+@@ -48,3 +48,76 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
  
      let _ = tokio::fs::remove_dir_all(codex_home).await;
  }
@@ -69,6 +71,8 @@ index 6c9d75f4d..ad5b372ad 100644
 +    );
 +    tracing::trace!(target: "codex_core::session::handlers", "dropped-session-handler");
 +    tracing::trace!(target: "codex_core::session::session", "dropped-session-state");
++    tracing::error!(target: "codex_core::util", "dropped-core-util-diagnostic");
++    tracing::info!(target: "codex_rollout::recorder", "dropped-rollout-diagnostic");
 +    tracing::trace!(
 +        target: "codex_app_server::outgoing_message",
 +        "retained-reviewed-app-server-log"
