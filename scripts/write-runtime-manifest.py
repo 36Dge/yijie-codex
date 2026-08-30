@@ -10,6 +10,25 @@ from pathlib import Path
 from runtime_manifest import sha256_file, sha256_tree
 
 
+EXPECTED_PATCH_NAMES = (
+    "0001-feat-126-filter-persistent-diagnostics.patch",
+    "0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch",
+)
+
+
+def reviewed_patch_files(patch_dir: Path) -> list[Path]:
+    patch_files = sorted(patch_dir.glob("*.patch"))
+    patch_names = tuple(patch.name for patch in patch_files)
+    if patch_names != EXPECTED_PATCH_NAMES:
+        raise SystemExit(
+            "Runtime manifest requires the exact ordered FEAT-126/FEAT-136 patch set: "
+            f"expected={list(EXPECTED_PATCH_NAMES)!r}, got={list(patch_names)!r}"
+        )
+    if any(not patch.is_file() or patch.is_symlink() for patch in patch_files):
+        raise SystemExit("Runtime manifest patch set contains a missing or unsafe patch")
+    return patch_files
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
@@ -33,9 +52,7 @@ def main() -> int:
         raise SystemExit(f"Schema directory is missing: {schema_dir}")
     if not args.lock_normalization.is_file():
         raise SystemExit(f"Lock normalization report is missing: {args.lock_normalization}")
-    patch_files = sorted(args.patch_dir.glob("*.patch"))
-    if len(patch_files) != 1:
-        raise SystemExit("Runtime manifest requires the reviewed single-patch overlay")
+    patch_files = reviewed_patch_files(args.patch_dir)
 
     reported_version = subprocess.run(
         [str(binary), "--version"],

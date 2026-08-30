@@ -16,6 +16,9 @@ from runtime_manifest import sha256_tree
 COMPATIBILITY_RELATIVE_PATH = Path("compatibility/agent-host-runtime-v1.json")
 CANONICAL_RUNTIME_REPOSITORY = "https://github.com/36Dge/yijie-codex.git"
 EXPECTED_RUNTIME_METHODS = [
+    "skills/config/write",
+    "skills/extraRoots/set",
+    "skills/list",
     "thread/resume",
     "thread/start",
     "turn/interrupt",
@@ -24,10 +27,15 @@ EXPECTED_RUNTIME_METHODS = [
 EXPECTED_RUNTIME_NOTIFICATIONS = [
     "error",
     "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
     "item/completed",
+    "item/mcpToolCall/progress",
+    "item/reasoning/textDelta",
     "item/started",
+    "skills/changed",
     "thread/started",
     "turn/completed",
+    "turn/plan/updated",
     "turn/started",
     "warning",
 ]

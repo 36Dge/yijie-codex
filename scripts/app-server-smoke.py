@@ -12,20 +12,79 @@ import time
 from pathlib import Path
 
 
-def fail(message: str, process: subprocess.Popen[str] | None = None) -> None:
+NORMAL_SHUTDOWN_TIMEOUT_SECONDS = 3.0
+
+
+def close_process_stdin(process: subprocess.Popen[str]) -> None:
+    """Request normal app-server shutdown by delivering stdio EOF exactly once."""
+    stdin = process.stdin
+    if stdin is None:
+        return
+    try:
+        stdin.close()
+    except (BrokenPipeError, OSError):
+        # A concurrently exiting child may close its side of the pipe first.
+        pass
+    finally:
+        process.stdin = None
+
+
+def fail(
+    message: str,
+    process: subprocess.Popen[str] | None = None,
+    shutdown_timeout: float = NORMAL_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    shutdown_timed_out = False
     if process is not None and process.poll() is None:
-        process.terminate()
+        close_process_stdin(process)
         try:
-            process.wait(timeout=3)
+            process.wait(timeout=shutdown_timeout)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=3)
+            shutdown_timed_out = True
+    if shutdown_timed_out:
+        process_id = getattr(process, "pid", "unknown")
+        message = (
+            f"{message}\napp-server did not exit after stdin EOF within "
+            f"{shutdown_timeout:g}s; process {process_id} was left running and no forced "
+            "stop was attempted"
+        )
     stderr = ""
-    if process is not None and process.stderr is not None:
+    if (
+        process is not None
+        and not shutdown_timed_out
+        and process.poll() is not None
+        and process.stderr is not None
+    ):
         stderr = process.stderr.read().strip()
     if stderr:
         message = f"{message}\napp-server stderr:\n{stderr}"
     raise SystemExit(message)
+
+
+def read_runtime_version(binary: Path, timeout: float) -> str:
+    process = subprocess.Popen(
+        [str(binary), "--version"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        fail(
+            "Runtime --version did not exit after stdin EOF",
+            process,
+            shutdown_timeout=0,
+        )
+    if process.returncode != 0:
+        detail = stderr.strip()
+        message = f"Runtime --version exited with status {process.returncode}"
+        if detail:
+            message = f"{message}\nRuntime stderr:\n{detail}"
+        raise SystemExit(message)
+    return stdout.strip()
 
 
 def read_json_line(process: subprocess.Popen[str], timeout: float) -> dict:
@@ -71,13 +130,7 @@ def main() -> int:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         fail(f"Runtime binary is not executable: {binary}")
 
-    version = subprocess.run(
-        [str(binary), "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=args.timeout_seconds,
-    ).stdout.strip()
+    version = read_runtime_version(binary, args.timeout_seconds)
     if args.expected_version not in version:
         fail(f"Expected runtime {args.expected_version}, got {version!r}")
 
@@ -138,13 +191,12 @@ def main() -> int:
         initialized = {"method": "initialized", "params": {}}
         process.stdin.write(json.dumps(initialized, separators=(",", ":")) + "\n")
         process.stdin.flush()
-        process.stdin.close()
-        process.stdin = None
+        close_process_stdin(process)
 
         try:
             return_code = process.wait(timeout=args.timeout_seconds)
         except subprocess.TimeoutExpired:
-            fail("app-server did not exit after stdio closed", process)
+            fail("app-server did not exit after stdio closed", process, shutdown_timeout=0)
         if return_code != 0:
             fail(f"app-server exited with status {return_code}", process)
 

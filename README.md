@@ -24,7 +24,7 @@ Runtime Baseline 0 已建立：
 - 上游固定为 `openai/codex` 的 `rust-v0.144.6`；
 - 完整 commit 为 `5d1fbf26c43abc65a203928b2e31561cb039e06d`；
 - `codex-rs/` 与该 commit 的上游子树字节级一致；
-- 构建时应用一个可重放的 FEAT-126 持久诊断日志安全 patch；
+- 当前 Runtime candidate 构建时严格按 `0001` → `0002` 应用两个可重放 patch：FEAT-126 持久诊断日志安全 patch，以及 Owner 单独授权的 FEAT-136 early sandbox-denial Command lifecycle patch；
 - 首个发布目标为 `aarch64-apple-darwin`；
 - app-server 客户端基线使用稳定 API、JSONL-over-stdio；
 - 版本匹配的 JSON Schema 位于 `.yijie/schemas/app-server/`。
@@ -33,7 +33,11 @@ Runtime Baseline 0 已建立：
 
 ## Runtime Baseline 0
 
-Baseline 0 固定不可变上游源码、协议 Schema 和工具链。易界 overlay 只在临时构建工作区应用，当前单一 patch 收紧本地 SQLite 诊断日志，不改变 app-server 协议面。它不表示 Desktop sidecar、真实模型回合或云端 runner 已完成。
+Baseline 0 固定不可变上游源码、协议 Schema 和工具链。易界 overlay 只在临时构建工作区应用。`0001-feat-126-filter-persistent-diagnostics.patch` 收紧本地 SQLite 诊断日志；`0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` 在 early sandbox-denial 返回发生在既有 emitter 之前时，补发同一 Command identity 的 canonical `item/started` 与 failed `item/completed`，但不改变原错误、retry/approval 决策、权限或 sandbox 策略。
+
+FEAT-136 的 `contract-impact` 为 `semantic`。当前预计 stable app-server Schema shape 不变，但必须由最终隔离 release build、Schema 生成和逐文件比较确认。focused `codex-core`、4 个 safe fake exec-server 场景、`codex-app-server-protocol`、fmt、scoped clippy 及 fork-management 门禁已经通过；这不等同于完整 build、generate、runtime-test 或 Runtime→Contracts→Host→Desktop conformance 已通过。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍固定此前 Runtime provenance，必须在 Runtime candidate 形成不可变 commit 并确认 Schema digest 后由新的 Contracts candidate 重新 pin。Tool D4 未执行，且本 patch 不制造 Tool producer。
+
+它不表示 Desktop sidecar、真实模型回合或云端 runner 已完成。
 
 详细定义和完成标准见 [`docs/runtime-baseline-0.md`](docs/runtime-baseline-0.md)。
 

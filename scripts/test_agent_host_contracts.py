@@ -14,6 +14,8 @@ from check_agent_host_contracts import (
     CANONICAL_RUNTIME_REPOSITORY,
     COMPATIBILITY_RELATIVE_PATH,
     EXPECTED_HOST_PROJECTION,
+    EXPECTED_RUNTIME_METHODS,
+    EXPECTED_RUNTIME_NOTIFICATIONS,
     CompatibilityError,
     check_sibling,
     validate_compatibility,
@@ -57,7 +59,7 @@ class Fixture:
         )
         self.manifest = {
             "schema_version": 1,
-            "contracts_version": "0.2.0",
+            "contracts_version": "0.7.0",
             "runtime": {
                 "repository": CANONICAL_RUNTIME_REPOSITORY,
                 "repository_commit": COMMIT,
@@ -127,6 +129,38 @@ class AgentHostContractsCompatibilityTests(unittest.TestCase):
 
     def test_valid_manifest_matches_source_schemas_and_runtime_artifact(self) -> None:
         self.validate()
+
+    def test_expected_projection_is_exactly_contracts_v070(self) -> None:
+        self.assertEqual(
+            EXPECTED_RUNTIME_METHODS,
+            [
+                "skills/config/write",
+                "skills/extraRoots/set",
+                "skills/list",
+                "thread/resume",
+                "thread/start",
+                "turn/interrupt",
+                "turn/start",
+            ],
+        )
+        self.assertEqual(
+            EXPECTED_RUNTIME_NOTIFICATIONS,
+            [
+                "error",
+                "item/agentMessage/delta",
+                "item/commandExecution/outputDelta",
+                "item/completed",
+                "item/mcpToolCall/progress",
+                "item/reasoning/textDelta",
+                "item/started",
+                "skills/changed",
+                "thread/started",
+                "turn/completed",
+                "turn/plan/updated",
+                "turn/started",
+                "warning",
+            ],
+        )
 
     def test_missing_sibling_is_an_explicit_non_blocking_skip(self) -> None:
         missing = Path(self.temporary.name) / "not-checked-out"

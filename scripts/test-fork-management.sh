@@ -17,8 +17,12 @@ required=(
   docs/runtime-compatibility.md
   docs/runtime-baseline-0.md
   scripts/check_agent_host_contracts.py
+  scripts/app-server-smoke.py
   scripts/runtime_manifest.py
+  scripts/test_app_server_smoke.py
   scripts/test_agent_host_contracts.py
+  scripts/test_write_runtime_manifest.py
+  scripts/write-runtime-manifest.py
 )
 for file in "${required[@]}"; do
   if [ ! -s "$file" ]; then
@@ -100,15 +104,26 @@ for key, value in expected.items():
 PY
 
 python3 scripts/test_agent_host_contracts.py
+python3 scripts/test_app_server_smoke.py
+python3 scripts/test_write_runtime_manifest.py
 
-expected_patch=".yijie/patches/0001-feat-126-filter-persistent-diagnostics.patch"
-shopt -s nullglob
+expected_patches=(
+  ".yijie/patches/0001-feat-126-filter-persistent-diagnostics.patch"
+  ".yijie/patches/0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch"
+)
+shopt -s nullglob dotglob
 patches=(.yijie/patches/*.patch)
-shopt -u nullglob
-if [ "${#patches[@]}" -ne 1 ] || [ "${patches[0]}" != "$expected_patch" ]; then
-  echo "Runtime patch set does not match the reviewed FEAT-126 overlay." >&2
+shopt -u dotglob nullglob
+if [ "${#patches[@]}" -ne "${#expected_patches[@]}" ]; then
+  echo "Runtime patch set does not match the reviewed FEAT-126/FEAT-136 overlays." >&2
   exit 1
 fi
+for index in "${!expected_patches[@]}"; do
+  if [ "${patches[$index]}" != "${expected_patches[$index]}" ]; then
+    echo "Runtime patch set order does not match the reviewed FEAT-126/FEAT-136 overlays." >&2
+    exit 1
+  fi
+done
 ./scripts/apply-yijie-patches.sh
 
 echo "Fork-management metadata and scripts are valid."

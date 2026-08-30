@@ -1,0 +1,535 @@
+diff --git a/app-server-protocol/src/protocol/event_mapping.rs b/app-server-protocol/src/protocol/event_mapping.rs
+index 6d6012e..6ba85c4 100644
+--- a/app-server-protocol/src/protocol/event_mapping.rs
++++ b/app-server-protocol/src/protocol/event_mapping.rs
+@@ -466,12 +466,22 @@ pub fn item_event_to_server_notification(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::protocol::v2::CommandExecutionStatus;
+     use codex_protocol::ThreadId;
++    use codex_protocol::items::CommandExecutionItem as CoreCommandExecutionItem;
++    use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
++    use codex_protocol::items::TurnItem as CoreTurnItem;
++    use codex_protocol::parse_command::ParsedCommand;
+     use codex_protocol::protocol::CollabResumeBeginEvent;
+     use codex_protocol::protocol::CollabResumeEndEvent;
+     use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
++    use codex_protocol::protocol::ExecCommandSource;
+     use codex_protocol::protocol::ExecOutputStream;
++    use codex_protocol::protocol::ItemCompletedEvent;
++    use codex_protocol::protocol::ItemStartedEvent;
++    use codex_utils_path_uri::PathUri;
+     use pretty_assertions::assert_eq;
++    use std::time::Duration;
+
+     fn assert_item_started_server_notification(
+         notification: ServerNotification,
+@@ -608,4 +618,112 @@ mod tests {
+             },
+         );
+     }
++
++    #[test]
++    fn nonzero_sandbox_denial_lifecycle_maps_to_canonical_v2_command_notifications() {
++        let thread_id = ThreadId::new();
++        let cwd = PathUri::from_host_native_path(std::env::temp_dir()).expect("absolute cwd");
++        let command = vec!["demo".to_string(), "--read-only".to_string()];
++        let parsed_cmd = vec![ParsedCommand::Unknown {
++            cmd: "demo --read-only".to_string(),
++        }];
++        let started_at_ms = 1_000;
++        let completed_at_ms = 1_007;
++
++        let started = item_event_to_server_notification(
++            EventMsg::ItemStarted(ItemStartedEvent {
++                thread_id,
++                turn_id: "turn-1".to_string(),
++                item: CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
++                    id: "call-early-sandbox-denied".to_string(),
++                    process_id: Some("321".to_string()),
++                    command: command.clone(),
++                    cwd: cwd.clone(),
++                    parsed_cmd: parsed_cmd.clone(),
++                    source: ExecCommandSource::UnifiedExecStartup,
++                    interaction_input: None,
++                    status: CoreCommandExecutionStatus::InProgress,
++                    stdout: None,
++                    stderr: None,
++                    aggregated_output: None,
++                    exit_code: None,
++                    duration: None,
++                    formatted_output: None,
++                }),
++                started_at_ms,
++            }),
++            "thread-1",
++            "turn-1",
++        );
++        let ServerNotification::ItemStarted(started) = started else {
++            panic!("expected item/started notification");
++        };
++        let ThreadItem::CommandExecution {
++            id: started_id,
++            process_id: started_process_id,
++            status: started_status,
++            aggregated_output: started_output,
++            exit_code: started_exit_code,
++            duration_ms: started_duration,
++            ..
++        } = started.item
++        else {
++            panic!("expected command execution item");
++        };
++        assert_eq!(started.started_at_ms, started_at_ms);
++        assert_eq!(started_id, "call-early-sandbox-denied");
++        assert_eq!(started_process_id.as_deref(), Some("321"));
++        assert_eq!(started_status, CommandExecutionStatus::InProgress);
++        assert_eq!(started_output, None);
++        assert_eq!(started_exit_code, None);
++        assert_eq!(started_duration, None);
++
++        let completed = item_event_to_server_notification(
++            EventMsg::ItemCompleted(ItemCompletedEvent {
++                thread_id,
++                turn_id: "turn-1".to_string(),
++                item: CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
++                    id: "call-early-sandbox-denied".to_string(),
++                    process_id: Some("321".to_string()),
++                    command,
++                    cwd,
++                    parsed_cmd,
++                    source: ExecCommandSource::UnifiedExecStartup,
++                    interaction_input: None,
++                    status: CoreCommandExecutionStatus::Failed,
++                    stdout: Some(String::new()),
++                    stderr: Some("sandbox denied".to_string()),
++                    aggregated_output: Some("sandbox denied".to_string()),
++                    exit_code: Some(128),
++                    duration: Some(Duration::from_millis(7)),
++                    formatted_output: Some("sandbox denied".to_string()),
++                }),
++                completed_at_ms,
++            }),
++            "thread-1",
++            "turn-1",
++        );
++        let ServerNotification::ItemCompleted(completed) = completed else {
++            panic!("expected item/completed notification");
++        };
++        let ThreadItem::CommandExecution {
++            id: completed_id,
++            process_id: completed_process_id,
++            status: completed_status,
++            aggregated_output,
++            exit_code,
++            duration_ms,
++            ..
++        } = completed.item
++        else {
++            panic!("expected command execution item");
++        };
++        assert_eq!(completed.completed_at_ms, completed_at_ms);
++        assert_eq!(completed_id, started_id);
++        assert_eq!(completed_process_id, started_process_id);
++        assert_eq!(completed_status, CommandExecutionStatus::Failed);
++        assert_eq!(aggregated_output.as_deref(), Some("sandbox denied"));
++        assert_eq!(exit_code, Some(128));
++        assert_eq!(duration_ms, Some(7));
++    }
+ }
+diff --git a/core/src/tools/events.rs b/core/src/tools/events.rs
+index 628e6ce..21223ac 100644
+--- a/core/src/tools/events.rs
++++ b/core/src/tools/events.rs
+@@ -123,6 +123,52 @@ pub(crate) async fn emit_exec_command_begin(
+         )
+         .await;
+ }
++
++pub(crate) async fn emit_unified_exec_denied_lifecycle(
++    ctx: ToolEventCtx<'_>,
++    command: &[String],
++    cwd: &PathUri,
++    source: ExecCommandSource,
++    process_id: Option<&str>,
++    output: ExecToolCallOutput,
++) {
++    let parsed_cmd = parse_command(command);
++    emit_exec_command_begin(
++        ctx,
++        command,
++        cwd,
++        &parsed_cmd,
++        source,
++        /*interaction_input*/ None,
++        process_id,
++    )
++    .await;
++    let exec_result = ExecCommandResult {
++        stdout: output.stdout.text.clone(),
++        stderr: output.stderr.text.clone(),
++        aggregated_output: output.aggregated_output.text.clone(),
++        exit_code: output.exit_code,
++        duration: output.duration,
++        formatted_output: format_exec_output_str(
++            &output,
++            ctx.turn.model_info.truncation_policy.into(),
++        ),
++        status: ExecCommandStatus::Failed,
++    };
++    emit_exec_end(
++        ctx,
++        ExecCommandInput::new(
++            command,
++            cwd,
++            &parsed_cmd,
++            source,
++            /*interaction_input*/ None,
++            process_id,
++        ),
++        exec_result,
++    )
++    .await;
++}
+ // Concrete, allocation-free emitter: avoid trait objects and boxed futures.
+ pub(crate) enum ToolEmitter {
+     Shell {
+diff --git a/core/src/unified_exec/process_manager.rs b/core/src/unified_exec/process_manager.rs
+index fe3ec45..4c39307 100644
+--- a/core/src/unified_exec/process_manager.rs
++++ b/core/src/unified_exec/process_manager.rs
+@@ -25,6 +25,7 @@ use crate::tools::context::ExecCommandToolOutput;
+ use crate::tools::events::ToolEmitter;
+ use crate::tools::events::ToolEventCtx;
+ use crate::tools::events::ToolEventStage;
++use crate::tools::events::emit_unified_exec_denied_lifecycle;
+ use crate::tools::network_approval::DeferredNetworkApproval;
+ use crate::tools::network_approval::finish_deferred_network_approval;
+ use crate::tools::orchestrator::ToolOrchestrator;
+@@ -60,6 +61,7 @@ use codex_network_proxy::NetworkProxy;
+ use codex_protocol::config_types::ShellEnvironmentPolicy;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::error::SandboxErr;
++use codex_protocol::exec_output::ExecToolCallOutput;
+ use codex_protocol::protocol::ExecCommandSource;
+ use codex_sandboxing::SandboxCommand;
+ use codex_tools::ToolName;
+@@ -344,6 +346,30 @@ async fn emit_failed_initial_exec_end_if_unstored(
+     .await;
+ }
+
++async fn emit_early_sandbox_denied_exec_lifecycle(
++    context: &UnifiedExecContext,
++    request: &ExecCommandRequest,
++    cwd: PathUri,
++    output: ExecToolCallOutput,
++) {
++    let event_ctx = ToolEventCtx::new(
++        context.session.as_ref(),
++        context.turn.as_ref(),
++        &context.call_id,
++        /*turn_diff_tracker*/ None,
++    );
++    let process_id = request.process_id.to_string();
++    emit_unified_exec_denied_lifecycle(
++        event_ctx,
++        &request.command,
++        &cwd,
++        ExecCommandSource::UnifiedExecStartup,
++        Some(&process_id),
++        output,
++    )
++    .await;
++}
++
+ fn terminate_process_on_network_denial(
+     process: Arc<UnifiedExecProcess>,
+     session: std::sync::Weak<crate::session::session::Session>,
+@@ -420,6 +446,15 @@ impl UnifiedExecProcessManager {
+                 (Arc::new(process), deferred_network_approval)
+             }
+             Err(err) => {
++                if let UnifiedExecError::SandboxDenied { output, .. } = &err {
++                    emit_early_sandbox_denied_exec_lifecycle(
++                        context,
++                        &request,
++                        cwd.clone(),
++                        output.clone(),
++                    )
++                    .await;
++                }
+                 self.release_process_id(request.process_id).await;
+                 return Err(err);
+             }
+diff --git a/core/src/unified_exec/process_manager_tests.rs b/core/src/unified_exec/process_manager_tests.rs
+index 20a930b..015c2ad 100644
+--- a/core/src/unified_exec/process_manager_tests.rs
++++ b/core/src/unified_exec/process_manager_tests.rs
+@@ -1,6 +1,8 @@
+ use super::*;
+ use crate::unified_exec::clamp_yield_time;
+ use codex_network_proxy::ManagedNetworkSandboxContext;
++use codex_protocol::exec_output::ExecToolCallOutput;
++use codex_protocol::exec_output::StreamOutput;
+ use pretty_assertions::assert_eq;
+ use tokio::time::Duration;
+ use tokio::time::Instant;
+@@ -336,6 +338,144 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
+     );
+ }
+
++#[tokio::test]
++async fn early_sandbox_denial_forces_failed_lifecycle_without_rewriting_exit_code() {
++    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
++    let context = UnifiedExecContext::new(
++        Arc::clone(&session),
++        Arc::clone(&turn),
++        "call-early-sandbox-denied".to_string(),
++    );
++    let request = ExecCommandRequest {
++        command: vec!["demo".to_string(), "--read-only".to_string()],
++        shell_type: crate::shell::ShellType::Sh,
++        hook_command: "demo --read-only".to_string(),
++        process_id: 321,
++        yield_time_ms: 1000,
++        max_output_tokens: None,
++        #[allow(deprecated)]
++        cwd: turn.cwd.clone().into(),
++        #[allow(deprecated)]
++        sandbox_cwd: turn.cwd.clone().into(),
++        turn_environment: turn
++            .environments
++            .primary()
++            .cloned()
++            .expect("primary environment"),
++        shell_mode: codex_tools::UnifiedExecShellMode::Direct,
++        network: None,
++        tty: true,
++        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
++        additional_permissions: None,
++        additional_permissions_preapproved: false,
++        justification: None,
++        prefix_rule: None,
++    };
++    let output = ExecToolCallOutput {
++        exit_code: 0,
++        stdout: StreamOutput::new(String::new()),
++        stderr: StreamOutput::new("sandbox denied".to_string()),
++        aggregated_output: StreamOutput::new("sandbox denied".to_string()),
++        duration: Duration::from_millis(7),
++        timed_out: false,
++    };
++
++    emit_early_sandbox_denied_exec_lifecycle(
++        &context,
++        &request,
++        #[allow(deprecated)]
++        turn.cwd.clone().into(),
++        output,
++    )
++    .await;
++
++    let mut started_item = None;
++    let mut completed_item = None;
++    let mut lifecycle = Vec::new();
++    while started_item.is_none() || completed_item.is_none() {
++        let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
++            .await
++            .expect("timed out waiting for command execution lifecycle")
++            .expect("event channel closed");
++        match event.msg {
++            codex_protocol::protocol::EventMsg::ItemStarted(started_event) => {
++                let codex_protocol::items::TurnItem::CommandExecution(item) = started_event.item
++                else {
++                    continue;
++                };
++                assert!(
++                    started_item.replace(item).is_none(),
++                    "duplicate ItemStarted"
++                );
++                lifecycle.push("started");
++            }
++            codex_protocol::protocol::EventMsg::ItemCompleted(completed_event) => {
++                let codex_protocol::items::TurnItem::CommandExecution(item) = completed_event.item
++                else {
++                    continue;
++                };
++                assert!(
++                    completed_item.replace(item).is_none(),
++                    "duplicate ItemCompleted"
++                );
++                lifecycle.push("completed");
++            }
++            _ => {}
++        }
++    }
++
++    assert_eq!(lifecycle, ["started", "completed"]);
++
++    let started_item = started_item.expect("started command execution item");
++    assert_eq!(started_item.id, "call-early-sandbox-denied");
++    assert_eq!(
++        started_item.status,
++        codex_protocol::items::CommandExecutionStatus::InProgress
++    );
++    assert_eq!(started_item.process_id.as_deref(), Some("321"));
++    assert_eq!(started_item.exit_code, None);
++    assert_eq!(started_item.duration, None);
++
++    let completed_item = completed_item.expect("completed command execution item");
++    assert_eq!(completed_item.id, "call-early-sandbox-denied");
++    assert_eq!(
++        completed_item.status,
++        codex_protocol::items::CommandExecutionStatus::Failed
++    );
++    assert_eq!(completed_item.process_id.as_deref(), Some("321"));
++    assert_eq!(completed_item.exit_code, Some(0));
++    assert_eq!(completed_item.duration, Some(Duration::from_millis(7)));
++    assert_eq!(
++        completed_item.aggregated_output.as_deref(),
++        Some("sandbox denied")
++    );
++
++    while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(25), rx_event.recv()).await
++    {
++        match event.msg {
++            codex_protocol::protocol::EventMsg::ItemStarted(event)
++                if matches!(
++                    event.item,
++                    codex_protocol::items::TurnItem::CommandExecution(ref item)
++                        if item.id == "call-early-sandbox-denied"
++                ) =>
++            {
++                panic!("duplicate ItemStarted")
++            }
++            codex_protocol::protocol::EventMsg::ItemCompleted(event)
++                if matches!(
++                    event.item,
++                    codex_protocol::items::TurnItem::CommandExecution(ref item)
++                        if item.id == "call-early-sandbox-denied"
++                ) =>
++            {
++                panic!("duplicate ItemCompleted")
++            }
++            _ => {}
++        }
++    }
++}
++
+ #[test]
+ fn pruning_prefers_exited_processes_outside_recently_used() {
+     let now = Instant::now();
+diff --git a/core/tests/suite/unified_exec_process_events.rs b/core/tests/suite/unified_exec_process_events.rs
+index 8ebd332..15f8868 100644
+--- a/core/tests/suite/unified_exec_process_events.rs
++++ b/core/tests/suite/unified_exec_process_events.rs
+@@ -3,6 +3,9 @@ use anyhow::Result;
+ use base64::Engine;
+ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+ use codex_features::Feature;
++use codex_protocol::items::CommandExecutionItem;
++use codex_protocol::items::CommandExecutionStatus;
++use codex_protocol::items::TurnItem;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::EventMsg;
+@@ -435,6 +438,10 @@ async fn exec_command_consumes_pushed_remote_process_events(
+         })
+         .await?;
+     let mut saw_exec_command_begin = false;
++    let mut started_command_items = Vec::new();
++    let mut completed_command_items = Vec::new();
++    let mut canonical_lifecycle = Vec::new();
++    let mut output_delta_count = 0;
+     loop {
+         let event = timeout(Duration::from_secs(5), test.codex.next_event())
+             .await
+@@ -444,6 +451,25 @@ async fn exec_command_consumes_pushed_remote_process_events(
+             EventMsg::ExecCommandBegin(event) if event.call_id == CALL_ID => {
+                 saw_exec_command_begin = true;
+             }
++            EventMsg::ExecCommandOutputDelta(event) if event.call_id == CALL_ID => {
++                output_delta_count += 1;
++            }
++            EventMsg::ItemStarted(event) => {
++                if let TurnItem::CommandExecution(item) = event.item
++                    && item.id == CALL_ID
++                {
++                    started_command_items.push(item);
++                    canonical_lifecycle.push("started");
++                }
++            }
++            EventMsg::ItemCompleted(event) => {
++                if let TurnItem::CommandExecution(item) = event.item
++                    && item.id == CALL_ID
++                {
++                    completed_command_items.push(item);
++                    canonical_lifecycle.push("completed");
++                }
++            }
+             EventMsg::TurnComplete(_) => break,
+             _ => {}
+         }
+@@ -467,12 +493,24 @@ async fn exec_command_consumes_pushed_remote_process_events(
+             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
+         }
+         PushedExecScenario::DirectDenied => {
+-            assert!(!saw_exec_command_begin);
++            assert!(saw_exec_command_begin);
++            assert_failed_command_lifecycle(
++                &started_command_items,
++                &completed_command_items,
++                &canonical_lifecycle,
++                output_delta_count,
++            );
+             assert!(output.contains("Process exited with code 1"));
+             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
+         }
+         PushedExecScenario::LegacyExit => {
+-            assert!(!saw_exec_command_begin);
++            assert!(saw_exec_command_begin);
++            assert_failed_command_lifecycle(
++                &started_command_items,
++                &completed_command_items,
++                &canonical_lifecycle,
++                output_delta_count,
++            );
+             assert!(output.contains("Process exited with code 1"));
+             assert_eq!(process_read_requests, 1, "expected compatibility read");
+         }
+@@ -487,3 +525,34 @@ async fn exec_command_consumes_pushed_remote_process_events(
+
+     Ok(())
+ }
++
++fn assert_failed_command_lifecycle(
++    started_items: &[CommandExecutionItem],
++    completed_items: &[CommandExecutionItem],
++    lifecycle: &[&str],
++    output_delta_count: usize,
++) {
++    assert_eq!(started_items.len(), 1, "expected exactly one item/started");
++    assert_eq!(
++        completed_items.len(),
++        1,
++        "expected exactly one item/completed"
++    );
++    assert_eq!(lifecycle, ["started", "completed"]);
++    assert_eq!(output_delta_count, 0, "short denial should emit no delta");
++
++    let started = &started_items[0];
++    let completed = &completed_items[0];
++    assert_eq!(started.id, CALL_ID);
++    assert_eq!(completed.id, started.id);
++    assert_eq!(completed.process_id, started.process_id);
++    assert_eq!(started.status, CommandExecutionStatus::InProgress);
++    assert_eq!(started.exit_code, None);
++    assert_eq!(started.duration, None);
++    assert_eq!(started.aggregated_output, None);
++
++    assert_eq!(completed.status, CommandExecutionStatus::Failed);
++    assert_eq!(completed.exit_code, Some(1));
++    assert_eq!(completed.duration, Some(Duration::ZERO));
++    assert_eq!(completed.aggregated_output.as_deref(), Some(""));
++}
