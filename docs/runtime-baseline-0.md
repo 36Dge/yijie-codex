@@ -6,7 +6,7 @@ Runtime Baseline 0 是易界首次可消费的 Codex Runtime 技术基线。它�
 
 Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得到同一协议面、Agent Host 可以从哪里开始适配”。它不负责跨境电商业务逻辑，也不宣称真实任务链路已完成。
 
-此前受支持的易界 Runtime commit 为 `0ce5902ed400866be0196886bb78f693a004d68d`，只包含 FEAT-126 `0001`。当前 FEAT-136 工作是在相同上游源码上增加 Owner 单独授权的 `0002` candidate；在最终隔离 build/generate/runtime-test、Contracts repin 和下游 conformance 完成前，它不是新的受支持 Baseline。
+此前受支持的易界 Runtime commit 为 `0ce5902ed400866be0196886bb78f693a004d68d`，只包含 FEAT-126 `0001`。当前 FEAT-136 工作是在相同上游源码上增加 Owner 单独授权的 `0002` candidate；隔离 build/generate/runtime-test 已通过，但在 Contracts repin 和下游 conformance 完成前，它仍不是新的受支持 Baseline。
 
 ## 固定决策
 
@@ -34,7 +34,7 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 
 ## FEAT-136 candidate 状态
 
-`0002` 修复 early sandbox-denial 在既有 emitter 创建前返回所造成的 Command lifecycle 缺失。它对同一 identity 发布 canonical `item/started` 和 failed `item/completed` 后仍返回原错误，不改变 retry/approval、sandbox 或权限决策。该变化的 `contract-impact = semantic`；stable Schema shape 预计不变，但最终隔离 build、Schema 生成和逐文件比较仍待完成。
+`0002` 修复 early sandbox-denial 在既有 emitter 创建前返回所造成的 Command lifecycle 缺失。它对同一 identity 发布 canonical `item/started` 和 failed `item/completed` 后仍返回原错误，不改变 retry/approval、sandbox 或权限决策。该变化的 `contract-impact = semantic`；隔离 build、Schema 生成和逐文件比较已确认 stable Schema shape 不变。
 
 当前只确认以下门禁通过：
 
@@ -42,9 +42,11 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 - 4 个 safe fake exec-server 场景；
 - focused `codex-app-server-protocol` v2 Command notification mapping；
 - `cargo fmt --all -- --check` 和 `codex-core` / `codex-app-server-protocol` scoped `clippy --no-deps -D warnings`；
-- `scripts/test-fork-management.sh` 的 patch replay、精确 allowlist、Contracts v0.7.0 投影和安全 smoke wrapper 测试。
+- `scripts/test-fork-management.sh` 的 patch replay、精确 allowlist、Contracts v0.7.0 投影和安全 smoke wrapper 测试；
+- Rust `1.95.0` macOS Apple Silicon release build、267-file stable Schema 生成/零差异比较；
+- normal-EOF stdio smoke、双补丁 Runtime manifest 和 Runtime→Contracts 双向检查。
 
-不得据此宣称完整 `make build`、`make generate`、`make runtime-test`、artifact identity 或 Runtime→Contracts→Host→Desktop conformance 已通过。旧 Contracts `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 必须由新的 candidate 精确 repin repaired Runtime immutable commit 与确认后的 Schema digest。
+不得据此宣称 Runtime→Host→Desktop conformance 已通过。旧 Contracts `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 必须由新的 candidate 精确 repin repaired Runtime immutable commit 与确认后的 Schema digest。
 
 ## 非完成项
 

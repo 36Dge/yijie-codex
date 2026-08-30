@@ -14,11 +14,11 @@
 - tag 固定为 `rust-v0.144.6`，完整 commit 为 `5d1fbf26c43abc65a203928b2e31561cb039e06d`；
 - `codex-rs/` 是该 commit 的上游子树，`LICENSE` 和 `NOTICE` 同步保留；
 - `.yijie/patches/` 当前 candidate 包含严格有序的 `0001` FEAT-126 持久诊断日志安全 patch 和 `0002` FEAT-136 early sandbox-denial Command lifecycle patch；脚本要求精确名称、顺序、独立重放和 digest；
-- 既有单 patch Baseline 0 的 macOS Apple Silicon release build、267 个 stable app-server JSON Schema、Schema 重生成比较和无凭据 stdio 初始化握手已通过；FEAT-136 双 patch candidate 已通过 focused core、4 个 safe fake exec-server 场景、focused app-server-protocol、fmt、两组 scoped clippy 与 fork-management 门禁，最终隔离 build/generate/runtime-test 尚未完成；
+- 既有单 patch Baseline 0 与 FEAT-136 双 patch candidate 的 macOS Apple Silicon release build、267 个 stable app-server JSON Schema、Schema 重生成比较和无凭据 stdio 初始化握手均已通过；FEAT-136 还通过 focused core、4 个 safe fake exec-server 场景、focused app-server-protocol、fmt、两组 scoped clippy、fork-management 和 Runtime→Contracts 双向门禁；
 - sibling `yijie-contracts` 存在时，Runtime identity、Schema tree 与 Agent Host method/notification 投影会由 `make runtime-test` 双向校验；独立 checkout 缺少 sibling 时明确跳过；
 - 构建产物和 Runtime manifest 位于被忽略的 `.yijie/build/`，Schema 位于 `.yijie/schemas/app-server/`。
 
-FEAT-136 `0002` 的 `contract-impact = semantic`：它补齐 early sandbox-denial 的 canonical Command started/failed terminal，不设计新的 schema shape，也不改变原错误、retry/approval 决策、权限或 sandbox 策略；schema shape 不变目前仍是待隔离生成确认的预期，不是已完成结论。旧 Contracts `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 的 Runtime provenance 必须由新的 immutable candidate repin 后才能继续下游 conformance。Tool D4 不执行，也不得通过注册工具或制造 producer 来解除其阻塞。
+FEAT-136 `0002` 的 `contract-impact = semantic`：它补齐 early sandbox-denial 的 canonical Command started/failed terminal，不设计新的 schema shape，也不改变原错误、retry/approval 决策、权限或 sandbox 策略；隔离生成已确认 stable schema 仍为 267 个文件且逐文件零差异。旧 Contracts `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 的 Runtime provenance 必须由新的 immutable candidate repin 后才能继续下游 conformance。Tool D4 不执行，也不得通过注册工具或制造 producer 来解除其阻塞。
 
 Baseline 0 不表示 Agent Host、真实模型 turn、MCP 工具、Desktop sidecar、签名或 cloud runner 已完成。Codex 不得擅自改变上游、固定版本、源码策略、transport、patch 集或发布目标；除本次 Owner 已单独授权的 FEAT-136 最小 Runtime patch 外，升级和核心修改仍必须取得用户明确确认。
 

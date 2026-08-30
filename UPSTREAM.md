@@ -30,7 +30,7 @@
 1. `0001-feat-126-filter-persistent-diagnostics.patch`：阻止路径承载的 HTTP、stream、shell、feedback、rollout、core util 和根级 app-server 配置诊断进入本地 SQLite；保留经审查的 state 与 app-server 子 target 日志。该 patch 不改变 app-server schema 或 transport。
 2. `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch`：基于同一上游 `rust-v0.144.6` / `5d1fbf26c43abc65a203928b2e31561cb039e06d`，并以此前易界 Runtime commit `0ce5902ed400866be0196886bb78f693a004d68d` 为 candidate 起点，修复 unified exec 在 early sandbox-denial 检测后、既有 emitter 创建前直接返回，导致 Command lifecycle 从 Runtime→Host→Desktop 链路消失的问题。它只在最终 `SandboxDenied` 返回分支，以相同 call/process identity 依次发布 canonical `item/started`（`inProgress`）和 `item/completed`（`failed`，保留 nonzero exit code、duration 与聚合输出），随后返回原错误；不删除检测、不改变 ToolOrchestrator retry/approval、sandbox 或权限语义，也不制造 Tool producer。
 
-`0002` 的 `contract-impact = semantic`：可观察的失败生命周期被补齐，但 stable wire 类型和字段 shape 预计不变。最终结论仍须由隔离 release build、Schema 生成和逐文件比较确认；在确认前不得宣称 Schema 无 diff。
+`0002` 的 `contract-impact = semantic`：可观察的失败生命周期被补齐，但 stable wire 类型和字段 shape 不变。隔离 release build、Schema 生成和逐文件比较已确认仍为 267 个 stable JSON 文件且无 tracked diff。
 
 patch 的相对路径和 SHA-256 进入 Runtime manifest。管理脚本只接受上述 `0001` → `0002` 精确名称与顺序，拒绝缺失、重命名、额外或乱序 patch。`make apply-patches` 必须从上述固定 commit 独立重放成功，且不得修改 canonical `codex-rs/` 物化目录。
 
@@ -61,6 +61,8 @@ FEAT-136 双 patch candidate 当前已通过：
 - 4 个 safe fake exec-server 场景，包括最终 direct denial、legacy exit metadata 和 replay gap；
 - focused `codex-app-server-protocol` canonical v2 Command mapping 回归；
 - `cargo fmt --all -- --check` 以及 `codex-core` / `codex-app-server-protocol` scoped `clippy --no-deps -D warnings`；
-- `scripts/test-fork-management.sh`，包括严格双 patch allowlist、独立重放和 wrapper 单元/安全门禁。
+- `scripts/test-fork-management.sh`，包括严格双 patch allowlist、独立重放和 wrapper 单元/安全门禁；
+- Rust `1.95.0` macOS Apple Silicon release build、267-file Schema 生成与逐文件零差异比较；
+- normal-EOF app-server stdio `initialize` / `initialized`、双补丁 artifact manifest 与 Runtime→Contracts 双向兼容检查。
 
-尚未完成最终隔离 release build、Schema 生成/比较、完整 `runtime-test`、binary/manifest 固化或 Runtime→Contracts→Host→Desktop conformance。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍记录此前 Runtime provenance；必须由新的 Contracts candidate 精确 repin 新 Runtime immutable commit 和确认后的 Schema digest。Tool D4 保持 `BLOCKED/NOT RUN`。
+尚未完成 Contracts 新 immutable candidate、Host/Desktop 精确 repin 及 Runtime→Host→Desktop conformance。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍记录此前 Runtime provenance；必须由新的 Contracts candidate 精确 repin 新 Runtime immutable commit 和已确认 Schema digest。Tool D4 保持 `BLOCKED/NOT RUN`。

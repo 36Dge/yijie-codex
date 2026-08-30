@@ -35,7 +35,7 @@ Runtime Baseline 0 已建立：
 
 Baseline 0 固定不可变上游源码、协议 Schema 和工具链。易界 overlay 只在临时构建工作区应用。`0001-feat-126-filter-persistent-diagnostics.patch` 收紧本地 SQLite 诊断日志；`0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` 在 early sandbox-denial 返回发生在既有 emitter 之前时，补发同一 Command identity 的 canonical `item/started` 与 failed `item/completed`，但不改变原错误、retry/approval 决策、权限或 sandbox 策略。
 
-FEAT-136 的 `contract-impact` 为 `semantic`。当前预计 stable app-server Schema shape 不变，但必须由最终隔离 release build、Schema 生成和逐文件比较确认。focused `codex-core`、4 个 safe fake exec-server 场景、`codex-app-server-protocol`、fmt、scoped clippy 及 fork-management 门禁已经通过；这不等同于完整 build、generate、runtime-test 或 Runtime→Contracts→Host→Desktop conformance 已通过。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍固定此前 Runtime provenance，必须在 Runtime candidate 形成不可变 commit 并确认 Schema digest 后由新的 Contracts candidate 重新 pin。Tool D4 未执行，且本 patch 不制造 Tool producer。
+FEAT-136 的 `contract-impact` 为 `semantic`。隔离 macOS Apple Silicon release build、Schema 生成和逐文件比较已确认 stable app-server Schema 仍为 267 个文件、tree SHA-256 `82ee9de771cf1d41bac16d87380f1121e7794107aa3aa526ad702d5d1bf7afe1` 且无 tracked diff；normal-EOF stdio smoke、focused `codex-core`、4 个 safe fake exec-server 场景、`codex-app-server-protocol`、fmt、scoped clippy、fork-management 及 Runtime→Contracts 双向门禁均通过。这仍不等同于 Runtime→Host→Desktop conformance 已通过。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 固定此前 Runtime provenance，必须由新的 Contracts candidate 重新 pin。Tool D4 未执行，且本 patch 不制造 Tool producer。
 
 它不表示 Desktop sidecar、真实模型回合或云端 runner 已完成。
 

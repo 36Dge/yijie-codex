@@ -34,12 +34,13 @@
 | fmt 与 scoped clippy | 通过；`codex-core` / `codex-app-server-protocol` 使用 `--no-deps -D warnings` |
 | `scripts/test-fork-management.sh` | 通过 |
 | 精确 `0001` → `0002` allowlist 与独立 replay | 随 fork-management 通过 |
-| 隔离 Rust `1.95.0` release build | 待执行 |
-| stable Schema 生成和逐文件 diff | 待执行；预计 shape 不变 |
-| 完整 `runtime-test`、binary/manifest identity | 待执行 |
+| 隔离 Rust `1.95.0` release build | 通过；`codex-cli 0.144.6` / `aarch64-apple-darwin` |
+| stable Schema 生成和逐文件 diff | 通过；267 files / `82ee9de771cf1d41bac16d87380f1121e7794107aa3aa526ad702d5d1bf7afe1` / tracked diff 为空 |
+| 完整 `runtime-test`、binary/manifest identity | 通过；binary SHA-256 `6000888bd404bfd19e811029651b91502c45a6bcc8a58c978a7f472783cfe966`，size `355676536`，manifest SHA-256 `a92cfe7ef7eebe75b0f886f58bcd58732ef17582aae26052236410dd9a8f30d4` |
+| Runtime→Contracts 双向兼容 | 通过；Contracts compatibility candidate SHA-256 `48ad0cc3bd6823d4d76ff6a527925fe98535a2a691f485a747b7d16347102fef` |
 | Runtime→Contracts→Host→Desktop conformance | 待执行 |
 
-因此不得把 focused 测试解释为全门禁或目标平台 build 已通过。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍 pin 此前 Runtime provenance；新 Runtime immutable commit 和 Schema digest 确认后，必须由新的 Contracts candidate repin，随后才能执行 Host/Desktop conformance 和 fresh Command D4。Tool D4 保持 `BLOCKED/NOT RUN`，本 candidate 不注册或制造 Tool producer。
+Runtime 自身候选门禁和 Runtime→Contracts 双向检查已通过，但不能解释为 Host/Desktop conformance。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍 pin 此前 Runtime provenance；必须由新的 Contracts candidate repin，随后才能执行 Host/Desktop conformance 和 fresh Command D4。Tool D4 保持 `BLOCKED/NOT RUN`，本 candidate 不注册或制造 Tool producer。
 
 ## Agent Host Contracts 双向门禁
 
