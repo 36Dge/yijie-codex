@@ -7,14 +7,30 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from runtime_manifest import sha256_tree
+from runtime_manifest import sha256_file, sha256_tree
 
 
 COMPATIBILITY_RELATIVE_PATH = Path("compatibility/agent-host-runtime-v1.json")
+APPROVAL_COMPATIBILITY_RELATIVE_PATH = Path(
+    "compatibility/agent-host-runtime-approval-v6-v3.json"
+)
 CANONICAL_RUNTIME_REPOSITORY = "https://github.com/36Dge/yijie-codex.git"
+APPROVAL_METHOD = "item/commandExecution/requestApproval"
+EXPECTED_SANDBOX_PERMISSIONS = [
+    "use_default",
+    "require_escalated",
+    "with_additional_permissions",
+]
+APPROVAL_SCHEMA_ARTIFACTS = [
+    "ServerRequest.json",
+    "CommandExecutionRequestApprovalParams.json",
+    "CommandExecutionRequestApprovalResponse.json",
+    "ServerNotification.json",
+]
 EXPECTED_RUNTIME_METHODS = [
     "skills/config/write",
     "skills/extraRoots/set",
@@ -172,6 +188,49 @@ def git_head(repo_root: Path) -> str:
     return commit
 
 
+def git_blob(repo_root: Path, commit: str, relative_path: Path) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{commit}:{relative_path.as_posix()}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise CompatibilityError(
+            f"cannot read immutable Runtime object {commit}:{relative_path.as_posix()}"
+        ) from error
+
+
+def materialize_runtime_schema_object(repo_root: Path, commit: str, destination: Path) -> None:
+    schema_root = Path(".yijie/schemas/app-server/generated-json-schema")
+    baseline_path = Path(".yijie/schemas/app-server/baseline.json")
+    try:
+        listing = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                commit,
+                str(schema_root),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise CompatibilityError(f"cannot list immutable Runtime Schema object {commit}") from error
+    paths = [Path(line) for line in listing.splitlines() if line.endswith(".json")]
+    if not paths:
+        raise CompatibilityError(f"immutable Runtime Schema object {commit} is empty")
+    for relative_path in [baseline_path, *paths]:
+        output = destination / relative_path
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(git_blob(repo_root, commit, relative_path))
+
+
 def schema_methods(path: Path, label: str) -> set[str]:
     schema = load_json(path, label)
     branches = schema.get("oneOf")
@@ -290,6 +349,140 @@ def validate_compatibility(
         validate_runtime_artifact(runtime_manifest_path, expected_runtime)
 
 
+def validate_historical_v1_compatibility(
+    repo_root: Path,
+    contracts_manifest_path: Path,
+) -> None:
+    manifest = load_json(contracts_manifest_path, "historical Agent Host v1 compatibility manifest")
+    validate_contract_manifest_shape(manifest)
+    commit = manifest["runtime"]["repository_commit"]
+    with tempfile.TemporaryDirectory(prefix="yijie-runtime-v1-authority-") as directory:
+        historical_root = Path(directory)
+        materialize_runtime_schema_object(repo_root, commit, historical_root)
+        validate_compatibility(
+            historical_root,
+            contracts_manifest_path,
+            repository_commit=commit,
+        )
+
+
+def validate_active_approval_compatibility(
+    repo_root: Path,
+    contracts_manifest_path: Path,
+    runtime_manifest_path: Path | None = None,
+    repository_commit: str | None = None,
+) -> None:
+    manifest = load_json(
+        contracts_manifest_path, "active Agent Host v6 approval compatibility manifest"
+    )
+    require_equal(manifest.get("schema_version"), 3, "approval manifest schema_version")
+    require_equal(
+        manifest.get("projection_id"),
+        "agent-host-runtime-approval-v6-v3",
+        "approval manifest projection_id",
+    )
+
+    runtime = manifest.get("runtime")
+    if not isinstance(runtime, dict):
+        raise CompatibilityError("approval manifest runtime must be an object")
+    baseline = load_json(
+        repo_root / ".yijie/schemas/app-server/baseline.json", "app-server baseline"
+    )
+    schema_dir = repo_root / ".yijie/schemas/app-server/generated-json-schema"
+    schema_files = sorted(path for path in schema_dir.rglob("*.json") if path.is_file())
+    expected_runtime = {
+        "repository": CANONICAL_RUNTIME_REPOSITORY,
+        "repository_commit": repository_commit or git_head(repo_root),
+        "upstream_tag": baseline.get("upstreamTag"),
+        "upstream_commit": baseline.get("upstreamCommit"),
+        "version": baseline.get("runtimeVersion"),
+        "transport": baseline.get("transport"),
+        "experimental_api": baseline.get("experimentalApi"),
+        "schema_file_count": len(schema_files),
+        "schema_tree_sha256": sha256_tree(schema_dir),
+    }
+    for key, expected in expected_runtime.items():
+        require_equal(runtime.get(key), expected, f"approval manifest runtime.{key}")
+
+    artifact_digests = runtime.get("schema_artifacts")
+    if not isinstance(artifact_digests, dict):
+        raise CompatibilityError("approval manifest runtime.schema_artifacts must be an object")
+    require_exact_keys(
+        artifact_digests,
+        set(APPROVAL_SCHEMA_ARTIFACTS),
+        "approval manifest runtime.schema_artifacts",
+    )
+    for name in APPROVAL_SCHEMA_ARTIFACTS:
+        require_equal(
+            artifact_digests[name],
+            sha256_file(schema_dir / name),
+            f"approval manifest runtime.schema_artifacts.{name}",
+        )
+
+    reverse_request = manifest.get("reverse_request")
+    if not isinstance(reverse_request, dict):
+        raise CompatibilityError("approval manifest reverse_request must be an object")
+    require_equal(reverse_request.get("method"), APPROVAL_METHOD, "approval manifest method")
+    require_equal(
+        reverse_request.get("stable_required_params"),
+        {
+            "item_id": "itemId",
+            "sandbox_permissions": "sandboxPermissions",
+            "started_at_ms": "startedAtMs",
+            "thread_id": "threadId",
+            "turn_id": "turnId",
+        },
+        "approval manifest stable_required_params",
+    )
+    eligibility = reverse_request.get("eligibility")
+    sandbox_permissions = (
+        eligibility.get("sandbox_permissions") if isinstance(eligibility, dict) else None
+    )
+    if not isinstance(sandbox_permissions, dict):
+        raise CompatibilityError(
+            "approval manifest eligibility.sandbox_permissions must be an object"
+        )
+    require_equal(
+        sandbox_permissions.get("runtime_enum"),
+        EXPECTED_SANDBOX_PERMISSIONS,
+        "approval manifest sandbox permission enum",
+    )
+    require_equal(
+        sandbox_permissions.get("eligible_value"),
+        "use_default",
+        "approval manifest eligible sandbox permission",
+    )
+
+    params_schema = load_json(
+        schema_dir / "CommandExecutionRequestApprovalParams.json",
+        "CommandExecutionRequestApprovalParams Schema",
+    )
+    required = params_schema.get("required")
+    if not isinstance(required, list) or "sandboxPermissions" not in required:
+        raise CompatibilityError(
+            "CommandExecutionRequestApprovalParams Schema must require sandboxPermissions"
+        )
+    definition = params_schema.get("definitions", {}).get("SandboxPermissions", {})
+    branches = definition.get("oneOf") if isinstance(definition, dict) else None
+    actual_permissions = [
+        branch.get("enum", [None])[0]
+        for branch in branches or []
+        if isinstance(branch, dict)
+        and isinstance(branch.get("enum"), list)
+        and len(branch["enum"]) == 1
+    ]
+    require_equal(
+        actual_permissions,
+        EXPECTED_SANDBOX_PERMISSIONS,
+        "Runtime SandboxPermissions Schema enum",
+    )
+    if APPROVAL_METHOD not in schema_methods(schema_dir / "ServerRequest.json", "ServerRequest Schema"):
+        raise CompatibilityError(f"ServerRequest Schema is missing {APPROVAL_METHOD!r}")
+
+    if runtime_manifest_path is not None:
+        validate_runtime_artifact(runtime_manifest_path, expected_runtime)
+
+
 def check_sibling(
     repo_root: Path,
     contracts_repo: Path,
@@ -307,8 +500,22 @@ def check_sibling(
             "sibling yijie-contracts checkout exists but its Runtime compatibility manifest "
             f"is missing: {contracts_manifest_path}"
         )
-    validate_compatibility(repo_root, contracts_manifest_path, runtime_manifest_path)
-    print(f"Agent Host contracts compatibility passed: {contracts_manifest_path}")
+    approval_manifest_path = contracts_repo / APPROVAL_COMPATIBILITY_RELATIVE_PATH
+    if not approval_manifest_path.is_file():
+        raise CompatibilityError(
+            "sibling yijie-contracts checkout exists but its active approval compatibility "
+            f"manifest is missing: {approval_manifest_path}"
+        )
+    validate_historical_v1_compatibility(repo_root, contracts_manifest_path)
+    validate_active_approval_compatibility(
+        repo_root,
+        approval_manifest_path,
+        runtime_manifest_path,
+    )
+    print(
+        "Agent Host contracts compatibility passed: "
+        f"historical={contracts_manifest_path}, active={approval_manifest_path}"
+    )
     return True
 
 

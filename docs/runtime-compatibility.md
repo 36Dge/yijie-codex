@@ -64,14 +64,17 @@ Owner 授权的 `0003-feat-137-stable-sandbox-provenance.patch` 在既有 `0001`
 
 `make runtime-test` 在生成 Runtime artifact manifest 后调用
 `scripts/check_agent_host_contracts.py`。默认读取相邻目录
-`../yijie-contracts/compatibility/agent-host-runtime-v1.json`，也可通过
+`../yijie-contracts/compatibility/agent-host-runtime-v1.json` 和当前
+`agent-host-runtime-approval-v6-v3.json`，也可通过
 `YIJIE_CONTRACTS_REPO=/path/to/yijie-contracts` 指向其它 checkout。
 
 门禁会严格比较以下内容：
 
-- 易界 Runtime 仓库 URL 和当前 `yijie-codex` `HEAD`；
+- 历史 v1 投影从其固定 Runtime Git object 验证，当前 approval v3 投影精确匹配
+  `yijie-codex` `HEAD`；
 - Runtime 版本、上游 tag/完整 commit、stdio transport 和 experimental API 状态；
 - 已提交协议 Schema 的 JSON 文件数及整个 Schema tree SHA-256；
+- active v3 四个 stable Schema artifact digest、必填 `sandboxPermissions` 和精确三值 enum；
 - Agent Host 的 HTTP/SSE、认证、sandbox、approval policy 固定投影；
 - Contracts v0.7.0 的 7 个 Runtime request method 和 13 个 notification 的完整、有序集合，并确认每一项实际存在于 `ClientRequest.json` 或 `ServerNotification.json`；
 - 刚生成的 Runtime artifact manifest 与上述源数据仍然一致。

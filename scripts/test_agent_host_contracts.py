@@ -11,16 +11,21 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from check_agent_host_contracts import (
+    APPROVAL_COMPATIBILITY_RELATIVE_PATH,
+    APPROVAL_METHOD,
+    APPROVAL_SCHEMA_ARTIFACTS,
     CANONICAL_RUNTIME_REPOSITORY,
     COMPATIBILITY_RELATIVE_PATH,
     EXPECTED_HOST_PROJECTION,
     EXPECTED_RUNTIME_METHODS,
     EXPECTED_RUNTIME_NOTIFICATIONS,
+    EXPECTED_SANDBOX_PERMISSIONS,
     CompatibilityError,
     check_sibling,
+    validate_active_approval_compatibility,
     validate_compatibility,
 )
-from runtime_manifest import sha256_tree
+from runtime_manifest import sha256_file, sha256_tree
 
 
 COMMIT = "a" * 40
@@ -34,6 +39,7 @@ class Fixture:
         self.schema_dir = self.repo_root / ".yijie/schemas/app-server/generated-json-schema"
         self.baseline_path = self.repo_root / ".yijie/schemas/app-server/baseline.json"
         self.contracts_path = self.contracts_repo / COMPATIBILITY_RELATIVE_PATH
+        self.approval_path = self.contracts_repo / APPROVAL_COMPATIBILITY_RELATIVE_PATH
         self.runtime_manifest_path = root / "runtime-manifest.json"
 
         self.schema_dir.mkdir(parents=True)
@@ -45,6 +51,35 @@ class Fixture:
         self.write_json(
             self.schema_dir / "ServerNotification.json",
             self.method_schema(EXPECTED_HOST_PROJECTION["runtime_notifications"]),
+        )
+        self.write_json(
+            self.schema_dir / "ServerRequest.json",
+            self.method_schema([APPROVAL_METHOD]),
+        )
+        self.write_json(
+            self.schema_dir / "CommandExecutionRequestApprovalParams.json",
+            {
+                "definitions": {
+                    "SandboxPermissions": {
+                        "oneOf": [
+                            {"type": "string", "enum": [value]}
+                            for value in EXPECTED_SANDBOX_PERMISSIONS
+                        ]
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "itemId",
+                    "sandboxPermissions",
+                    "startedAtMs",
+                    "threadId",
+                    "turnId",
+                ],
+            },
+        )
+        self.write_json(
+            self.schema_dir / "CommandExecutionRequestApprovalResponse.json",
+            {"type": "object"},
         )
         self.write_json(
             self.baseline_path,
@@ -68,7 +103,7 @@ class Fixture:
                 "version": "0.144.6",
                 "transport": "stdio",
                 "experimental_api": False,
-                "schema_file_count": 2,
+                "schema_file_count": 5,
                 "schema_tree_sha256": sha256_tree(self.schema_dir),
             },
             "host_projection": copy.deepcopy(EXPECTED_HOST_PROJECTION),
@@ -82,8 +117,35 @@ class Fixture:
             "appServer": {
                 "transport": "stdio",
                 "experimentalApi": False,
-                "schemaFileCount": 2,
+                "schemaFileCount": 5,
                 "schemaTreeSha256": self.manifest["runtime"]["schema_tree_sha256"],
+            },
+        }
+        self.approval_manifest = {
+            "schema_version": 3,
+            "projection_id": "agent-host-runtime-approval-v6-v3",
+            "runtime": {
+                **self.manifest["runtime"],
+                "schema_artifacts": {
+                    name: sha256_file(self.schema_dir / name)
+                    for name in APPROVAL_SCHEMA_ARTIFACTS
+                },
+            },
+            "reverse_request": {
+                "method": APPROVAL_METHOD,
+                "stable_required_params": {
+                    "item_id": "itemId",
+                    "sandbox_permissions": "sandboxPermissions",
+                    "started_at_ms": "startedAtMs",
+                    "thread_id": "threadId",
+                    "turn_id": "turnId",
+                },
+                "eligibility": {
+                    "sandbox_permissions": {
+                        "runtime_enum": EXPECTED_SANDBOX_PERMISSIONS,
+                        "eligible_value": "use_default",
+                    }
+                },
             },
         }
         self.flush()
@@ -107,6 +169,7 @@ class Fixture:
 
     def flush(self) -> None:
         self.write_json(self.contracts_path, self.manifest)
+        self.write_json(self.approval_path, self.approval_manifest)
         self.write_json(self.runtime_manifest_path, self.runtime_manifest)
 
 
@@ -127,8 +190,45 @@ class AgentHostContractsCompatibilityTests(unittest.TestCase):
             repository_commit=COMMIT,
         )
 
+    def validate_approval(self) -> None:
+        schema_tree = sha256_tree(self.fixture.schema_dir)
+        self.fixture.approval_manifest["runtime"]["schema_tree_sha256"] = schema_tree
+        self.fixture.approval_manifest["runtime"]["schema_artifacts"] = {
+            name: sha256_file(self.fixture.schema_dir / name)
+            for name in APPROVAL_SCHEMA_ARTIFACTS
+        }
+        self.fixture.runtime_manifest["appServer"]["schemaTreeSha256"] = schema_tree
+        self.fixture.flush()
+        validate_active_approval_compatibility(
+            self.fixture.repo_root,
+            self.fixture.approval_path,
+            self.fixture.runtime_manifest_path,
+            repository_commit=COMMIT,
+        )
+
     def test_valid_manifest_matches_source_schemas_and_runtime_artifact(self) -> None:
         self.validate()
+
+    def test_active_approval_manifest_matches_stable_sandbox_provenance(self) -> None:
+        self.validate_approval()
+
+    def test_active_approval_manifest_rejects_missing_or_widened_sandbox_provenance(self) -> None:
+        params_path = (
+            self.fixture.schema_dir / "CommandExecutionRequestApprovalParams.json"
+        )
+        params = json.loads(params_path.read_text(encoding="utf-8"))
+        params["required"].remove("sandboxPermissions")
+        Fixture.write_json(params_path, params)
+        with self.assertRaisesRegex(CompatibilityError, "must require sandboxPermissions"):
+            self.validate_approval()
+
+        params["required"].append("sandboxPermissions")
+        params["definitions"]["SandboxPermissions"]["oneOf"].append(
+            {"type": "string", "enum": ["unknown"]}
+        )
+        Fixture.write_json(params_path, params)
+        with self.assertRaisesRegex(CompatibilityError, "SandboxPermissions Schema enum"):
+            self.validate_approval()
 
     def test_expected_projection_is_exactly_contracts_v070(self) -> None:
         self.assertEqual(
