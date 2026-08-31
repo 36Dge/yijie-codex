@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add the Owner-authorized FEAT-137 `0003-feat-137-stable-sandbox-provenance.patch`: stable `item/commandExecution/requestApproval` now requires `sandboxPermissions` (`use_default`, `require_escalated`, or `with_additional_permissions`) carried unchanged from the originating tool request through the core approval event to app-server. Execution authority, approval decisions, and the public v6 API remain unchanged.
+- Require the exact ordered `0001` → `0002` → `0003` overlay and a versioned Contracts v6 compatibility projection before Host/Desktop consume the new stable provenance field.
 - Add the Owner-authorized FEAT-136 candidate patch `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` after FEAT-126 `0001`. It emits one canonical Command `item/started` followed by one failed `item/completed` when final early sandbox denial previously returned before emitter creation, while preserving the original error, nonzero exit details, retry/approval decisions, sandbox, and permissions.
 - Classify the FEAT-136 Runtime change as `semantic`: isolated macOS Apple Silicon release build and schema regeneration confirm the stable app-server Schema remains 267 files with no tracked diff. Focused core, four safe fake exec-server scenarios, focused app-server-protocol, fmt, scoped clippy, fork-management, normal-EOF stdio smoke, and Runtime→Contracts checks pass; downstream Host/Desktop conformance is not yet claimed.
 - Require the exact ordered `0001` → `0002` overlay in patch replay and Runtime manifests, and make the credential-free app-server smoke harness close by stdin EOF without terminate/kill fallback.

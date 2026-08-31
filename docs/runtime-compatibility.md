@@ -42,6 +42,24 @@
 
 Runtime 自身候选门禁和 Runtime→Contracts 双向检查已通过，但不能解释为 Host/Desktop conformance。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍 pin 此前 Runtime provenance；必须由新的 Contracts candidate repin，随后才能执行 Host/Desktop conformance 和 fresh Command D4。Tool D4 保持 `BLOCKED/NOT RUN`，本 candidate 不注册或制造 Tool producer。
 
+## FEAT-137 三 patch candidate
+
+Owner 授权的 `0003-feat-137-stable-sandbox-provenance.patch` 在既有 `0001`、`0002` 之后应用。它为 stable `item/commandExecution/requestApproval` 增加必填 `sandboxPermissions`，枚举严格限定为 `use_default`、`require_escalated`、`with_additional_permissions`，并保持 tool request → core `ExecApprovalRequestEvent` → app-server wire 的原值。该字段不授予权限，不改变审批或执行决策，也不扩张 public v6 API。
+
+| FEAT-137 Runtime 检查 | 当前结果 |
+|---|---|
+| 精确 `0001` → `0002` → `0003` allowlist 与独立 replay | 通过 |
+| core 三枚举 provenance focused test | 1/1 通过 |
+| stable projection strip focused test | 1/1 通过 |
+| app-server stable wire focused test | 1/1 通过，`use_default` 原样出现 |
+| fmt 与 scoped Clippy | 通过；app-server 只放行未被 patch 触及的既有 `unused_mut` |
+| Rust `1.95.0` release build | 通过；`codex-cli 0.144.6` / `aarch64-apple-darwin` |
+| stable Schema | 267 files / `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228` |
+| binary | SHA-256 `84bb0445a15f99354ddd38ccb407b9b0d3d28522accece3fa9755918ab6978e3` |
+| normal-EOF stdio smoke | 通过；无凭据、无 Provider/模型调用 |
+| Contracts/Host/Desktop | 等待本 Runtime immutable commit 后依次 source-first repin |
+| D4 | `NOT RUN`；真实调用 0 |
+
 ## Agent Host Contracts 双向门禁
 
 `make runtime-test` 在生成 Runtime artifact manifest 后调用

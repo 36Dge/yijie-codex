@@ -14,7 +14,7 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 - tag：`rust-v0.144.6`；
 - commit：`5d1fbf26c43abc65a203928b2e31561cb039e06d`；
 - source：上游 `codex-rs/` 子树加根目录 `LICENSE`、`NOTICE`；
-- patch 顺序：`0001-feat-126-filter-persistent-diagnostics.patch` → `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch`；
+- patch 顺序：`0001-feat-126-filter-persistent-diagnostics.patch` → `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` → `0003-feat-137-stable-sandbox-provenance.patch`；
 - Rust：`1.95.0`；
 - primary target：`aarch64-apple-darwin`；
 - app-server：稳定 API，`experimentalApi=false`，JSONL-over-stdio。
@@ -24,7 +24,7 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 1. `UPSTREAM.md` 和 `.yijie/upstream.env` 记录一致的上游 URL、tag、完整 commit、Runtime 版本和工具链。
 2. `make sync` 从固定 commit 重建源码，验证 tag 解引用结果，内容相同时幂等，目标存在改动时不覆盖。
 3. `verify-upstream-source.sh` 证明 `codex-rs/`、`LICENSE` 和 `NOTICE` 与上游一致。
-4. `make apply-patches` 从固定上游按精确名称与顺序重放 reviewed `0001` → `0002` patch set，拒绝缺失、额外、乱序 patch 及对 canonical `codex-rs/` 的修改。
+4. `make apply-patches` 从固定上游按精确名称与顺序重放 reviewed `0001` → `0002` → `0003` patch set，拒绝缺失、额外、乱序 patch 及对 canonical `codex-rs/` 的修改。
 5. `make build` 使用固定 Rust 工具链和目标平台，以临时构建工作树产出 `codex-cli 0.144.6` release binary。
 6. 上游 release lock 的正规化只能改变本地 workspace package 版本，且正规化前后 SHA-256 被记录。
 7. `make generate` 使用构建产物导出 stable app-server JSON Schema，并进行 canonical JSON serialization。
@@ -47,6 +47,12 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 - normal-EOF stdio smoke、双补丁 Runtime manifest 和 Runtime→Contracts 双向检查。
 
 不得据此宣称 Runtime→Host→Desktop conformance 已通过。旧 Contracts `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 必须由新的 candidate 精确 repin repaired Runtime immutable commit 与确认后的 Schema digest。
+
+## FEAT-137 stable sandbox provenance candidate
+
+Owner 授权的 `0003` 在 stable Command approval request 上增加必填 `sandboxPermissions`，只允许 `use_default`、`require_escalated`、`with_additional_permissions`。值从 originating tool request 经 core approval event 原样进入 app-server wire；它不改变 Runtime 的权限、审批或执行决策，public v6 API 也保持不变。对 strict stable-wire consumer，该新增必填字段分类为 `breaking`，必须由 Contracts 新的版本化 v6 compatibility 投影承接。
+
+Runtime source/focused tests、精确三补丁 replay、fmt、scoped Clippy、Rust `1.95.0` release build、267-file Schema 生成与 normal-EOF smoke 已通过。Schema tree SHA-256 为 `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228`，binary SHA-256 为 `84bb0445a15f99354ddd38ccb407b9b0d3d28522accece3fa9755918ab6978e3`。跨仓门禁必须等待 Runtime immutable commit，再按 Contracts→Host→Desktop 顺序执行；D4 保持 `NOT RUN`，真实调用为 0。
 
 ## 非完成项
 

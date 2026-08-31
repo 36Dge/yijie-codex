@@ -13,6 +13,7 @@ from runtime_manifest import sha256_file, sha256_tree
 EXPECTED_PATCH_NAMES = (
     "0001-feat-126-filter-persistent-diagnostics.patch",
     "0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch",
+    "0003-feat-137-stable-sandbox-provenance.patch",
 )
 
 
@@ -21,7 +22,7 @@ def reviewed_patch_files(patch_dir: Path) -> list[Path]:
     patch_names = tuple(patch.name for patch in patch_files)
     if patch_names != EXPECTED_PATCH_NAMES:
         raise SystemExit(
-            "Runtime manifest requires the exact ordered FEAT-126/FEAT-136 patch set: "
+            "Runtime manifest requires the exact ordered FEAT-126/FEAT-136/FEAT-137 patch set: "
             f"expected={list(EXPECTED_PATCH_NAMES)!r}, got={list(patch_names)!r}"
         )
     if any(not patch.is_file() or patch.is_symlink() for patch in patch_files):

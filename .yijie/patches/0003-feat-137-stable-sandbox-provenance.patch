@@ -1,0 +1,518 @@
+diff --git a/analytics/src/analytics_client_tests.rs b/analytics/src/analytics_client_tests.rs
+index 3691653..b8acef0 100644
+--- a/analytics/src/analytics_client_tests.rs
++++ b/analytics/src/analytics_client_tests.rs
+@@ -901,6 +901,7 @@ fn sample_command_approval_request(request_id: i64, approval_id: Option<&str>) -
+             command: Some("echo hi".to_string()),
+             cwd: None,
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: None,
+             proposed_execpolicy_amendment: None,
+             proposed_network_policy_amendments: None,
+diff --git a/app-server-protocol/src/protocol/common.rs b/app-server-protocol/src/protocol/common.rs
+index 27a8b02..a90070e 100644
+--- a/app-server-protocol/src/protocol/common.rs
++++ b/app-server-protocol/src/protocol/common.rs
+@@ -3744,6 +3744,7 @@ mod tests {
+             command: Some("cat file".to_string()),
+             cwd: None,
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: Some(v2::AdditionalPermissionProfile {
+                 network: None,
+                 file_system: Some(v2::AdditionalFileSystemPermissions {
+@@ -3763,6 +3764,32 @@ mod tests {
+             Some("item/commandExecution/requestApproval.additionalPermissions")
+         );
+     }
++
++    #[test]
++    fn command_execution_request_approval_keeps_stable_sandbox_provenance() {
++        let mut params = v2::CommandExecutionRequestApprovalParams {
++            thread_id: "thr_123".to_string(),
++            turn_id: "turn_123".to_string(),
++            item_id: "call_123".to_string(),
++            started_at_ms: 0,
++            approval_id: None,
++            environment_id: None,
++            reason: None,
++            network_approval_context: None,
++            command: Some("cat file".to_string()),
++            cwd: None,
++            command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::RequireEscalated,
++            additional_permissions: None,
++            proposed_execpolicy_amendment: None,
++            proposed_network_policy_amendments: None,
++            available_decisions: None,
++        };
++
++        params.strip_experimental_fields();
++        let wire = serde_json::to_value(params).expect("serialize stable approval params");
++        assert_eq!(wire["sandboxPermissions"], "require_escalated");
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/app-server-protocol/src/protocol/v2/item.rs b/app-server-protocol/src/protocol/v2/item.rs
+index 7a5e4dc..d81837e 100644
+--- a/app-server-protocol/src/protocol/v2/item.rs
++++ b/app-server-protocol/src/protocol/v2/item.rs
+@@ -30,6 +30,7 @@ use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
+ use codex_protocol::memory_citation::MemoryCitationEntry as CoreMemoryCitationEntry;
+ use codex_protocol::models::MessagePhase;
+ use codex_protocol::models::ResponseItem;
++use codex_protocol::models::SandboxPermissions;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use codex_protocol::parse_command::ParsedCommand as CoreParsedCommand;
+ use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
+@@ -1471,6 +1472,9 @@ pub struct CommandExecutionRequestApprovalParams {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     #[ts(optional = nullable)]
+     pub command_actions: Option<Vec<CommandAction>>,
++    /// Per-command sandbox override requested by the originating shell-like
++    /// tool call. This stable field is authority provenance, not presentation.
++    pub sandbox_permissions: SandboxPermissions,
+     /// Optional additional permissions requested for this command.
+     #[experimental("item/commandExecution/requestApproval.additionalPermissions")]
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+diff --git a/app-server-test-client/src/lib.rs b/app-server-test-client/src/lib.rs
+index 0e32365..9ba3f40 100644
+--- a/app-server-test-client/src/lib.rs
++++ b/app-server-test-client/src/lib.rs
+@@ -2073,6 +2073,7 @@ impl CodexClient {
+             command,
+             cwd,
+             command_actions,
++            sandbox_permissions: _,
+             additional_permissions,
+             proposed_execpolicy_amendment,
+             proposed_network_policy_amendments,
+diff --git a/app-server/src/bespoke_event_handling.rs b/app-server/src/bespoke_event_handling.rs
+index 829aa3f..4b43af1 100644
+--- a/app-server/src/bespoke_event_handling.rs
++++ b/app-server/src/bespoke_event_handling.rs
+@@ -572,6 +572,7 @@ pub(crate) async fn apply_bespoke_event_handling(
+                 started_at_ms,
+                 command,
+                 cwd,
++                sandbox_permissions,
+                 reason,
+                 network_approval_context,
+                 proposed_execpolicy_amendment,
+@@ -651,6 +652,7 @@ pub(crate) async fn apply_bespoke_event_handling(
+                 command,
+                 cwd,
+                 command_actions,
++                sandbox_permissions,
+                 additional_permissions,
+                 proposed_execpolicy_amendment: proposed_execpolicy_amendment_v2,
+                 proposed_network_policy_amendments: proposed_network_policy_amendments_v2,
+diff --git a/app-server/src/outgoing_message.rs b/app-server/src/outgoing_message.rs
+index 16d5c2f..fdcc564 100644
+--- a/app-server/src/outgoing_message.rs
++++ b/app-server/src/outgoing_message.rs
+@@ -1019,6 +1019,7 @@ mod tests {
+                 command: Some("echo hi".to_string()),
+                 cwd: None,
+                 command_actions: None,
++                sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                 additional_permissions: None,
+                 proposed_execpolicy_amendment: None,
+                 proposed_network_policy_amendments: None,
+diff --git a/app-server/src/transport_tests.rs b/app-server/src/transport_tests.rs
+index 439284a..5e3a0f8 100644
+--- a/app-server/src/transport_tests.rs
++++ b/app-server/src/transport_tests.rs
+@@ -256,6 +256,7 @@ async fn command_execution_request_approval_strips_additional_permissions_withou
+                     command: Some("cat file".to_string()),
+                     cwd: Some(absolute_path("/tmp").into()),
+                     command_actions: None,
++                    sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                     additional_permissions: Some(
+                         codex_app_server_protocol::AdditionalPermissionProfile {
+                             network: None,
+@@ -322,6 +323,7 @@ async fn command_execution_request_approval_keeps_additional_permissions_with_ca
+                     command: Some("cat file".to_string()),
+                     cwd: Some(absolute_path("/tmp").into()),
+                     command_actions: None,
++                    sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                     additional_permissions: Some(
+                         codex_app_server_protocol::AdditionalPermissionProfile {
+                             network: None,
+diff --git a/app-server/tests/suite/v2/turn_start.rs b/app-server/tests/suite/v2/turn_start.rs
+index c748c41..28727de 100644
+--- a/app-server/tests/suite/v2/turn_start.rs
++++ b/app-server/tests/suite/v2/turn_start.rs
+@@ -2307,6 +2307,10 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
+         panic!("expected CommandExecutionRequestApproval request");
+     };
+     assert_eq!(params.item_id, "call1");
++    assert_eq!(
++        params.sandbox_permissions,
++        codex_protocol::models::SandboxPermissions::UseDefault
++    );
+     assert_eq!(
+         params.environment_id.as_deref(),
+         Some(expected_environment_id.as_str())
+diff --git a/core/src/codex_delegate.rs b/core/src/codex_delegate.rs
+index d2911df..6685695 100644
+--- a/core/src/codex_delegate.rs
++++ b/core/src/codex_delegate.rs
+@@ -503,6 +503,7 @@ async fn handle_exec_approval(
+         environment_id,
+         command,
+         cwd,
++        sandbox_permissions,
+         reason,
+         network_approval_context,
+         proposed_execpolicy_amendment,
+@@ -520,11 +521,7 @@ async fn handle_exec_approval(
+                 id: call_id.clone(),
+                 command,
+                 cwd,
+-                sandbox_permissions: if additional_permissions.is_some() {
+-                    crate::sandboxing::SandboxPermissions::WithAdditionalPermissions
+-                } else {
+-                    crate::sandboxing::SandboxPermissions::UseDefault
+-                },
++                sandbox_permissions,
+                 additional_permissions,
+                 justification: None,
+             },
+@@ -549,6 +546,7 @@ async fn handle_exec_approval(
+                 environment_id,
+                 command,
+                 cwd,
++                sandbox_permissions,
+                 reason,
+                 network_approval_context,
+                 proposed_execpolicy_amendment,
+diff --git a/core/src/codex_delegate_tests.rs b/core/src/codex_delegate_tests.rs
+index 5cb2251..769466f 100644
+--- a/core/src/codex_delegate_tests.rs
++++ b/core/src/codex_delegate_tests.rs
+@@ -350,6 +350,7 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
+                     started_at_ms: 0,
+                     command: vec!["rm".to_string(), "-rf".to_string(), "tmp".to_string()],
+                     cwd: test_path_buf("/tmp").abs(),
++                    sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                     reason: Some("unsafe subcommand".to_string()),
+                     network_approval_context: None,
+                     proposed_execpolicy_amendment: None,
+diff --git a/core/src/session/elicitation_holders_tests.rs b/core/src/session/elicitation_holders_tests.rs
+index df03aeb..0b6f8e6 100644
+--- a/core/src/session/elicitation_holders_tests.rs
++++ b/core/src/session/elicitation_holders_tests.rs
+@@ -1,5 +1,7 @@
+ use std::collections::HashMap;
+ 
++use codex_protocol::models::SandboxPermissions;
++use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::ReviewDecision;
+ use codex_protocol::request_permissions::PermissionGrantScope;
+ use codex_protocol::request_permissions::RequestPermissionProfile;
+@@ -47,6 +49,7 @@ async fn command_approval_holds_an_elicitation_until_response() {
+                     /*environment_id*/ None,
+                     vec!["echo".to_string()],
+                     cwd,
++                    codex_protocol::models::SandboxPermissions::UseDefault,
+                     /*reason*/ None,
+                     /*network_approval_context*/ None,
+                     /*proposed_execpolicy_amendment*/ None,
+@@ -66,6 +69,55 @@ async fn command_approval_holds_an_elicitation_until_response() {
+     wait_until_released(&mut pause_state).await;
+ }
+ 
++#[tokio::test]
++async fn command_approval_preserves_stable_sandbox_permissions_provenance() {
++    for sandbox_permissions in [
++        SandboxPermissions::UseDefault,
++        SandboxPermissions::RequireEscalated,
++        SandboxPermissions::WithAdditionalPermissions,
++    ] {
++        let (session, turn_context, events) = make_session_and_context_with_rx().await;
++        *session.active_turn.lock().await = Some(ActiveTurn::default());
++        #[allow(deprecated)]
++        let cwd = turn_context.cwd.clone();
++        let request = tokio::spawn({
++            let session = session.clone();
++            let turn_context = turn_context.clone();
++            async move {
++                session
++                    .request_command_approval(
++                        turn_context.as_ref(),
++                        "provenance-call".to_string(),
++                        None,
++                        None,
++                        vec!["echo".to_string()],
++                        cwd,
++                        sandbox_permissions,
++                        None,
++                        None,
++                        None,
++                        None,
++                        None,
++                    )
++                    .await
++            }
++        });
++
++        let event = events.recv().await.expect("approval event");
++        let EventMsg::ExecApprovalRequest(event) = event.msg else {
++            panic!("expected exec approval request");
++        };
++        assert_eq!(event.sandbox_permissions, sandbox_permissions);
++        session
++            .notify_approval("provenance-call", ReviewDecision::Approved)
++            .await;
++        assert_eq!(
++            request.await.expect("approval task"),
++            ReviewDecision::Approved
++        );
++    }
++}
++
+ #[tokio::test]
+ async fn patch_approval_holds_an_elicitation_until_response() {
+     let (session, turn_context, events) = make_session_and_context_with_rx().await;
+diff --git a/core/src/session/mod.rs b/core/src/session/mod.rs
+index 9339413..0a39867 100644
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -344,6 +344,7 @@ use codex_protocol::config_types::WindowsSandboxLevel;
+ use codex_protocol::models::LocalImagePreparation;
+ use codex_protocol::models::ResponseInputItem;
+ use codex_protocol::models::ResponseItem;
++use codex_protocol::models::SandboxPermissions;
+ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+ use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+ use codex_protocol::protocol::AskForApproval;
+@@ -2175,6 +2176,7 @@ impl Session {
+         environment_id: Option<String>,
+         command: Vec<String>,
+         cwd: AbsolutePathBuf,
++        sandbox_permissions: SandboxPermissions,
+         reason: Option<String>,
+         network_approval_context: Option<NetworkApprovalContext>,
+         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
+@@ -2230,6 +2232,7 @@ impl Session {
+             started_at_ms: now_unix_timestamp_ms(),
+             command,
+             cwd,
++            sandbox_permissions,
+             reason,
+             network_approval_context,
+             proposed_execpolicy_amendment,
+diff --git a/core/src/tools/network_approval.rs b/core/src/tools/network_approval.rs
+index 747ae80..95af539 100644
+--- a/core/src/tools/network_approval.rs
++++ b/core/src/tools/network_approval.rs
+@@ -22,6 +22,7 @@ use codex_protocol::approvals::NetworkApprovalContext;
+ use codex_protocol::approvals::NetworkApprovalProtocol;
+ use codex_protocol::approvals::NetworkPolicyRuleAction;
+ use codex_protocol::models::PermissionProfile;
++use codex_protocol::models::SandboxPermissions;
+ use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::Event;
+ use codex_protocol::protocol::EventMsg;
+@@ -674,6 +675,7 @@ impl NetworkApprovalService {
+                     Some(environment_id),
+                     prompt_command,
+                     cwd,
++                    SandboxPermissions::UseDefault,
+                     Some(prompt_reason),
+                     Some(network_approval_context.clone()),
+                     /*proposed_execpolicy_amendment*/ None,
+diff --git a/core/src/tools/runtimes/shell.rs b/core/src/tools/runtimes/shell.rs
+index 3ff50f3..ee764af 100644
+--- a/core/src/tools/runtimes/shell.rs
++++ b/core/src/tools/runtimes/shell.rs
+@@ -162,6 +162,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
+                         environment_id,
+                         command,
+                         cwd,
++                        req.sandbox_permissions,
+                         reason,
+                         ctx.network_approval_context.clone(),
+                         req.exec_approval_requirement
+diff --git a/core/src/tools/runtimes/shell/unix_escalation.rs b/core/src/tools/runtimes/shell/unix_escalation.rs
+index 10cb460..e868140 100644
+--- a/core/src/tools/runtimes/shell/unix_escalation.rs
++++ b/core/src/tools/runtimes/shell/unix_escalation.rs
+@@ -454,6 +454,7 @@ impl CoreShellActionProvider {
+         let call_id = self.call_id.clone();
+         let approval_id = Some(Uuid::new_v4().to_string());
+         let environment_id = Some(self.environment_id.clone());
++        let sandbox_permissions = self.approval_sandbox_permissions;
+         let source = self.tool_name;
+         let guardian_review_id = routes_approval_to_guardian(&turn).then(new_guardian_review_id);
+         Ok(stopwatch
+@@ -522,6 +523,7 @@ impl CoreShellActionProvider {
+                         environment_id,
+                         command,
+                         workdir.clone(),
++                        sandbox_permissions,
+                         /*reason*/ None,
+                         /*network_approval_context*/ None,
+                         /*proposed_execpolicy_amendment*/ None,
+diff --git a/core/src/tools/runtimes/unified_exec.rs b/core/src/tools/runtimes/unified_exec.rs
+index a1b9b33..d5121fc 100644
+--- a/core/src/tools/runtimes/unified_exec.rs
++++ b/core/src/tools/runtimes/unified_exec.rs
+@@ -202,6 +202,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
+                         environment_id,
+                         command,
+                         native_cwd,
++                        req.sandbox_permissions,
+                         reason,
+                         ctx.network_approval_context.clone(),
+                         req.exec_approval_requirement
+diff --git a/mcp-server/src/codex_tool_runner.rs b/mcp-server/src/codex_tool_runner.rs
+index cbc113f..3cef3dc 100644
+--- a/mcp-server/src/codex_tool_runner.rs
++++ b/mcp-server/src/codex_tool_runner.rs
+@@ -224,6 +224,7 @@ async fn run_codex_tool_session_inner(
+                             started_at_ms: _,
+                             command,
+                             cwd,
++                            sandbox_permissions: _,
+                             call_id,
+                             approval_id: _,
+                             reason: _,
+diff --git a/protocol/src/approvals.rs b/protocol/src/approvals.rs
+index 5cf4f27..bcf5dd8 100644
+--- a/protocol/src/approvals.rs
++++ b/protocol/src/approvals.rs
+@@ -1,6 +1,7 @@
+ use crate::mcp::RequestId;
+ use crate::models::AdditionalPermissionProfile;
+ use crate::models::PermissionProfile;
++use crate::models::SandboxPermissions;
+ use crate::parse_command::ParsedCommand;
+ use crate::protocol::FileChange;
+ use crate::protocol::ReviewDecision;
+@@ -245,6 +246,10 @@ pub struct ExecApprovalRequestEvent {
+     pub command: Vec<String>,
+     /// The command's working directory.
+     pub cwd: AbsolutePathBuf,
++    /// Per-command sandbox override requested by the originating shell-like
++    /// tool call. This is stable provenance: approval consumers must not infer
++    /// it from presentation text, reasons, or parsed command actions.
++    pub sandbox_permissions: SandboxPermissions,
+     /// Optional human-readable reason for the approval (e.g. retry without sandbox).
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub reason: Option<String>,
+diff --git a/tui/src/app/app_server_requests.rs b/tui/src/app/app_server_requests.rs
+index 0b72897..0a548fe 100644
+--- a/tui/src/app/app_server_requests.rs
++++ b/tui/src/app/app_server_requests.rs
+@@ -465,6 +465,7 @@ mod tests {
+                 command: Some("ls".to_string()),
+                 cwd: None,
+                 command_actions: None,
++                sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                 additional_permissions: None,
+                 proposed_execpolicy_amendment: None,
+                 proposed_network_policy_amendments: None,
+@@ -805,6 +806,7 @@ mod tests {
+                     command: Some("ls".to_string()),
+                     cwd: None,
+                     command_actions: None,
++                    sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                     additional_permissions: None,
+                     proposed_execpolicy_amendment: None,
+                     proposed_network_policy_amendments: None,
+diff --git a/tui/src/app/pending_interactive_replay.rs b/tui/src/app/pending_interactive_replay.rs
+index d204105..c53be79 100644
+--- a/tui/src/app/pending_interactive_replay.rs
++++ b/tui/src/app/pending_interactive_replay.rs
+@@ -621,6 +621,7 @@ mod tests {
+                 command: Some("echo hi".to_string()),
+                 cwd: Some(test_path_buf("/tmp").abs().into()),
+                 command_actions: None,
++                sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                 additional_permissions: None,
+                 proposed_execpolicy_amendment: None,
+                 proposed_network_policy_amendments: None,
+diff --git a/tui/src/app/tests.rs b/tui/src/app/tests.rs
+index 04c2e85..0bcb74f 100644
+--- a/tui/src/app/tests.rs
++++ b/tui/src/app/tests.rs
+@@ -4711,6 +4711,7 @@ fn exec_approval_request(
+             command: Some("echo hello".to_string()),
+             cwd: Some(test_path_buf("/tmp/project").abs().into()),
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: None,
+             proposed_execpolicy_amendment: None,
+             proposed_network_policy_amendments: None,
+diff --git a/tui/src/app/thread_events.rs b/tui/src/app/thread_events.rs
+index 8d41f1c..96f9ec1 100644
+--- a/tui/src/app/thread_events.rs
++++ b/tui/src/app/thread_events.rs
+@@ -494,6 +494,7 @@ mod tests {
+                 command: Some("echo hello".to_string()),
+                 cwd: Some(test_path_buf("/tmp/project").abs().into()),
+                 command_actions: None,
++                sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+                 additional_permissions: None,
+                 proposed_execpolicy_amendment: None,
+                 proposed_network_policy_amendments: None,
+diff --git a/tui/src/chatwidget/tests/approval_requests.rs b/tui/src/chatwidget/tests/approval_requests.rs
+index 1ec9a9c..e7f4ca6 100644
+--- a/tui/src/chatwidget/tests/approval_requests.rs
++++ b/tui/src/chatwidget/tests/approval_requests.rs
+@@ -67,6 +67,7 @@ fn app_server_exec_approval_request_splits_shell_wrapped_command() {
+             ),
+             cwd: Some(test_path_buf("/tmp").abs().into()),
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: None,
+             proposed_execpolicy_amendment: None,
+             proposed_network_policy_amendments: None,
+@@ -109,6 +110,7 @@ fn app_server_exec_approval_request_preserves_permissions_context() {
+             command: Some("ls".to_string()),
+             cwd: Some(test_path_buf("/tmp").abs().into()),
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: Some(AppServerAdditionalPermissionProfile {
+                 network: Some(AppServerAdditionalNetworkPermissions {
+                     enabled: Some(true),
+@@ -169,6 +171,7 @@ async fn network_exec_approval_history_describes_session_host_allowance() {
+             command: Some("network-access https://example.com:8443".to_string()),
+             cwd: None,
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: None,
+             proposed_execpolicy_amendment: None,
+             proposed_network_policy_amendments: None,
+@@ -211,6 +214,7 @@ async fn network_exec_approval_history_describes_one_time_host_allowance() {
+             command: None,
+             cwd: None,
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: None,
+             proposed_execpolicy_amendment: None,
+             proposed_network_policy_amendments: None,
+@@ -253,6 +257,7 @@ async fn network_exec_approval_history_describes_canceled_host_request() {
+             command: Some("network-access socks5-tcp://example.com:1080".to_string()),
+             cwd: None,
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: None,
+             proposed_execpolicy_amendment: None,
+             proposed_network_policy_amendments: None,
+diff --git a/tui/src/chatwidget/tests/exec_flow.rs b/tui/src/chatwidget/tests/exec_flow.rs
+index 99190ec..9f2f0b2 100644
+--- a/tui/src/chatwidget/tests/exec_flow.rs
++++ b/tui/src/chatwidget/tests/exec_flow.rs
+@@ -66,6 +66,7 @@ fn app_server_exec_approval_request_splits_shell_wrapped_command() {
+             ),
+             cwd: Some(test_path_buf("/tmp").abs().into()),
+             command_actions: None,
++            sandbox_permissions: codex_protocol::models::SandboxPermissions::UseDefault,
+             additional_permissions: None,
+             proposed_execpolicy_amendment: None,
+             proposed_network_policy_amendments: None,

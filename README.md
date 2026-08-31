@@ -24,7 +24,7 @@ Runtime Baseline 0 已建立：
 - 上游固定为 `openai/codex` 的 `rust-v0.144.6`；
 - 完整 commit 为 `5d1fbf26c43abc65a203928b2e31561cb039e06d`；
 - `codex-rs/` 与该 commit 的上游子树字节级一致；
-- 当前 Runtime candidate 构建时严格按 `0001` → `0002` 应用两个可重放 patch：FEAT-126 持久诊断日志安全 patch，以及 Owner 单独授权的 FEAT-136 early sandbox-denial Command lifecycle patch；
+- 当前 Runtime candidate 构建时严格按 `0001` → `0002` → `0003` 应用三个可重放 patch：FEAT-126 持久诊断日志安全 patch、FEAT-136 early sandbox-denial Command lifecycle patch，以及 Owner 单独授权的 FEAT-137 stable sandbox provenance patch；
 - 首个发布目标为 `aarch64-apple-darwin`；
 - app-server 客户端基线使用稳定 API、JSONL-over-stdio；
 - 版本匹配的 JSON Schema 位于 `.yijie/schemas/app-server/`。
@@ -33,9 +33,11 @@ Runtime Baseline 0 已建立：
 
 ## Runtime Baseline 0
 
-Baseline 0 固定不可变上游源码、协议 Schema 和工具链。易界 overlay 只在临时构建工作区应用。`0001-feat-126-filter-persistent-diagnostics.patch` 收紧本地 SQLite 诊断日志；`0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` 在 early sandbox-denial 返回发生在既有 emitter 之前时，补发同一 Command identity 的 canonical `item/started` 与 failed `item/completed`，但不改变原错误、retry/approval 决策、权限或 sandbox 策略。
+Baseline 0 固定不可变上游源码、协议 Schema 和工具链。易界 overlay 只在临时构建工作区应用。`0001-feat-126-filter-persistent-diagnostics.patch` 收紧本地 SQLite 诊断日志；`0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` 补齐 early sandbox-denial 的 canonical Command terminal；`0003-feat-137-stable-sandbox-provenance.patch` 为 stable `item/commandExecution/requestApproval` 增加必填 `sandboxPermissions`，并从 tool request 经 core approval event 原样投影到 app-server wire。`0003` 只暴露既有权限 provenance，不改变执行权限、审批决策或 public v6 API。
 
 FEAT-136 的 `contract-impact` 为 `semantic`。隔离 macOS Apple Silicon release build、Schema 生成和逐文件比较已确认 stable app-server Schema 仍为 267 个文件、tree SHA-256 `82ee9de771cf1d41bac16d87380f1121e7794107aa3aa526ad702d5d1bf7afe1` 且无 tracked diff；normal-EOF stdio smoke、focused `codex-core`、4 个 safe fake exec-server 场景、`codex-app-server-protocol`、fmt、scoped clippy、fork-management 及 Runtime→Contracts 双向门禁均通过。这仍不等同于 Runtime→Host→Desktop conformance 已通过。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 固定此前 Runtime provenance，必须由新的 Contracts candidate 重新 pin。Tool D4 未执行，且本 patch 不制造 Tool producer。
+
+FEAT-137 `0003` 的 `contract-impact` 为 `breaking`，仅因为 closed stable-wire consumer 必须接收新增必填 provenance；public v6 API 仍不变。隔离 release build 与 canonical generation 确认 stable Schema 仍为 267 个文件，tree SHA-256 为 `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228`；生成的 enum 恰好为三种既有 Runtime sandbox permission。Contracts 必须以新版本化 compatibility 投影精确 pin 本 Runtime commit 后，Host 才能消费。
 
 它不表示 Desktop sidecar、真实模型回合或云端 runner 已完成。
 

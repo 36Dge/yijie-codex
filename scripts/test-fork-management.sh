@@ -110,17 +110,18 @@ python3 scripts/test_write_runtime_manifest.py
 expected_patches=(
   ".yijie/patches/0001-feat-126-filter-persistent-diagnostics.patch"
   ".yijie/patches/0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch"
+  ".yijie/patches/0003-feat-137-stable-sandbox-provenance.patch"
 )
 shopt -s nullglob dotglob
 patches=(.yijie/patches/*.patch)
 shopt -u dotglob nullglob
 if [ "${#patches[@]}" -ne "${#expected_patches[@]}" ]; then
-  echo "Runtime patch set does not match the reviewed FEAT-126/FEAT-136 overlays." >&2
+  echo "Runtime patch set does not match the reviewed FEAT-126/FEAT-136/FEAT-137 overlays." >&2
   exit 1
 fi
 for index in "${!expected_patches[@]}"; do
   if [ "${patches[$index]}" != "${expected_patches[$index]}" ]; then
-    echo "Runtime patch set order does not match the reviewed FEAT-126/FEAT-136 overlays." >&2
+    echo "Runtime patch set order does not match the reviewed FEAT-126/FEAT-136/FEAT-137 overlays." >&2
     exit 1
   fi
 done

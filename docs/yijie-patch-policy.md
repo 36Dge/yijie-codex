@@ -6,6 +6,7 @@ canonical `codex-rs/` 必须继续与 Runtime Baseline 0 的固定上游 commit 
 
 1. `0001-feat-126-filter-persistent-diagnostics.patch`：解决 FEAT-126 full-case R8 发现的本地 SQLite 路径日志持久化问题，不改变 app-server schema、transport 或外部业务协议。
 2. `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch`：Owner 单独授权的最小 Runtime producer 修复；治理记录如下。
+3. `0003-feat-137-stable-sandbox-provenance.patch`：Owner 单独授权的 stable approval provenance 修复；治理记录如下。
 
 ## FEAT-136 `0002` 治理记录
 
@@ -19,6 +20,14 @@ canonical `codex-rs/` 必须继续与 Runtime Baseline 0 的固定上游 commit 
 - 回滚：恢复此前受支持 Runtime commit `0ce5902ed400866be0196886bb78f693a004d68d` 和与其匹配的 Contracts provenance。若从尚未晋升的 candidate 删除 `0002`，同一治理变更必须同步 allowlist、manifest 与文档；禁止在构建时临时跳过 patch。
 - 上游升级删除条件：只有新上游原生提供相同的 exactly-once canonical started/failed terminal，且 focused core/protocol、Schema、Host completed reconciliation、Desktop reducer/hydration 和权限语义复核全部通过后，才删除 `0002` 并更新 Runtime/Contracts pins。若实现或语义不等价，继续移植最小 patch 或停止升级评审。
 - D4 边界：本 patch 只修复 Command producer。Tool D4 保持 `BLOCKED/NOT RUN`；不得注册 MCP/Connector/dynamic tool 或制造 producer 来获得证据。
+
+## FEAT-137 `0003` 治理记录
+
+- 原因与 Host 边界：stable approval wire 此前没有携带 originating shell request 的 sandbox provenance，Host 无法可靠区分 `use_default` 与权限扩张请求；不得从展示命令、reason 或 parsed action 推断 authority。
+- 源码基线与顺序：固定上游仍为 `rust-v0.144.6` / `5d1fbf26c43abc65a203928b2e31561cb039e06d`，按 `0001` → `0002` → `0003` 应用，canonical `codex-rs/` 保持零漂移。
+- 行为：`sandboxPermissions` 为 stable request 的必填枚举，只允许 `use_default`、`require_escalated`、`with_additional_permissions`；shell/unified-exec tool request → `ExecApprovalRequestEvent` → app-server wire 原样传递。字段是 provenance，不授予权限；既有 Runtime 执行与审批逻辑不变。
+- 契约影响：`contract-impact = breaking`（对 closed stable-wire consumer 新增必填字段）。Contracts 必须 source-first 新增版本化 v6 compatibility 投影；public v6 Host/Desktop API 不增加字段。
+- D4 边界：本批只做 source、artifact、immutable pins 和 conformance；真实 Provider/模型调用为 0，D4 不执行。
 
 优先通过上游配置、稳定 app-server API、MCP、Skills、Plugins 或 `yijie-agent-host` 适配解决需求。只有这些边界无法满足经过确认的产品或安全要求时，才可以提议 Runtime patch。
 

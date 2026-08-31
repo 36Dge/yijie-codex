@@ -32,7 +32,7 @@ class RuntimeManifestPatchSetTests(unittest.TestCase):
     def write_patch(self, name: str) -> None:
         (self.patch_dir / name).write_text("benign patch fixture\n", encoding="utf-8")
 
-    def test_accepts_only_the_exact_ordered_feat126_feat136_patch_set(self) -> None:
+    def test_accepts_only_the_exact_ordered_feat126_feat136_feat137_patch_set(self) -> None:
         for name in reversed(self.manifest.EXPECTED_PATCH_NAMES):
             self.write_patch(name)
         patches = self.manifest.reviewed_patch_files(self.patch_dir)
@@ -44,12 +44,13 @@ class RuntimeManifestPatchSetTests(unittest.TestCase):
     def test_rejects_missing_extra_or_renamed_patch(self) -> None:
         cases = (
             self.manifest.EXPECTED_PATCH_NAMES[:1],
-            (*self.manifest.EXPECTED_PATCH_NAMES, "0003-unreviewed.patch"),
-            (*self.manifest.EXPECTED_PATCH_NAMES, ".0003-hidden.patch"),
+            (*self.manifest.EXPECTED_PATCH_NAMES, "0004-unreviewed.patch"),
+            (*self.manifest.EXPECTED_PATCH_NAMES, ".0004-hidden.patch"),
             (*self.manifest.EXPECTED_PATCH_NAMES, ".patch"),
             (
                 self.manifest.EXPECTED_PATCH_NAMES[0],
-                "0002-renamed.patch",
+                self.manifest.EXPECTED_PATCH_NAMES[1],
+                "0003-renamed.patch",
             ),
         )
         for index, names in enumerate(cases):

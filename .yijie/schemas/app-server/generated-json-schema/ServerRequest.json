@@ -428,6 +428,14 @@
             "null"
           ]
         },
+        "sandboxPermissions": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SandboxPermissions"
+            }
+          ],
+          "description": "Per-command sandbox override requested by the originating shell-like tool call. This stable field is authority provenance, not presentation."
+        },
         "startedAtMs": {
           "description": "Unix timestamp (in milliseconds) when this approval request started.",
           "format": "int64",
@@ -442,6 +450,7 @@
       },
       "required": [
         "itemId",
+        "sandboxPermissions",
         "startedAtMs",
         "threadId",
         "turnId"
@@ -1699,6 +1708,32 @@
         }
       },
       "type": "object"
+    },
+    "SandboxPermissions": {
+      "description": "Controls the per-command sandbox override requested by a shell-like tool call.",
+      "oneOf": [
+        {
+          "description": "Run with the turn's configured sandbox policy unchanged.",
+          "enum": [
+            "use_default"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Request to run outside the sandbox.",
+          "enum": [
+            "require_escalated"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Request to stay in the sandbox while widening permissions for this command only.",
+          "enum": [
+            "with_additional_permissions"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ThreadId": {
       "type": "string"
