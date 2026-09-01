@@ -14,7 +14,7 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 - tag：`rust-v0.144.6`；
 - commit：`5d1fbf26c43abc65a203928b2e31561cb039e06d`；
 - source：上游 `codex-rs/` 子树加根目录 `LICENSE`、`NOTICE`；
-- patch 顺序：`0001-feat-126-filter-persistent-diagnostics.patch` → `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` → `0003-feat-137-stable-sandbox-provenance.patch`；
+- patch 顺序：`0001-feat-126-filter-persistent-diagnostics.patch` → `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch` → `0003-feat-137-stable-sandbox-provenance.patch` → `0004-feat-137-deterministic-approval-producer.patch`；
 - Rust：`1.95.0`；
 - primary target：`aarch64-apple-darwin`；
 - app-server：稳定 API，`experimentalApi=false`，JSONL-over-stdio。
@@ -24,7 +24,7 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 1. `UPSTREAM.md` 和 `.yijie/upstream.env` 记录一致的上游 URL、tag、完整 commit、Runtime 版本和工具链。
 2. `make sync` 从固定 commit 重建源码，验证 tag 解引用结果，内容相同时幂等，目标存在改动时不覆盖。
 3. `verify-upstream-source.sh` 证明 `codex-rs/`、`LICENSE` 和 `NOTICE` 与上游一致。
-4. `make apply-patches` 从固定上游按精确名称与顺序重放 reviewed `0001` → `0002` → `0003` patch set，拒绝缺失、额外、乱序 patch 及对 canonical `codex-rs/` 的修改。
+4. `make apply-patches` 从固定上游按精确名称与顺序重放 reviewed `0001` → `0002` → `0003` → `0004` patch set，拒绝缺失、额外、乱序 patch 及对 canonical `codex-rs/` 的修改。
 5. `make build` 使用固定 Rust 工具链和目标平台，以临时构建工作树产出 `codex-cli 0.144.6` release binary。
 6. 上游 release lock 的正规化只能改变本地 workspace package 版本，且正规化前后 SHA-256 被记录。
 7. `make generate` 使用构建产物导出 stable app-server JSON Schema，并进行 canonical JSON serialization。
@@ -52,7 +52,13 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 
 Owner 授权的 `0003` 在 stable Command approval request 上增加必填 `sandboxPermissions`，只允许 `use_default`、`require_escalated`、`with_additional_permissions`。值从 originating tool request 经 core approval event 原样进入 app-server wire；它不改变 Runtime 的权限、审批或执行决策，public v6 API 也保持不变。对 strict stable-wire consumer，该新增必填字段分类为 `breaking`，必须由 Contracts 新的版本化 v6 compatibility 投影承接。
 
-Runtime source/focused tests、精确三补丁 replay、fmt、scoped Clippy、Rust `1.95.0` release build、267-file Schema 生成与 normal-EOF smoke 已通过。Schema tree SHA-256 为 `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228`，binary SHA-256 为 `84bb0445a15f99354ddd38ccb407b9b0d3d28522accece3fa9755918ab6978e3`。跨仓门禁必须等待 Runtime immutable commit，再按 Contracts→Host→Desktop 顺序执行；D4 保持 `NOT RUN`，真实调用为 0。
+Runtime source/focused tests、精确四补丁 replay、fmt、scoped Clippy、Rust `1.95.0` release build、267-file Schema 生成与 normal-EOF smoke 已通过。Schema tree SHA-256 保持 `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228`，新 binary SHA-256 为 `896d303658a0978c3628f10e9e78f12139168be9508dd5f2abc658db186a828b`。跨仓门禁必须等待本 Runtime immutable commit，再按 Contracts→Host→Desktop 顺序执行。
+
+## FEAT-137 deterministic approval producer candidate
+
+Owner 授权的 `0004` 默认关闭，只在 exact D4 进程 gate 值为 `1` 时生效。每个新 user turn 首步仅暴露一个 zero-argument strict `exec_command`，强制 required/non-parallel；handler 忽略 Provider raw arguments并构造固定 `use_default` 只读仓库检查，首 call 后 no-tools/auto。开关关闭时原工具列表、auto choice、parallel 和 raw arguments 保持相等。
+
+该变化 `contract-impact = semantic`：不改变 stable app-server/public v6 shape，不提升权限，也不改变 approval/execute decision。6/6 focused 单元测试、精确四补丁 replay、release build、267-file Schema equality 与 Runtime artifact checks 已通过；Runtime→Contracts→Host→Desktop repin 与 post-repair fresh D4 仍须按顺序完成。
 
 ## 非完成项
 

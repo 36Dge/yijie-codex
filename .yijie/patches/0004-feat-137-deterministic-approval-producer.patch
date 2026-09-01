@@ -1,0 +1,368 @@
+diff --git a/core/src/client.rs b/core/src/client.rs
+index 2bd4ae3..77b9666 100644
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -899,7 +899,7 @@ impl ModelClient {
+             instructions,
+             input,
+             tools,
+-            tool_choice: "auto".to_string(),
++            tool_choice: prompt.tool_choice.clone(),
+             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+             reasoning,
+             store: provider.is_azure_responses_endpoint(),
+diff --git a/core/src/client_common.rs b/core/src/client_common.rs
+index 54ad70d..ca9203e 100644
+--- a/core/src/client_common.rs
++++ b/core/src/client_common.rs
+@@ -26,6 +26,9 @@ pub struct Prompt {
+     /// Whether parallel tool calls are permitted for this prompt.
+     pub(crate) parallel_tool_calls: bool,
+ 
++    /// Responses API tool choice for this prompt.
++    pub(crate) tool_choice: String,
++
+     pub base_instructions: BaseInstructions,
+ 
+     /// Optional the output schema for the model's response.
+@@ -41,6 +44,7 @@ impl Default for Prompt {
+             input: Vec::new(),
+             tools: Vec::new(),
+             parallel_tool_calls: false,
++            tool_choice: "auto".to_string(),
+             base_instructions: BaseInstructions::default(),
+             output_schema: None,
+             output_schema_strict: true,
+diff --git a/core/src/compact_remote_request.rs b/core/src/compact_remote_request.rs
+index bbf2f04..43fba4d 100644
+--- a/core/src/compact_remote_request.rs
++++ b/core/src/compact_remote_request.rs
+@@ -69,6 +69,7 @@ pub(super) async fn run_remote_compact_attempt(
+         input: prompt_input,
+         tools: tool_router.model_visible_specs(),
+         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
++        tool_choice: "auto".to_string(),
+         base_instructions,
+         output_schema: None,
+         output_schema_strict: true,
+diff --git a/core/src/compact_remote_v2_attempt.rs b/core/src/compact_remote_v2_attempt.rs
+index a145d00..47598d4 100644
+--- a/core/src/compact_remote_v2_attempt.rs
++++ b/core/src/compact_remote_v2_attempt.rs
+@@ -77,6 +77,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
+         input,
+         tools: tool_router.model_visible_specs(),
+         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
++        tool_choice: "auto".to_string(),
+         base_instructions,
+         output_schema: None,
+         output_schema_strict: true,
+diff --git a/core/src/feat137_deterministic_approval.rs b/core/src/feat137_deterministic_approval.rs
+new file mode 100644
+index 0000000..709a27c
+--- /dev/null
++++ b/core/src/feat137_deterministic_approval.rs
+@@ -0,0 +1,255 @@
++use std::collections::BTreeMap;
++use std::ffi::OsStr;
++
++use codex_protocol::models::ResponseItem;
++use codex_tools::JsonSchema;
++use codex_tools::ResponsesApiTool;
++use codex_tools::ToolSpec;
++use serde_json::json;
++
++pub(crate) const ENVIRONMENT_GATE: &str = "YIJIE_FEAT137_DETERMINISTIC_APPROVAL_PRODUCER";
++pub(crate) const EXACT_COMMAND: &str = "git rev-parse --is-inside-work-tree";
++
++const TOOL_CHOICE_AUTO: &str = "auto";
++const TOOL_CHOICE_REQUIRED: &str = "required";
++
++#[derive(Debug, PartialEq)]
++pub(crate) struct PromptToolPlan {
++    pub(crate) tools: Vec<ToolSpec>,
++    pub(crate) tool_choice: String,
++    pub(crate) parallel_tool_calls: bool,
++}
++
++pub(crate) fn environment_gate_enabled() -> bool {
++    environment_value_enables_gate(std::env::var_os(ENVIRONMENT_GATE).as_deref())
++}
++
++fn environment_value_enables_gate(value: Option<&OsStr>) -> bool {
++    value == Some(OsStr::new("1"))
++}
++
++pub(crate) fn prompt_tool_plan(
++    input: &[ResponseItem],
++    tools: Vec<ToolSpec>,
++    parallel_tool_calls: bool,
++) -> PromptToolPlan {
++    prompt_tool_plan_for_gate(
++        environment_gate_enabled(),
++        input,
++        tools,
++        parallel_tool_calls,
++    )
++}
++
++fn prompt_tool_plan_for_gate(
++    enabled: bool,
++    input: &[ResponseItem],
++    tools: Vec<ToolSpec>,
++    parallel_tool_calls: bool,
++) -> PromptToolPlan {
++    if !enabled {
++        return PromptToolPlan {
++            tools,
++            tool_choice: TOOL_CHOICE_AUTO.to_string(),
++            parallel_tool_calls,
++        };
++    }
++
++    if current_user_turn_has_exec_command(input) || !has_user_turn(input) {
++        return PromptToolPlan {
++            tools: Vec::new(),
++            tool_choice: TOOL_CHOICE_AUTO.to_string(),
++            parallel_tool_calls: false,
++        };
++    }
++
++    PromptToolPlan {
++        tools: vec![deterministic_exec_command_spec()],
++        tool_choice: TOOL_CHOICE_REQUIRED.to_string(),
++        parallel_tool_calls: false,
++    }
++}
++
++fn has_user_turn(input: &[ResponseItem]) -> bool {
++    input
++        .iter()
++        .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
++}
++
++fn current_user_turn_has_exec_command(input: &[ResponseItem]) -> bool {
++    let Some(last_user_message) = input
++        .iter()
++        .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
++    else {
++        return false;
++    };
++
++    input[last_user_message + 1..].iter().any(|item| {
++        matches!(
++            item,
++            ResponseItem::FunctionCall {
++                name,
++                namespace: None,
++                ..
++            } if name == "exec_command"
++        )
++    })
++}
++
++fn deterministic_exec_command_spec() -> ToolSpec {
++    ToolSpec::Function(ResponsesApiTool {
++        name: "exec_command".to_string(),
++        description: "Run the single deterministic FEAT-137 read-only repository check."
++            .to_string(),
++        strict: true,
++        defer_loading: None,
++        parameters: JsonSchema::object(BTreeMap::new(), Some(Vec::new()), Some(false.into())),
++        output_schema: None,
++    })
++}
++
++pub(crate) fn exec_command_arguments(provider_arguments: String) -> String {
++    exec_command_arguments_for_gate(environment_gate_enabled(), provider_arguments)
++}
++
++fn exec_command_arguments_for_gate(enabled: bool, provider_arguments: String) -> String {
++    if !enabled {
++        return provider_arguments;
++    }
++    json!({
++        "cmd": EXACT_COMMAND,
++        "sandbox_permissions": "use_default"
++    })
++    .to_string()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::tools::handlers::unified_exec::ExecCommandArgs;
++    use codex_protocol::models::ContentItem;
++
++    fn user_message() -> ResponseItem {
++        ResponseItem::Message {
++            id: None,
++            role: "user".to_string(),
++            content: vec![ContentItem::InputText {
++                text: "perform the configured check".to_string(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        }
++    }
++
++    fn ordinary_tool() -> ToolSpec {
++        ToolSpec::Function(ResponsesApiTool {
++            name: "ordinary".to_string(),
++            description: "ordinary tool".to_string(),
++            strict: false,
++            defer_loading: None,
++            parameters: JsonSchema::object(BTreeMap::new(), None, Some(false.into())),
++            output_schema: None,
++        })
++    }
++
++    #[test]
++    fn gate_off_preserves_tool_exposure_choice_and_parallelism_exactly() {
++        let original_tools = vec![ordinary_tool()];
++        let plan =
++            prompt_tool_plan_for_gate(false, &[user_message()], original_tools.clone(), true);
++
++        assert_eq!(plan.tools, original_tools);
++        assert_eq!(plan.tool_choice, TOOL_CHOICE_AUTO);
++        assert!(plan.parallel_tool_calls);
++    }
++
++    #[test]
++    fn first_step_forces_one_strict_closed_exec_command() {
++        let plan = prompt_tool_plan_for_gate(true, &[user_message()], vec![ordinary_tool()], true);
++
++        assert_eq!(plan.tool_choice, TOOL_CHOICE_REQUIRED);
++        assert!(!plan.parallel_tool_calls);
++        assert_eq!(plan.tools.len(), 1);
++        let ToolSpec::Function(tool) = &plan.tools[0] else {
++            panic!("expected function tool");
++        };
++        assert_eq!(tool.name, "exec_command");
++        assert!(tool.strict);
++        assert_eq!(
++            serde_json::to_value(&tool.parameters).expect("serialize schema"),
++            json!({
++                "type": "object",
++                "properties": {},
++                "required": [],
++                "additionalProperties": false
++            })
++        );
++    }
++
++    #[test]
++    fn post_exec_step_exposes_no_tools() {
++        let input = vec![
++            user_message(),
++            ResponseItem::FunctionCall {
++                id: None,
++                name: "exec_command".to_string(),
++                namespace: None,
++                arguments: json!({
++                    "cmd": EXACT_COMMAND,
++                    "sandbox_permissions": "use_default"
++                })
++                .to_string(),
++                call_id: "call-1".to_string(),
++                internal_chat_message_metadata_passthrough: None,
++            },
++        ];
++        let plan = prompt_tool_plan_for_gate(true, &input, vec![ordinary_tool()], true);
++
++        assert!(plan.tools.is_empty());
++        assert_eq!(plan.tool_choice, TOOL_CHOICE_AUTO);
++        assert!(!plan.parallel_tool_calls);
++    }
++
++    #[test]
++    fn arbitrary_or_truncated_provider_arguments_cannot_influence_fixed_command() {
++        let provider_arguments = [
++            String::new(),
++            "{".to_string(),
++            r#"{"cmd":"other""#.to_string(),
++            r#"{"sandbox_permissions":"require_escalated"}"#.to_string(),
++        ];
++
++        for raw in provider_arguments {
++            let execution_arguments = exec_command_arguments_for_gate(true, raw);
++            assert_eq!(
++                execution_arguments,
++                json!({
++                    "cmd": EXACT_COMMAND,
++                    "sandbox_permissions": "use_default"
++                })
++                .to_string()
++            );
++            let parsed: ExecCommandArgs =
++                serde_json::from_str(&execution_arguments).expect("fixed arguments must parse");
++            assert_eq!(parsed.cmd, EXACT_COMMAND);
++        }
++    }
++
++    #[test]
++    fn gate_off_preserves_provider_arguments_byte_for_byte() {
++        let arguments = r#"{"cmd":"ordinary","unknown":true"#.to_string();
++
++        assert_eq!(
++            exec_command_arguments_for_gate(false, arguments.clone()),
++            arguments
++        );
++    }
++
++    #[test]
++    fn only_exact_environment_value_enables_gate() {
++        assert!(environment_value_enables_gate(Some(OsStr::new("1"))));
++        assert!(!environment_value_enables_gate(Some(OsStr::new("true"))));
++        assert!(!environment_value_enables_gate(Some(OsStr::new("0"))));
++        assert!(!environment_value_enables_gate(None));
++    }
++}
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index cfc26c5..aa4cb53 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -46,6 +46,7 @@ mod environment_selection;
+ pub mod exec;
+ pub mod exec_env;
+ mod exec_policy;
++mod feat137_deterministic_approval;
+ #[cfg(test)]
+ mod git_info_tests;
+ mod guardian;
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+index bafb368..80df040 100644
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -1087,10 +1087,16 @@ pub(crate) fn build_prompt(
+     turn_context: &TurnContext,
+     base_instructions: BaseInstructions,
+ ) -> Prompt {
++    let tool_plan = crate::feat137_deterministic_approval::prompt_tool_plan(
++        &input,
++        router.model_visible_specs(),
++        turn_context.model_info.supports_parallel_tool_calls,
++    );
+     Prompt {
+         input,
+-        tools: router.model_visible_specs(),
+-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
++        tools: tool_plan.tools,
++        parallel_tool_calls: tool_plan.parallel_tool_calls,
++        tool_choice: tool_plan.tool_choice,
+         base_instructions,
+         output_schema: turn_context.final_output_json_schema.clone(),
+         output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
+diff --git a/core/src/tools/handlers/unified_exec/exec_command.rs b/core/src/tools/handlers/unified_exec/exec_command.rs
+index 546ad45..b003428 100644
+--- a/core/src/tools/handlers/unified_exec/exec_command.rs
++++ b/core/src/tools/handlers/unified_exec/exec_command.rs
+@@ -126,6 +126,8 @@ impl ExecCommandHandler {
+             }
+         };
+ 
++        let arguments = crate::feat137_deterministic_approval::exec_command_arguments(arguments);
++
+         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
+         let context = UnifiedExecContext::new(session.clone(), turn.clone(), call_id.clone());
+         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;

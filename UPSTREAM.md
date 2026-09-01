@@ -30,10 +30,13 @@
 1. `0001-feat-126-filter-persistent-diagnostics.patch`：阻止路径承载的 HTTP、stream、shell、feedback、rollout、core util 和根级 app-server 配置诊断进入本地 SQLite；保留经审查的 state 与 app-server 子 target 日志。该 patch 不改变 app-server schema 或 transport。
 2. `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch`：基于同一上游 `rust-v0.144.6` / `5d1fbf26c43abc65a203928b2e31561cb039e06d`，并以此前易界 Runtime commit `0ce5902ed400866be0196886bb78f693a004d68d` 为 candidate 起点，修复 unified exec 在 early sandbox-denial 检测后、既有 emitter 创建前直接返回，导致 Command lifecycle 从 Runtime→Host→Desktop 链路消失的问题。它只在最终 `SandboxDenied` 返回分支，以相同 call/process identity 依次发布 canonical `item/started`（`inProgress`）和 `item/completed`（`failed`，保留 nonzero exit code、duration 与聚合输出），随后返回原错误；不删除检测、不改变 ToolOrchestrator retry/approval、sandbox 或权限语义，也不制造 Tool producer。
 3. `0003-feat-137-stable-sandbox-provenance.patch`：为 stable `item/commandExecution/requestApproval` 增加必填 `sandboxPermissions`。字段只允许 Runtime 已有枚举 `use_default`、`require_escalated`、`with_additional_permissions`，并从 shell/unified-exec tool request 经 `ExecApprovalRequestEvent` 原样传递到 app-server stable wire；不改变执行权限、审批决策或 public v6 API。
+4. `0004-feat-137-deterministic-approval-producer.patch`：默认关闭；仅当 Host 在 exact Owner-run D4 进程显式设置 `YIJIE_FEAT137_DETERMINISTIC_APPROVAL_PRODUCER=1` 时，每个新 user turn 首步只向 Provider 暴露一个 zero-argument、strict、closed `exec_command`，强制 `tool_choice=required` 且禁止 parallel。Runtime handler 不解析或信任 Provider arguments，而是构造唯一固定的 `use_default` 只读仓库检查；首个 call 后工具集合为空并恢复 `tool_choice=auto`。不提升权限、不修改审批/执行决定，也不改变 public v6 或 stable app-server schema。
 
 `0002` 的 `contract-impact = semantic`：可观察的失败生命周期被补齐，但 stable wire 类型和字段 shape 不变。隔离 release build、Schema 生成和逐文件比较已确认仍为 267 个 stable JSON 文件且无 tracked diff。
 
-patch 的相对路径和 SHA-256 进入 Runtime manifest。管理脚本只接受上述 `0001` → `0002` → `0003` 精确名称与顺序，拒绝缺失、重命名、额外或乱序 patch。`make apply-patches` 必须从上述固定 commit 独立重放成功，且不得修改 canonical `codex-rs/` 物化目录。
+`0004` 的 `contract-impact = semantic`：stable wire shape 不变，但显式 D4 gate 开启时的 Provider 工具可见性和 producer 行为发生变化；gate 关闭时 tools、`tool_choice=auto`、parallel 设置及 provider arguments 均保持原结构/字节值。
+
+patch 的相对路径和 SHA-256 进入 Runtime manifest。管理脚本只接受上述 `0001` → `0002` → `0003` → `0004` 精确名称与顺序，拒绝缺失、重命名、额外或乱序 patch。`make apply-patches` 必须从上述固定 commit 独立重放成功，且不得修改 canonical `codex-rs/` 物化目录。
 
 `0002` 的回滚必须恢复此前受支持的 Runtime commit `0ce5902ed400866be0196886bb78f693a004d68d` 及其匹配的 Contracts provenance；若从 candidate 删除 patch，也必须在同一治理变更中同步 allowlist、manifest 和文档，不能临时跳过。下一次上游升级只有在新上游已经原生保证 early sandbox-denial 对同一 Command 恰好发布一次 canonical started/failed terminal、focused core/protocol 与下游 reconciliation 回归通过、Schema 和权限语义完成复核后，才可删除 `0002` 并重新 pin Runtime/Contracts。
 

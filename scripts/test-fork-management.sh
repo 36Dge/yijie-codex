@@ -111,6 +111,7 @@ expected_patches=(
   ".yijie/patches/0001-feat-126-filter-persistent-diagnostics.patch"
   ".yijie/patches/0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch"
   ".yijie/patches/0003-feat-137-stable-sandbox-provenance.patch"
+  ".yijie/patches/0004-feat-137-deterministic-approval-producer.patch"
 )
 shopt -s nullglob dotglob
 patches=(.yijie/patches/*.patch)

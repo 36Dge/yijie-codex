@@ -7,6 +7,7 @@ canonical `codex-rs/` 必须继续与 Runtime Baseline 0 的固定上游 commit 
 1. `0001-feat-126-filter-persistent-diagnostics.patch`：解决 FEAT-126 full-case R8 发现的本地 SQLite 路径日志持久化问题，不改变 app-server schema、transport 或外部业务协议。
 2. `0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch`：Owner 单独授权的最小 Runtime producer 修复；治理记录如下。
 3. `0003-feat-137-stable-sandbox-provenance.patch`：Owner 单独授权的 stable approval provenance 修复；治理记录如下。
+4. `0004-feat-137-deterministic-approval-producer.patch`：Owner 单独授权的 exact D4 确定性 approval producer；治理记录如下。
 
 ## FEAT-136 `0002` 治理记录
 
@@ -28,6 +29,16 @@ canonical `codex-rs/` 必须继续与 Runtime Baseline 0 的固定上游 commit 
 - 行为：`sandboxPermissions` 为 stable request 的必填枚举，只允许 `use_default`、`require_escalated`、`with_additional_permissions`；shell/unified-exec tool request → `ExecApprovalRequestEvent` → app-server wire 原样传递。字段是 provenance，不授予权限；既有 Runtime 执行与审批逻辑不变。
 - 契约影响：`contract-impact = breaking`（对 closed stable-wire consumer 新增必填字段）。Contracts 必须 source-first 新增版本化 v6 compatibility 投影；public v6 Host/Desktop API 不增加字段。
 - D4 边界：本批只做 source、artifact、immutable pins 和 conformance；真实 Provider/模型调用为 0，D4 不执行。
+
+## FEAT-137 `0004` 治理记录
+
+- 原因：真实失败轮次中的 Provider function arguments 是截断、未闭合 JSON，并在 parse error 回喂后形成自循环；这不是模型选择了另一条命令。不得通过 JSON heuristic 修复、提升权限或反复请求来制造 approval。
+- 开关与默认相等性：只接受进程环境 `YIJIE_FEAT137_DETERMINISTIC_APPROVAL_PRODUCER=1`。Host 只可在 exact local/demo_fast、FEAT-134/136/137 gate 全开且 Owner-run D4 gate 明确开启时注入；开关关闭时 tools、`tool_choice=auto`、parallel 和 Provider arguments 原样保持。
+- 工具面：开关开启后，每个新 user turn 的首步只暴露一个 zero-argument strict/closed `exec_command`，`required=[]`、`additionalProperties=false`、`tool_choice=required`、`parallel=false`。首个 `exec_command` call 后 tools 为空、`tool_choice=auto`，防止同 turn 重复 producer。
+- 执行 authority：handler 不解析、不修复也不信任 Provider raw arguments；无论参数为空、任意或截断，都只构造固定只读仓库检查和 `sandbox_permissions=use_default`，其余参数保持默认且不请求额外权限，然后进入既有正常 exec policy/approval/execute lifecycle。
+- 契约影响：`contract-impact = semantic`。stable app-server/public v6 shape 不变，但显式 D4 gate 下 Provider 工具可见性和 producer 语义改变；不得降为 `none`。
+- 权限与回滚：不提升权限、不改变 approval decision 或 sandbox policy。回滚时移除 `0004` 并同步 allowlist/manifest/文档，Host 必须同时停止注入环境 gate；不得只关闭 handler override 而保留 forced tool schema。
+- 已完成 focused：6/6 单元测试覆盖 gate-off 结构/字节相等、首步 forced closed tool、post-call no-tools、任意/截断参数不影响固定 command 以及 exact gate value。完整 replay、build、Schema equality、Host/Desktop repin 和 D4 仍须按顺序验证。
 
 优先通过上游配置、稳定 app-server API、MCP、Skills、Plugins 或 `yijie-agent-host` 适配解决需求。只有这些边界无法满足经过确认的产品或安全要求时，才可以提议 Runtime patch。
 

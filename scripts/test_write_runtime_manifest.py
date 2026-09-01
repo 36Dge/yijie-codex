@@ -44,13 +44,14 @@ class RuntimeManifestPatchSetTests(unittest.TestCase):
     def test_rejects_missing_extra_or_renamed_patch(self) -> None:
         cases = (
             self.manifest.EXPECTED_PATCH_NAMES[:1],
-            (*self.manifest.EXPECTED_PATCH_NAMES, "0004-unreviewed.patch"),
-            (*self.manifest.EXPECTED_PATCH_NAMES, ".0004-hidden.patch"),
+            (*self.manifest.EXPECTED_PATCH_NAMES, "0005-unreviewed.patch"),
+            (*self.manifest.EXPECTED_PATCH_NAMES, ".0005-hidden.patch"),
             (*self.manifest.EXPECTED_PATCH_NAMES, ".patch"),
             (
                 self.manifest.EXPECTED_PATCH_NAMES[0],
                 self.manifest.EXPECTED_PATCH_NAMES[1],
-                "0003-renamed.patch",
+                self.manifest.EXPECTED_PATCH_NAMES[2],
+                "0004-renamed.patch",
             ),
         )
         for index, names in enumerate(cases):

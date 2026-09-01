@@ -14,6 +14,7 @@ EXPECTED_PATCH_NAMES = (
     "0001-feat-126-filter-persistent-diagnostics.patch",
     "0002-feat-136-unified-exec-pre-emitter-command-lifecycle.patch",
     "0003-feat-137-stable-sandbox-provenance.patch",
+    "0004-feat-137-deterministic-approval-producer.patch",
 )
 
 
