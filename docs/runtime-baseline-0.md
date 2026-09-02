@@ -52,13 +52,13 @@ Baseline 0 解决的是“我们究竟基于哪一份 Runtime、能否重复得�
 
 Owner 授权的 `0003` 在 stable Command approval request 上增加必填 `sandboxPermissions`，只允许 `use_default`、`require_escalated`、`with_additional_permissions`。值从 originating tool request 经 core approval event 原样进入 app-server wire；它不改变 Runtime 的权限、审批或执行决策，public v6 API 也保持不变。对 strict stable-wire consumer，该新增必填字段分类为 `breaking`，必须由 Contracts 新的版本化 v6 compatibility 投影承接。
 
-Runtime source/focused tests、精确四补丁 replay、fmt、scoped Clippy、Rust `1.95.0` release build、267-file Schema 生成与 normal-EOF smoke 已通过。Schema tree SHA-256 保持 `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228`，新 binary SHA-256 为 `896d303658a0978c3628f10e9e78f12139168be9508dd5f2abc658db186a828b`。跨仓门禁必须等待本 Runtime immutable commit，再按 Contracts→Host→Desktop 顺序执行。
+admission hardening 之前的 immutable Runtime source/focused tests、精确四补丁 replay、fmt、scoped Clippy、Rust `1.95.0` release build、267-file Schema 生成与 normal-EOF smoke 曾通过；其 Schema tree SHA-256 为 `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228`，binary SHA-256 为 `896d303658a0978c3628f10e9e78f12139168be9508dd5f2abc658db186a828b`。当前 `0004` re-repair 已使该 binary/manifest 失去 authority；跨仓门禁必须等待新的 Runtime immutable freeze/build，再按 Contracts→Host→Desktop 顺序执行。
 
 ## FEAT-137 deterministic approval producer candidate
 
-Owner 授权的 `0004` 默认关闭，只在 exact D4 进程 gate 值为 `1` 时生效。每个新 user turn 首步仅暴露一个 zero-argument strict `exec_command`，强制 required/non-parallel；handler 忽略 Provider raw arguments并构造固定 `use_default` 只读仓库检查，首 call 后 no-tools/auto。开关关闭时原工具列表、auto choice、parallel 和 raw arguments 保持相等。
+Owner 授权的 `0004` 默认关闭，只在 exact D4 进程 gate 值为 `1` 时生效。每个新 user turn 首步仅暴露一个 zero-argument strict `exec_command`，强制 required/non-parallel；raw Added/delta 在 client、rollout、session/OTEL sink 前抑制，首个 exact plain/nonempty-call-id Done 原子接纳并替换为固定 `use_default` 只读仓库检查。Provider 无 admitted Done、handler 未完成或 duplicate/hidden/invalid call 均 stable fail，fatal 不 drain 未 poll tool future；首 call 后同一 TurnContext 的 steer/follow-up 继续 no-tools/auto。exact managed profile 要求 hooks/plugins/apps/tool search 全关，Runtime 在 hook/plugin/MCP contributor 前 fail closed，configured/runtime/effective MCP server 与 connector 投影为零。shell snapshot capture 禁用；direct、exec-server、override 和 no-snapshot non-login wrapper 精确清除 reviewed private credential/gate/startup-file names。开关关闭时原工具列表、auto choice、parallel、Provider item/arguments、hook/plugin/MCP composition 和 env map/policy 保持相等。
 
-该变化 `contract-impact = semantic`：不改变 stable app-server/public v6 shape，不提升权限，也不改变 approval/execute decision。6/6 focused 单元测试、精确四补丁 replay、release build、267-file Schema equality 与 Runtime artifact checks 已通过；Runtime→Contracts→Host→Desktop repin 与 post-repair fresh D4 仍须按顺序完成。
+该变化 `contract-impact = semantic`：不改变 stable app-server/public v6 shape，不提升权限，也不改变 approval/execute decision。当前 re-repair 的 25/25 safe focused（`codex-core` 24、`codex-api` 1）、精确四补丁 fresh replay/equality、scoped Clippy 与 source-conformance checker 已通过；新的 immutable freeze、release build、267-file Schema/manifest equality、Runtime→Contracts→Host→Desktop repin 与 post-repair fresh D4 仍须按顺序完成。admission hardening 之前的 binary/manifest 不再具有当前 authority。
 
 ## 非完成项
 

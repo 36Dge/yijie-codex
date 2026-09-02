@@ -17,6 +17,7 @@ required=(
   docs/runtime-compatibility.md
   docs/runtime-baseline-0.md
   scripts/check_agent_host_contracts.py
+  scripts/check-feat137-deterministic-approval.py
   scripts/app-server-smoke.py
   scripts/runtime_manifest.py
   scripts/test_app_server_smoke.py
@@ -126,6 +127,14 @@ for index in "${!expected_patches[@]}"; do
     exit 1
   fi
 done
-./scripts/apply-yijie-patches.sh
+./scripts/verify-upstream-source.sh
+patched_workspace="$source_diff_test_dir/feat137-patched-codex-rs"
+mkdir -p "$patched_workspace"
+git archive "$YIJIE_CODEX_UPSTREAM_COMMIT:$YIJIE_CODEX_UPSTREAM_SUBTREE" \
+  | tar -x -C "$patched_workspace"
+./scripts/apply-yijie-patches.sh "$patched_workspace"
+python3 scripts/check-feat137-deterministic-approval.py \
+  "$patched_workspace" \
+  .yijie/patches/0004-feat-137-deterministic-approval-producer.patch
 
 echo "Fork-management metadata and scripts are valid."

@@ -46,22 +46,23 @@ Runtime 自身候选门禁和 Runtime→Contracts 双向检查已通过，但不
 
 Owner 授权的 `0003-feat-137-stable-sandbox-provenance.patch` 在既有 `0001`、`0002` 之后应用。它为 stable `item/commandExecution/requestApproval` 增加必填 `sandboxPermissions`，枚举严格限定为 `use_default`、`require_escalated`、`with_additional_permissions`，并保持 tool request → core `ExecApprovalRequestEvent` → app-server wire 的原值。该字段不授予权限，不改变审批或执行决策，也不扩张 public v6 API。
 
-Owner 授权的 `0004-feat-137-deterministic-approval-producer.patch` 继续叠加在 `0003` 之后，默认关闭。exact D4 进程 gate 开启时，它以 zero-argument strict tool 和 Runtime-owned fixed arguments 消除 Provider 截断 JSON 对 approval producer 的影响；首 call 后 no-tools。该变化分类为 `semantic`，不新增 stable wire shape。
+Owner 授权的 `0004-feat-137-deterministic-approval-producer.patch` 继续叠加在 `0003` 之后，默认关闭。exact D4 进程 gate 开启时，它以 zero-argument strict tool、client/transport 最早 raw-payload boundary、turn-scoped atomic admission、Provider/handler terminal validation、same-turn no-tools、hook/plugin/MCP zero surface、snapshot no-file 和 exact child-environment scrub 消除截断 JSON、自循环、重复 approval、ambient producer 与 credential inheritance 风险。该变化分类为 `semantic`，不新增 stable wire shape。
 
 | FEAT-137 Runtime 检查 | 当前结果 |
 |---|---|
 | 精确 `0001` → `0002` → `0003` → `0004` allowlist 与独立 replay | 通过 |
-| deterministic producer focused | 6/6 通过；包含 gate-off equality、zero-argument required、one-shot 和 truncated arguments isolation |
+| deterministic producer focused | 25/25 通过（`codex-core` 24、`codex-api` 1）；包含 gate-off equality、zero-argument required、client/rollout/LastResponse canary=0、missing-Done terminal、same-turn steer closure、empty/hidden/duplicate rejection、handler lifecycle、hook/plugin/MCP zero、snapshot no-file、non-login wrapper 与 direct/exec-server scrub |
+| deterministic producer source conformance | 通过；26-path patch boundary closed，sanitizer/admission 位于 client persistent/observable sink 前，SSE/WS payload telemetry/log gate、fatal no-drain、hook/plugin/MCP early return 与 env scrub 接线完整 |
 | core 三枚举 provenance focused test | 1/1 通过 |
 | stable projection strip focused test | 1/1 通过 |
 | app-server stable wire focused test | 1/1 通过，`use_default` 原样出现 |
-| fmt 与 scoped Clippy | 通过；app-server 只放行未被 patch 触及的既有 `unused_mut` |
-| Rust `1.95.0` release build | 通过；`codex-cli 0.144.6` / `aarch64-apple-darwin` |
-| stable Schema | 267 files / `d82a33f683e554c10dd056a0101c26fd24477928e3f98ee3d9ef250b97395228`；`0004` equality 通过 |
-| binary | SHA-256 `896d303658a0978c3628f10e9e78f12139168be9508dd5f2abc658db186a828b` |
-| normal-EOF stdio smoke | 通过；无凭据、无 Provider/模型调用 |
+| fmt 与 scoped Clippy | 当前 source focused 通过；完整冻结复审待新 immutable commit |
+| Rust `1.95.0` release build | 当前 re-repair `NOT RUN`；旧 immutable artifact 已失效 |
+| stable Schema | 当前 re-repair 待重新生成/equality；source patch 不触及 app-server/protocol 路径 |
+| binary | 当前 re-repair `NOT BUILT`；旧 `896d…` 不得复用 |
+| normal-EOF stdio smoke | 当前 re-repair `NOT RUN` |
 | Contracts/Host/Desktop | 等待本 Runtime immutable commit 后依次 source-first repin |
-| D4 | `NOT RUN`；真实调用 0 |
+| post-repair fresh D4 | `NOT RUN`；本 Runtime source/freeze 阶段真实调用 0；历史 pre-repair RCA 调用由 FEAT-137 D4 证据单独记账 |
 
 ## Agent Host Contracts 双向门禁
 
