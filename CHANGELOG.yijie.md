@@ -21,3 +21,6 @@
 - Generate and canonicalize 267 stable app-server JSON Schema files.
 - Add credential-free JSONL-over-stdio app-server handshake compatibility testing.
 - Generate artifact manifests with source, binary, Schema, and build-lock SHA-256 records.
+## FEAT-155 input-only candidate (2026-09-19)
+
+Add an opt-in native text-input restriction with no executable tools, no task filesystem/network permissions, no inherited instructions/skills/hooks/MCP/plugin contributors, and a stable read-only policy query. Default ordinary behavior and the immutable upstream source remain unchanged. Build from the active two-patch baseline into a separate reproducible candidate; the retired FEAT-137 patch set is excluded. Qualification and downstream activation require actual native evidence and source-first Contracts projection. See [design and validation boundaries](docs/input-only-execution.md).

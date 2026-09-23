@@ -70,3 +70,6 @@ FEAT-136 双 patch candidate 当前已通过：
 - normal-EOF app-server stdio `initialize` / `initialized`、双补丁 artifact manifest 与 Runtime→Contracts 双向兼容检查。
 
 尚未完成 Contracts 新 immutable candidate、Host/Desktop 精确 repin 及 Runtime→Host→Desktop conformance。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍记录此前 Runtime provenance；必须由新的 Contracts candidate 精确 repin 新 Runtime immutable commit 和已确认 Schema digest。Tool D4 保持 `BLOCKED/NOT RUN`。
+# FEAT-155 input-only candidate supplement
+
+2026-09-19: the upstream pin and canonical `codex-rs/` subtree remain unchanged. The separately built input-only candidate applies the two active patches followed by `.yijie/patches/input-only/0003-input-only-execution.patch`. Its schema and binary live in dedicated candidate directories and must be projected through Contracts before Host activation. See [native restriction](docs/input-only-execution.md). Existing historical baseline statements below retain their original meaning.

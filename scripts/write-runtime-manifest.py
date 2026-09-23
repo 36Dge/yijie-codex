@@ -18,13 +18,20 @@ EXPECTED_PATCH_NAMES = (
 )
 
 
-def reviewed_patch_files(patch_dir: Path) -> list[Path]:
-    patch_files = sorted(patch_dir.glob("*.patch"))
-    patch_names = tuple(patch.name for patch in patch_files)
-    if patch_names != EXPECTED_PATCH_NAMES:
+def reviewed_patch_files(patch_dir: Path, profile: str = "legacy") -> list[Path]:
+    expected = EXPECTED_PATCH_NAMES
+    if profile == "input-only":
+        expected = EXPECTED_PATCH_NAMES[:2] + (
+            "input-only/0003-input-only-execution.patch",
+        )
+        patch_files = [patch_dir / name for name in expected]
+    else:
+        patch_files = sorted(patch_dir.glob("*.patch"))
+    patch_names = tuple(patch.relative_to(patch_dir).as_posix() for patch in patch_files)
+    if patch_names != expected:
         raise SystemExit(
             "Runtime manifest requires the exact ordered FEAT-126/FEAT-136/FEAT-137 patch set: "
-            f"expected={list(EXPECTED_PATCH_NAMES)!r}, got={list(patch_names)!r}"
+            f"expected={list(expected)!r}, got={list(patch_names)!r}"
         )
     if any(not patch.is_file() or patch.is_symlink() for patch in patch_files):
         raise SystemExit("Runtime manifest patch set contains a missing or unsafe patch")
@@ -44,6 +51,7 @@ def main() -> int:
     parser.add_argument("--rust-toolchain", required=True)
     parser.add_argument("--lock-normalization", required=True, type=Path)
     parser.add_argument("--patch-dir", required=True, type=Path)
+    parser.add_argument("--profile", choices=("legacy", "input-only"), default="legacy")
     args = parser.parse_args()
 
     binary = args.binary.resolve()
@@ -54,7 +62,7 @@ def main() -> int:
         raise SystemExit(f"Schema directory is missing: {schema_dir}")
     if not args.lock_normalization.is_file():
         raise SystemExit(f"Lock normalization report is missing: {args.lock_normalization}")
-    patch_files = reviewed_patch_files(args.patch_dir)
+    patch_files = reviewed_patch_files(args.patch_dir, args.profile)
 
     reported_version = subprocess.run(
         [str(binary), "--version"],
@@ -81,7 +89,7 @@ def main() -> int:
         },
         "patches": [
             {
-                "path": f".yijie/patches/{patch.name}",
+                "path": f".yijie/patches/{patch.relative_to(args.patch_dir).as_posix()}",
                 "sha256": sha256_file(patch),
             }
             for patch in patch_files

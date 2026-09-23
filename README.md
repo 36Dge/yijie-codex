@@ -1,5 +1,7 @@
 # yijie-codex
 
+FEAT-155本地候选：2026-09-19按用户“实施解决草案阻塞直到解决”的指令，新增最小原生[input-only约束](docs/input-only-execution.md)。使用相同上游及有效两补丁基线，独立`make input-only-build`输出；不覆盖现有固定产物、不重启FEAT-137。源码和验证状态以FEAT-155本轮报告为准，候选不等于默认激活或发布。
+
 > 2026-09-05 终止裁决：FEAT-137 已由 Owner 永久终止，未完成验收、未来不重启。下面的四补丁 candidate、D4 producer 和待重冻结事项均为历史研发记录，不再执行。当前 Desktop/Host 使用保留的 FEAT-136 两补丁 artifact，源 commit `b2b20e2fc4a0c94834f34d8cc459e488a1b56277`；现存二进制未经覆盖或重建。参见 [永久终止记录](docs/feat137-retirement.md)。
 
 Codex Runtime 的易界 fork 管理仓库。仓库固定上游源码、维持最小补丁集、构建 Runtime，并验证易界 Agent Host 所依赖的 app-server 协议。

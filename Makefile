@@ -1,5 +1,9 @@
 .PHONY: sync apply-patches build test runtime-test lint generate runtime-baseline
 
+.PHONY: input-only-build
+input-only-build:
+	bash scripts/build-input-only.sh
+
 sync:
 	./scripts/sync-upstream.sh
 

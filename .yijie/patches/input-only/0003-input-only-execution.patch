@@ -1,0 +1,752 @@
+diff --git a/app-server/src/message_processor.rs b/app-server/src/message_processor.rs
+--- a/app-server/src/message_processor.rs
++++ b/app-server/src/message_processor.rs
+@@ -1135,6 +1135,11 @@
+             ClientRequest::ThreadLoadedList { params, .. } => {
+                 self.thread_processor.thread_loaded_list(params).await
+             }
++            ClientRequest::ThreadInputOnlyPolicyRead { params, .. } => {
++                self.thread_processor
++                    .thread_input_only_policy_read(params)
++                    .await
++            }
+             ClientRequest::ThreadRead { params, .. } => {
+                 self.thread_processor.thread_read(params).await
+             }
+diff --git a/app-server/src/request_processors/thread_processor.rs b/app-server/src/request_processors/thread_processor.rs
+--- a/app-server/src/request_processors/thread_processor.rs
++++ b/app-server/src/request_processors/thread_processor.rs
+@@ -407,6 +407,54 @@
+ }
+ 
+ impl ThreadRequestProcessor {
++    pub(crate) async fn thread_input_only_policy_read(
++        &self,
++        params: codex_app_server_protocol::ThreadInputOnlyPolicyReadParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let (_, thread) = self.load_thread(&params.thread_id).await?;
++        let config = thread.config().await;
++        let policy = if config.input_only {
++            // Inspect the live snapshot, not merely the requested ConfigToml.
++            let snapshot = thread.config_snapshot().await;
++            let (filesystem, network) = snapshot.permission_profile.to_runtime_permissions();
++            let instruction_sources = thread.legacy_instruction_sources().await;
++            let mcp = thread.runtime_mcp_config(&config).await;
++            if filesystem.kind != codex_protocol::permissions::FileSystemSandboxKind::Restricted
++                || !filesystem.entries.is_empty()
++                || network.is_enabled()
++                || snapshot.approval_policy != codex_protocol::protocol::AskForApproval::Never
++                || !instruction_sources.is_empty()
++                || !codex_mcp::configured_mcp_servers(&mcp).is_empty()
++                || mcp.apps_enabled
++            {
++                return Err(internal_error(
++                    "input-only execution restrictions are not intact",
++                ));
++            }
++            Some(codex_app_server_protocol::InputOnlyExecutionPolicy {
++                version: 1,
++                cwd: snapshot.cwd().clone(),
++                file_read_roots: filesystem.get_readable_roots_with_cwd(snapshot.cwd().as_path()),
++                file_write_roots: Vec::new(),
++                network_access: network.is_enabled(),
++                // The native input-only tool-plan branch returns an empty
++                // executable registry, including hidden/deferred tools.
++                tool_names: Vec::new(),
++                instruction_sources,
++                extension_contributors_enabled: false,
++            })
++        } else {
++            None
++        };
++        Ok(Some(
++            codex_app_server_protocol::ThreadInputOnlyPolicyReadResponse {
++                thread_id: params.thread_id,
++                policy,
++            }
++            .into(),
++        ))
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     pub(crate) fn new(
+         auth_manager: Arc<AuthManager>,
+diff --git a/app-server-protocol/src/protocol/common.rs b/app-server-protocol/src/protocol/common.rs
+--- a/app-server-protocol/src/protocol/common.rs
++++ b/app-server-protocol/src/protocol/common.rs
+@@ -634,6 +634,11 @@
+         params: v2::ThreadLoadedListParams,
+         serialization: None,
+         response: v2::ThreadLoadedListResponse,
++    },
++    ThreadInputOnlyPolicyRead => "thread/inputOnlyPolicy/read" {
++        params: v2::ThreadInputOnlyPolicyReadParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadInputOnlyPolicyReadResponse,
+     },
+     ThreadRead => "thread/read" {
+         params: v2::ThreadReadParams,
+diff --git a/app-server-protocol/src/protocol/v2/thread.rs b/app-server-protocol/src/protocol/v2/thread.rs
+--- a/app-server-protocol/src/protocol/v2/thread.rs
++++ b/app-server-protocol/src/protocol/v2/thread.rs
+@@ -1501,3 +1501,33 @@
+     pub thread_id: String,
+     pub turn_id: String,
+ }
++
++/// Inspect enforced input-only restrictions on an already loaded thread.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct ThreadInputOnlyPolicyReadParams {
++    pub thread_id: String,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct InputOnlyExecutionPolicy {
++    pub version: u32,
++    pub cwd: AbsolutePathBuf,
++    pub file_read_roots: Vec<AbsolutePathBuf>,
++    pub file_write_roots: Vec<AbsolutePathBuf>,
++    pub network_access: bool,
++    pub tool_names: Vec<String>,
++    pub instruction_sources: Vec<LegacyAppPathString>,
++    pub extension_contributors_enabled: bool,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct ThreadInputOnlyPolicyReadResponse {
++    pub thread_id: String,
++    pub policy: Option<InputOnlyExecutionPolicy>,
++}
+diff --git a/config/src/config_toml.rs b/config/src/config_toml.rs
+--- a/config/src/config_toml.rs
++++ b/config/src/config_toml.rs
+@@ -152,6 +152,9 @@
+ #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+ #[schemars(deny_unknown_fields)]
+ pub struct ConfigToml {
++    /// Restrict this thread to explicit text input and model text output.
++    /// Disables tools, external instructions and extension initialization.
++    pub input_only: Option<bool>,
+     /// Optional override of model selection.
+     pub model: Option<String>,
+     /// Review model override used by the `/review` feature.
+diff --git a/core/config.schema.json b/core/config.schema.json
+--- a/core/config.schema.json
++++ b/core/config.schema.json
+@@ -5181,6 +5181,10 @@
+       "description": "Whether to inject the `<permissions instructions>` developer block.",
+       "type": "boolean"
+     },
++    "input_only": {
++      "description": "Restrict this thread to explicit text input and model text output. Disables tools, external instructions and extension initialization.",
++      "type": "boolean"
++    },
+     "instructions": {
+       "description": "System instructions.",
+       "type": "string"
+diff --git a/core/src/agents_md_manager.rs b/core/src/agents_md_manager.rs
+--- a/core/src/agents_md_manager.rs
++++ b/core/src/agents_md_manager.rs
+@@ -29,6 +29,10 @@
+     }
+ 
+     pub(crate) async fn refresh(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
++        if config.input_only {
++            *self.cache.lock().await = AgentsMdCache::default();
++            return;
++        }
+         let selections = environments.to_selections();
+         if self.cache.lock().await.selections.as_ref() == Some(&selections) {
+             return;
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -898,8 +898,13 @@
+             model: model_info.slug.clone(),
+             instructions,
+             input,
++            tool_choice: if prompt.tools.is_empty() {
++                "none"
++            } else {
++                "auto"
++            }
++            .to_string(),
+             tools,
+-            tool_choice: "auto".to_string(),
+             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+             reasoning,
+             store: provider.is_azure_responses_endpoint(),
+diff --git a/core/src/config/config_tests.rs b/core/src/config/config_tests.rs
+--- a/core/src/config/config_tests.rs
++++ b/core/src/config/config_tests.rs
+@@ -11419,3 +11419,74 @@
+         "unexpected error: {err}"
+     );
+ }
++
++#[tokio::test]
++async fn input_only_closes_inherited_sources_and_permissions() -> anyhow::Result<()> {
++    let home = tempdir()?;
++    let workspace = tempdir()?;
++    let instructions = home.path().join("ordinary-instructions.md");
++    std::fs::write(&instructions, "Ordinary inherited notes.")?;
++    let mut cfg = ConfigToml {
++        input_only: Some(true),
++        model_instructions_file: Some(instructions.abs()),
++        notify: Some(vec!["ordinary-notification".to_owned()]),
++        ..Default::default()
++    };
++    cfg.mcp_servers
++        .insert("ordinary".to_owned(), http_mcp("http://127.0.0.1:9/mcp"));
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides {
++            cwd: Some(workspace.path().to_path_buf()),
++            ..Default::default()
++        },
++        home.abs(),
++    )
++    .await?;
++    assert!(config.input_only);
++    let (filesystem, network) = config
++        .permissions
++        .permission_profile()
++        .to_runtime_permissions();
++    assert_eq!(filesystem, FileSystemSandboxPolicy::restricted(Vec::new()));
++    assert!(!network.is_enabled());
++    assert_eq!(
++        config.permissions.approval_policy.value(),
++        AskForApproval::Never
++    );
++    assert!(config.mcp_servers.get().is_empty());
++    assert!(config.notify.is_none());
++    assert!(!config.memories.generate_memories && !config.memories.use_memories);
++    assert!(!config.plugins_config_input().plugins_enabled);
++    assert!(!config.include_skill_instructions && !config.include_environment_context);
++    assert!(config.agent_roles.is_empty());
++    assert!(config.experimental_thread_config_endpoint.is_none());
++    assert!(config.base_instructions.is_none());
++    Ok(())
++}
++
++#[tokio::test]
++async fn input_only_default_preserves_ordinary_configuration() -> anyhow::Result<()> {
++    let home = tempdir()?;
++    let workspace = tempdir()?;
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides {
++            cwd: Some(workspace.path().to_path_buf()),
++            ..Default::default()
++        },
++        home.abs(),
++    )
++    .await?;
++    assert!(!config.input_only);
++    assert!(config.include_environment_context);
++    assert!(
++        config
++            .permissions
++            .permission_profile()
++            .to_runtime_permissions()
++            .0
++            .has_full_disk_read_access()
++    );
++    Ok(())
++}
+diff --git a/core/src/config/mod.rs b/core/src/config/mod.rs
+--- a/core/src/config/mod.rs
++++ b/core/src/config/mod.rs
+@@ -613,6 +613,8 @@
+ /// Application configuration loaded from disk and merged with overrides.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Config {
++    /// Native input-only execution restriction; never a model instruction.
++    pub input_only: bool,
+     /// Provenance for how this [`Config`] was derived (merged layers + enforced
+     /// requirements).
+     pub config_layer_stack: ConfigLayerStack,
+@@ -1500,8 +1502,8 @@
+     pub fn plugins_config_input(&self) -> PluginsConfigInput {
+         PluginsConfigInput::new(
+             self.config_layer_stack.clone(),
+-            self.features.enabled(Feature::Plugins),
+-            self.features.enabled(Feature::RemotePlugin),
++            !self.input_only && self.features.enabled(Feature::Plugins),
++            !self.input_only && self.features.enabled(Feature::RemotePlugin),
+             self.chatgpt_base_url.clone(),
+         )
+     }
+@@ -1584,7 +1586,7 @@
+             ));
+         }
+ 
+-        McpConfig {
++        let mut result = McpConfig {
+             chatgpt_base_url: self.chatgpt_base_url.clone(),
+             apps_mcp_product_sku: self.apps_mcp_product_sku.clone(),
+             codex_home: self.codex_home.to_path_buf(),
+@@ -1615,7 +1617,14 @@
+                 codex_connectors::ConnectorSnapshot::from_plugin_capability_summaries(
+                     loaded_plugins.capability_summaries(),
+                 ),
+-        }
++        };
++        if self.input_only {
++            result.mcp_server_catalog = ResolvedMcpCatalog::builder().build();
++            result.connector_snapshot = codex_connectors::ConnectorSnapshot::default();
++            result.apps_enabled = false;
++            result.skill_mcp_dependency_install_enabled = false;
++        }
++        result
+     }
+ 
+     pub(crate) fn prefix_mcp_tool_names(&self) -> bool {
+@@ -2945,6 +2954,22 @@
+         codex_home: AbsolutePathBuf,
+         config_layer_stack: ConfigLayerStack,
+     ) -> std::io::Result<Self> {
++        let mut cfg = cfg;
++        if cfg.input_only.unwrap_or(false) {
++            // Do this before resolving any optional instruction files.
++            cfg.instructions = None;
++            cfg.developer_instructions = None;
++            cfg.model_instructions_file = None;
++            cfg.experimental_compact_prompt_file = None;
++            cfg.notify = None;
++            for profile in cfg.profiles.values_mut() {
++                profile.model_instructions_file = None;
++                profile.experimental_compact_prompt_file = None;
++            }
++            cfg.mcp_servers.clear();
++            cfg.project_doc_max_bytes = Some(0);
++            cfg.experimental_thread_config_endpoint = None;
++        }
+         // Keep the large config-construction future off small test thread stacks.
+         Box::pin(async move {
+         if cfg.experimental_thread_store_endpoint.is_some() {
+@@ -3418,9 +3443,12 @@
+         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
+         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
+ 
+-        let agent_roles =
++        let agent_roles = if cfg.input_only.unwrap_or(false) {
++            BTreeMap::new()
++        } else {
+             agent_roles::load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings)
+-                .await?;
++                .await?
++        };
+ 
+         let openai_base_url = cfg
+             .openai_base_url
+@@ -3773,6 +3801,16 @@
+             &effective_file_system_sandbox_policy,
+             effective_network_sandbox_policy,
+         );
++        let effective_permission_profile = if cfg.input_only.unwrap_or(false) {
++            // There are no filesystem tools in input-only threads. Native state
++            // persistence is unaffected; no task read/write root is granted.
++            PermissionProfile::from_runtime_permissions(
++                &FileSystemSandboxPolicy::restricted(Vec::new()),
++                NetworkSandboxPolicy::Restricted,
++            )
++        } else {
++            effective_permission_profile
++        };
+         constrained_permission_profile
+             .value
+             .set(effective_permission_profile)
+@@ -3784,10 +3822,11 @@
+         )
+         .map_err(std::io::Error::from)?;
+         let otel = otel::resolve_config(cfg.otel.unwrap_or_default(), &mut startup_warnings);
+-        let config = Self {
++        let mut config = Self {
+             model,
+             service_tier,
+             review_model,
++            input_only: cfg.input_only.unwrap_or(false),
+             model_context_window: cfg.model_context_window,
+             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
+             model_auto_compact_token_limit_scope: cfg
+@@ -4019,6 +4058,17 @@
+                 .unwrap_or_default(),
+             otel,
+         };
++        if config.input_only {
++            config.memories.generate_memories = false;
++            config.memories.use_memories = false;
++            config.include_skill_instructions = false;
++            config.include_environment_context = false;
++            config.include_apps_instructions = false;
++            config.notify = None;
++            // Never initialize a guardian/auto-review model for input-only work.
++            config.permissions.approval_policy.set(AskForApproval::Never)
++                .map_err(std::io::Error::from)?;
++        }
+         Ok(config)
+         })
+         .await
+diff --git a/core/src/mcp.rs b/core/src/mcp.rs
+--- a/core/src/mcp.rs
++++ b/core/src/mcp.rs
+@@ -105,6 +105,15 @@
+         context: McpServerContributionContext<'_, Config>,
+     ) -> McpRuntimeProjection {
+         let config = context.config();
++        if config.input_only {
++            return McpRuntimeProjection {
++                config: config.to_mcp_config_with_loaded_plugins(
++                    &codex_core_plugins::PluginLoadOutcome::default(),
++                    std::iter::empty(),
++                ),
++                plugins_available: false,
++            };
++        }
+         let mut selected_plugin_available = false;
+         let mut selected_plugin_connector_sources = Vec::new();
+         let mut selected_plugin_registrations = Vec::new();
+diff --git a/core/src/session/mod.rs b/core/src/session/mod.rs
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -545,20 +545,21 @@
+         config
+             .startup_warnings
+             .extend(user_instruction_provider_warnings);
+-        let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
+-            // Guardian review should rely on the built-in shell safety checks,
+-            // not on caller-provided exec-policy rules that could shape the
+-            // reviewer or silently auto-approve commands.
+-            Arc::new(ExecPolicyManager::default())
+-        } else if let Some(exec_policy) = &inherited_exec_policy {
+-            Arc::clone(exec_policy)
+-        } else {
+-            Arc::new(
+-                ExecPolicyManager::load(&config.config_layer_stack)
+-                    .await
+-                    .map_err(|err| CodexErr::Fatal(format!("failed to load rules: {err}")))?,
+-            )
+-        };
++        let exec_policy =
++            if config.input_only || crate::guardian::is_guardian_reviewer_source(&session_source) {
++                // Guardian review should rely on the built-in shell safety checks,
++                // not on caller-provided exec-policy rules that could shape the
++                // reviewer or silently auto-approve commands.
++                Arc::new(ExecPolicyManager::default())
++            } else if let Some(exec_policy) = &inherited_exec_policy {
++                Arc::clone(exec_policy)
++            } else {
++                Arc::new(
++                    ExecPolicyManager::load(&config.config_layer_stack)
++                        .await
++                        .map_err(|err| CodexErr::Fatal(format!("failed to load rules: {err}")))?,
++                )
++            };
+ 
+         let config = Arc::new(config);
+         let refresh_strategy = if session_source.is_non_root_agent() {
+@@ -783,6 +784,25 @@
+     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
+     /// unique IDs for each submission.
+     pub async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
++        if self.session.get_config().await.input_only {
++            match &sub.op {
++                Op::UserInput {
++                    items,
++                    additional_context,
++                    ..
++                } if additional_context.is_empty()
++                    && items
++                        .iter()
++                        .all(|item| matches!(item, UserInput::Text { .. })) => {}
++                Op::Shutdown | Op::Interrupt => {}
++                _ => {
++                    return Err(CodexErr::InvalidRequest(
++                        "input-only threads accept text turns, interrupt and shutdown only"
++                            .to_owned(),
++                    ));
++                }
++            }
++        }
+         if sub.trace.is_none() {
+             sub.trace = current_span_w3c_trace_context();
+         }
+@@ -4048,6 +4068,9 @@
+     plugins_manager: &PluginsManager,
+     environment: Option<&TurnEnvironment>,
+ ) -> Hooks {
++    if config.input_only {
++        return Hooks::new(HooksConfig::default());
++    }
+     let (hook_shell_program, hook_shell_argv) = environment
+         .and_then(|environment| environment.shell.as_ref())
+         .map(|shell| {
+diff --git a/core/src/session/session.rs b/core/src/session/session.rs
+--- a/core/src/session/session.rs
++++ b/core/src/session/session.rs
+@@ -203,6 +203,22 @@
+     }
+ 
+     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
++        if self.original_config_do_not_use.input_only
++            && (updates.environments.is_some()
++                || updates.workspace_roots.is_some()
++                || updates.permission_profile.is_some()
++                || updates.sandbox_policy.is_some()
++                || updates
++                    .approval_policy
++                    .is_some_and(|v| v != AskForApproval::Never))
++        {
++            return Err(ConstraintError::InvalidValue {
++                field_name: "input_only",
++                candidate: "execution settings override".to_owned(),
++                allowed: "unchanged input-only execution restrictions".to_owned(),
++                requirement_source: codex_config::RequirementSource::Unknown,
++            });
++        }
+         let mut next_configuration = self.clone();
+         let current_sandbox_policy = self.sandbox_policy();
+         let current_file_system_sandbox_policy = self.file_system_sandbox_policy();
+@@ -444,6 +460,9 @@
+     skills_service: Arc<SkillsService>,
+     turn_environments: &TurnEnvironmentSnapshot,
+ ) -> Vec<SkillError> {
++    if config.input_only {
++        return Vec::new();
++    }
+     let fs = turn_environments.primary_filesystem();
+     let plugins_input = config.plugins_config_input();
+     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
+@@ -885,7 +904,7 @@
+             } else {
+                 shell::default_user_shell()
+             };
+-            let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot) {
++            let shell_snapshot = if !config.input_only && config.features.enabled(Feature::ShellSnapshot) {
+                 ShellSnapshot::new(
+                     config.codex_home.clone(),
+                     thread_id,
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -2037,6 +2037,14 @@
+             }
+         };
+ 
++        if turn_context.config.input_only && !input_only_response_event_allowed(&event) {
++            // Reject before telemetry/item persistence, tool futures or the
++            // ordinary unsupported-tool follow-up loop are entered.
++            break Err(CodexErr::Fatal(
++                "input-only response contained an unsupported non-text item".to_owned(),
++            ));
++        }
++
+         sess.services
+             .session_telemetry
+             .record_responses(&handle_responses, &event);
+@@ -2509,3 +2517,52 @@
+ #[cfg(test)]
+ #[path = "turn_tests.rs"]
+ mod tests;
++
++/// Input-only conversations never turn a model-emitted tool item into another
++/// request to the model. Unknown future variants fail closed at this boundary.
++fn input_only_response_event_allowed(event: &ResponseEvent) -> bool {
++    match event {
++        ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item) => match item {
++            ResponseItem::Message { role, content, .. } => {
++                role == "assistant"
++                    && content.iter().all(|part| {
++                        matches!(part, codex_protocol::models::ContentItem::OutputText { .. })
++                    })
++            }
++            ResponseItem::Reasoning { .. } => true,
++            _ => false,
++        },
++        ResponseEvent::ToolCallInputDelta { .. } => false,
++        _ => true,
++    }
++}
++
++#[cfg(test)]
++mod input_only_response_tests {
++    use super::*;
++
++    #[test]
++    fn input_only_response_rejects_non_text_variants() {
++        let message: ResponseItem = serde_json::from_value(serde_json::json!({
++            "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ordinary proposal"}]
++        })).unwrap();
++        assert!(input_only_response_event_allowed(
++            &ResponseEvent::OutputItemAdded(message.clone())
++        ));
++        assert!(input_only_response_event_allowed(
++            &ResponseEvent::OutputItemDone(message)
++        ));
++        // Plain unknown-format compatibility metadata, not an executable or
++        // adversarial payload. No tool, process or network is invoked here.
++        assert!(!input_only_response_event_allowed(
++            &ResponseEvent::OutputItemDone(ResponseItem::Other)
++        ));
++        assert!(!input_only_response_event_allowed(
++            &ResponseEvent::ToolCallInputDelta {
++                item_id: "ordinary-item".into(),
++                call_id: None,
++                delta: String::new(),
++            }
++        ));
++    }
++}
+diff --git a/core/src/session_startup_prewarm.rs b/core/src/session_startup_prewarm.rs
+--- a/core/src/session_startup_prewarm.rs
++++ b/core/src/session_startup_prewarm.rs
+@@ -182,6 +182,9 @@
+ 
+ impl Session {
+     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
++        if self.get_config().await.input_only {
++            return;
++        }
+         if !self.services.model_client.responses_websocket_enabled() {
+             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
+             // register or engage this session's bearer fallback before the first user request.
+diff --git a/core/src/skills.rs b/core/src/skills.rs
+--- a/core/src/skills.rs
++++ b/core/src/skills.rs
+@@ -43,6 +43,7 @@
+         config.config_layer_stack.clone(),
+         config.bundled_skills_enabled(),
+     )
++    .with_discovery_enabled(!config.input_only)
+ }
+ 
+ pub(crate) async fn maybe_emit_implicit_skill_invocation(
+diff --git a/core/src/thread_manager.rs b/core/src/thread_manager.rs
+--- a/core/src/thread_manager.rs
++++ b/core/src/thread_manager.rs
+@@ -1560,9 +1560,21 @@
+                 threads.remove(&resumed.conversation_id);
+             }
+         }
+-        let user_instructions = self
+-            .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
+-            .await;
++        let user_instructions = if config.input_only {
++            LoadedUserInstructions::default()
++        } else {
++            self.user_instructions_for_spawn(
++                &session_source,
++                parent_thread_id,
++                forked_from_thread_id,
++            )
++            .await
++        };
++        let extensions = if config.input_only {
++            empty_extension_registry()
++        } else {
++            Arc::clone(&self.extensions)
++        };
+         let parent_rollout_thread_trace = self
+             .parent_rollout_thread_trace_for_source(&session_source, &initial_history)
+             .await;
+@@ -1598,7 +1610,7 @@
+             plugins_manager: Arc::clone(&self.plugins_manager),
+             mcp_manager: Arc::clone(&self.mcp_manager),
+             code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
+-            extensions: Arc::clone(&self.extensions),
++            extensions,
+             conversation_history: initial_history,
+             requested_history_mode: history_mode,
+             session_source,
+diff --git a/core/src/tools/spec_plan.rs b/core/src/tools/spec_plan.rs
+--- a/core/src/tools/spec_plan.rs
++++ b/core/src/tools/spec_plan.rs
+@@ -173,6 +173,11 @@
+     tool_search_handler_cache: &ToolSearchHandlerCache,
+ ) -> (Vec<ToolSpec>, ToolRegistry) {
+     let turn_context = step_context.turn.as_ref();
++    if turn_context.config.input_only {
++        // Both provider-visible tools AND the executable registry are empty.
++        // Future tool contributors cannot escape via a hidden/deferred tool.
++        return (Vec::new(), ToolRegistry::from_tools(Vec::new()));
++    }
+     let ToolRouterParams {
+         mcp_tools,
+         deferred_mcp_tools,
+diff --git a/core/src/tools/spec_plan_tests.rs b/core/src/tools/spec_plan_tests.rs
+--- a/core/src/tools/spec_plan_tests.rs
++++ b/core/src/tools/spec_plan_tests.rs
+@@ -1633,3 +1633,19 @@
+     .await;
+     unsupported_provider.assert_visible_lacks(&["web_search"]);
+ }
++
++#[tokio::test]
++async fn input_only_has_no_visible_or_executable_tools() {
++    let closed = probe(|turn| {
++        set_feature(turn, Feature::ShellTool, true);
++        set_feature(turn, Feature::UnifiedExec, true);
++        set_feature(turn, Feature::RequestPermissionsTool, true);
++        turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
++        update_config(turn, |config| config.input_only = true);
++    })
++    .await;
++    assert!(closed.visible_specs.is_empty());
++    assert!(closed.registered_names.is_empty());
++    let ordinary = probe(|_| {}).await;
++    assert!(!ordinary.registered_names.is_empty());
++}
+diff --git a/core-skills/src/service.rs b/core-skills/src/service.rs
+--- a/core-skills/src/service.rs
++++ b/core-skills/src/service.rs
+@@ -34,6 +34,7 @@
+     pub config_layer_stack: ConfigLayerStack,
+     pub bundled_skills_enabled: bool,
+     plugin_skill_snapshots: Option<PluginSkillSnapshots>,
++    discovery_enabled: bool,
+ }
+ 
+ impl SkillsLoadInput {
+@@ -49,7 +50,14 @@
+             config_layer_stack,
+             bundled_skills_enabled,
+             plugin_skill_snapshots: None,
+-        }
++            discovery_enabled: true,
++        }
++    }
++
++    /// Disable discovery before any filesystem roots or extra roots are read.
++    pub fn with_discovery_enabled(mut self, enabled: bool) -> Self {
++        self.discovery_enabled = enabled;
++        self
+     }
+ 
+     /// Attaches plugin skill snapshots parsed during plugin loading, when available.
+@@ -128,6 +136,9 @@
+         input: &SkillsLoadInput,
+         fs: Option<Arc<dyn ExecutorFileSystem>>,
+     ) -> HostSkillsSnapshot {
++        if !input.discovery_enabled {
++            return HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome::default()));
++        }
+         let roots = self.skill_roots_for_config(input, fs).await;
+         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
+         let cache_key = config_skills_cache_key(&roots, &skill_config_rules);
+@@ -152,6 +163,9 @@
+         input: &SkillsLoadInput,
+         fs: Option<Arc<dyn ExecutorFileSystem>>,
+     ) -> Vec<SkillRoot> {
++        if !input.discovery_enabled {
++            return Vec::new();
++        }
+         let mut roots = skill_roots(
+             fs,
+             &input.config_layer_stack,
