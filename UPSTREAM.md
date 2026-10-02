@@ -73,3 +73,20 @@ FEAT-136 双 patch candidate 当前已通过：
 # FEAT-155 input-only candidate supplement
 
 2026-09-19: the upstream pin and canonical `codex-rs/` subtree remain unchanged. The separately built input-only candidate applies the two active patches followed by `.yijie/patches/input-only/0003-input-only-execution.patch`. Its schema and binary live in dedicated candidate directories and must be projected through Contracts before Host activation. See [native restriction](docs/input-only-execution.md). Existing historical baseline statements below retain their original meaning.
+
+## FEAT-156 Kimi compatibility candidate (2026-10-02)
+
+Owner explicitly authorized restoring upstream `tool_choice="auto"` after the input-only patch, while retaining its empty advertised/executable tools, input-only admission, non-text output rejection, sandbox, permissions and extension restrictions. `.yijie/patches/chat-models/0004-feat-156-upstream-tool-choice.patch` changes only the Responses request value in `core/src/client.rs`. Upstream tag/commit, transport and toolchain are unchanged. Ordinary nonempty-tool requests already use auto.
+
+`make chat-models-build` replays the active 0001/0002/input-only 0003/new 0004 in a temporary source workspace. It reuses the existing `codex-rs/target` cache (approximately 24 GiB); it does not copy or create another target cache. Candidate binary, manifest, resolved lock and 269 regenerated schemas are stored separately under `.yijie/build/chat-models/aarch64-apple-darwin/`. Existing fixed input-only and FEAT-136 artifacts are retained. The command refuses to overwrite an existing new candidate.
+
+The new schema tree must equal the input-only authority byte for byte. Contracts imports a separate `runtime-chat-models` artifact projection; existing input-only source locks remain intact. Host accepts only exact artifact pins and continues checking each draft's live native policy. Rollback selects the preserved fixed artifact and disables new Kimi draft writes, retaining historical readers. No automatic fallback or provider proxy parameter rewrite is introduced.
+
+The parameter change is semantic; the complete FEAT-156 candidate retains its conservative breaking classification because exact artifact pins change. This local working-tree candidate is not a release or immutable Git promotion. Actual build, schema and paid verification results are recorded in the FEAT-156 package.
+
+
+## FEAT-156 流式参数候选（2026-10-02）
+
+Owner已明确批准最小流式兼容补丁 `chat-models/0005-feat-156-terminal-tool-arguments.patch`（semantic）。固定上游与0001/0002/input-only0003/已批准0004保持。仅在中间function_call完成Item参数为空时暂存后续事件，等完整response.completed后校验Item索引、ID、callID、函数名、namespace、有效JSON对象及参数增量一致，再按原顺序进入工具处理。非空参数继续流式处理；未获完整一致终态时安全错误，不执行空/猜测参数。缓冲有界，不新增权限或工具，input-only原拒绝路径保持。
+
+新候选由 `make chat-model-stream-build` 生成到 `.yijie/build/chat-models-stream-args/aarch64-apple-darwin/`，复用原 `codex-rs/target`。原input-only和chat-models产物不覆盖；原始codex-rs子树不修改。`make chat-model-stream-test`检验重放/逆向、schema和正常EOF握手。实际构建/资格结果及精确hash以FEAT-156 evidence为准，不能把本说明当已通过或已发布。

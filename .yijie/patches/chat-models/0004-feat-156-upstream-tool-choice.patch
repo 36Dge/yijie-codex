@@ -1,0 +1,18 @@
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -898,13 +898,8 @@
+             model: model_info.slug.clone(),
+             instructions,
+             input,
+-            tool_choice: if prompt.tools.is_empty() {
+-                "none"
+-            } else {
+-                "auto"
+-            }
+-            .to_string(),
+             tools,
++            tool_choice: "auto".to_string(),
+             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+             reasoning,
+             store: provider.is_azure_responses_endpoint(),

@@ -1,0 +1,338 @@
+--- a/codex-api/src/sse/responses.rs
++++ b/codex-api/src/sse/responses.rs
+@@ -165,6 +165,8 @@
+     response: Option<Value>,
+     item: Option<Value>,
+     item_id: Option<String>,
++    output_index: Option<usize>,
++    arguments: Option<String>,
+     call_id: Option<String>,
+     delta: Option<String>,
+     text: Option<String>,
+@@ -498,6 +500,7 @@
+     let mut stream = stream.eventsource();
+     let mut response_error: Option<ApiError> = None;
+     let mut last_server_model: Option<String> = None;
++    let mut deferred_arguments = DeferredFunctionArguments::default();
+ 
+     loop {
+         let start = Instant::now();
+@@ -577,21 +580,205 @@
+             return;
+         }
+ 
+-        match process_responses_event(event) {
+-            Ok(Some(event)) => {
+-                let is_completed = matches!(event, ResponseEvent::Completed { .. });
+-                if tx_event.send(Ok(event)).await.is_err() {
+-                    return;
+-                }
+-                if is_completed {
+-                    return;
+-                }
+-            }
+-            Ok(None) => {}
++        let events = match deferred_arguments.accept(event, sse.data.len()) {
++            Ok(events) => events,
+             Err(error) => {
+-                response_error = Some(error.into_api_error());
++                let _ = tx_event.send(Err(error)).await;
++                return;
+             }
+         };
++        for event in events {
++            match process_responses_event(event) {
++                Ok(Some(event)) => {
++                    let is_completed = matches!(event, ResponseEvent::Completed { .. });
++                    if tx_event.send(Ok(event)).await.is_err() {
++                        return;
++                    }
++                    if is_completed {
++                        return;
++                    }
++                }
++                Ok(None) => {}
++                Err(error) => {
++                    response_error = Some(error.into_api_error());
++                }
++            };
++        }
++    }
++}
++
++// Some Responses providers omit arguments in intermediate completed Items while
++// supplying the same complete JSON in deltas and response.completed. Never run
++// that incomplete Item: defer it and subsequent events until identities and the
++// terminal arguments agree. The ordinary nonempty path stays streaming.
++#[derive(Default)]
++struct DeferredFunctionArguments {
++    arguments: std::collections::BTreeMap<(usize, String), (String, Option<String>)>,
++    capture_bytes: usize,
++    capture_lost: bool,
++    queued: Vec<ResponsesStreamEvent>,
++    queued_bytes: usize,
++}
++
++impl DeferredFunctionArguments {
++    const MAX_BYTES: usize = 8 * 1024 * 1024;
++    const MAX_ITEMS: usize = 64;
++    const MAX_EVENTS: usize = 4096;
++
++    fn invalid() -> ApiError {
++        ApiError::Stream("incomplete function arguments could not be verified".into())
++    }
++
++    fn capture(&mut self, event: &ResponsesStreamEvent) {
++        if self.capture_lost {
++            return;
++        }
++        let value = match event.kind.as_str() {
++            "response.function_call_arguments.delta" => event.delta.as_ref(),
++            "response.function_call_arguments.done" => {
++                event.arguments.as_ref().filter(|s| !s.is_empty())
++            }
++            _ => return,
++        };
++        let (Some(index), Some(id), Some(value)) =
++            (event.output_index, event.item_id.as_ref(), value)
++        else {
++            return;
++        };
++        // Losing optional capture does not change ordinary, nonempty Items.
++        // A subsequent empty Item fails closed instead of guessing its input.
++        if id.len() > 1024
++            || self.capture_bytes.saturating_add(value.len()) > Self::MAX_BYTES
++            || (self.arguments.len() >= Self::MAX_ITEMS
++                && !self.arguments.contains_key(&(index, id.clone())))
++        {
++            self.capture_lost = true;
++            self.arguments.clear();
++            return;
++        }
++        self.capture_bytes += value.len();
++        let entry = self.arguments.entry((index, id.clone())).or_default();
++        if event.kind.ends_with(".delta") {
++            entry.0.push_str(value);
++        } else {
++            entry.1 = Some(value.clone());
++        }
++    }
++
++    fn empty_call(event: &ResponsesStreamEvent) -> bool {
++        event.kind == "response.output_item.done"
++            && event.item.as_ref().is_some_and(|item| {
++                item.get("type").and_then(Value::as_str) == Some("function_call")
++                    && item.get("arguments").and_then(Value::as_str) == Some("")
++            })
++    }
++
++    fn accept(
++        &mut self,
++        event: ResponsesStreamEvent,
++        bytes: usize,
++    ) -> Result<Vec<ResponsesStreamEvent>, ApiError> {
++        self.capture(&event);
++        let empty = Self::empty_call(&event);
++        if self.queued.is_empty() && !empty {
++            if event.kind == "response.output_item.done"
++                && let (Some(index), Some(id)) = (
++                    event.output_index,
++                    event
++                        .item
++                        .as_ref()
++                        .and_then(|v| v.get("id"))
++                        .and_then(Value::as_str),
++                )
++                && let Some((delta, done)) = self.arguments.remove(&(index, id.to_owned()))
++            {
++                self.capture_bytes = self
++                    .capture_bytes
++                    .saturating_sub(delta.len() + done.map_or(0, |s| s.len()));
++            }
++            return Ok(vec![event]);
++        }
++        if matches!(
++            event.kind.as_str(),
++            "response.failed" | "response.incomplete"
++        ) {
++            self.queued.clear();
++            return Ok(vec![event]);
++        }
++        if self.capture_lost
++            || self.queued.len() >= Self::MAX_EVENTS
++            || self.queued_bytes.saturating_add(bytes) > Self::MAX_BYTES
++        {
++            return Err(Self::invalid());
++        }
++        self.queued_bytes += bytes;
++        if event.kind != "response.completed" {
++            self.queued.push(event);
++            return Ok(Vec::new());
++        }
++        let response = event.response.as_ref().ok_or_else(Self::invalid)?;
++        if response.get("status").and_then(Value::as_str) != Some("completed")
++            || response.get("error").is_some_and(|v| !v.is_null())
++        {
++            return Err(Self::invalid());
++        }
++        let output = response
++            .get("output")
++            .and_then(Value::as_array)
++            .ok_or_else(Self::invalid)?;
++        let mut recovered = std::collections::BTreeSet::new();
++        for queued in &mut self.queued {
++            if !Self::empty_call(queued) {
++                continue;
++            }
++            let index = queued.output_index.ok_or_else(Self::invalid)?;
++            let item = queued.item.as_mut().ok_or_else(Self::invalid)?;
++            let id = item
++                .get("id")
++                .and_then(Value::as_str)
++                .filter(|s| !s.is_empty())
++                .ok_or_else(Self::invalid)?
++                .to_owned();
++            if !recovered.insert(id.clone()) || recovered.len() > Self::MAX_ITEMS {
++                return Err(Self::invalid());
++            }
++            let terminal = output.get(index).ok_or_else(Self::invalid)?;
++            for field in ["id", "type", "call_id", "name"] {
++                if item
++                    .get(field)
++                    .and_then(Value::as_str)
++                    .filter(|s| !s.is_empty())
++                    .is_none()
++                    || item.get(field) != terminal.get(field)
++                {
++                    return Err(Self::invalid());
++                }
++            }
++            if item.get("namespace") != terminal.get("namespace")
++                || output
++                    .iter()
++                    .filter(|v| v.get("id").and_then(Value::as_str) == Some(id.as_str()))
++                    .count()
++                    != 1
++            {
++                return Err(Self::invalid());
++            }
++            let complete = terminal
++                .get("arguments")
++                .and_then(Value::as_str)
++                .filter(|s| !s.is_empty())
++                .ok_or_else(Self::invalid)?;
++            let (delta, done) = self.arguments.get(&(index, id)).ok_or_else(Self::invalid)?;
++            if delta != complete
++                || done.as_ref().is_some_and(|s| s != complete)
++                || !serde_json::from_str::<Value>(complete).is_ok_and(|value| value.is_object())
++            {
++                return Err(Self::invalid());
++            }
++            item["arguments"] = Value::String(complete.to_owned());
++        }
++        self.queued.push(event);
++        Ok(std::mem::take(&mut self.queued))
+     }
+ }
+ 
+@@ -1629,5 +1816,100 @@
+         assert_eq!(delay, Some(Duration::from_secs(35)));
+     }
+ 
++    fn feat156_function(id: &str, arguments: &str) -> Value {
++        json!({"type":"function_call","id":id,"call_id":format!("call_{id}"),"name":"exec_command","arguments":arguments})
++    }
++
++    #[tokio::test]
++    async fn feat156_terminal_arguments_restore_empty_item_and_preserve_following_order() {
++        let a = r#"{"cmd":"/bin/pwd"}"#;
++        let b = r#"{"cmd":"/usr/bin/true"}"#;
++        let events = run_sse(vec![
++            json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"first","delta":&a[..8]}),
++            json!({"type":"response.function_call_arguments.delta","output_index":1,"item_id":"second","delta":b}),
++            json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"first","delta":&a[8..]}),
++            json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"first","arguments":""}),
++            json!({"type":"response.output_item.done","output_index":0,"item":feat156_function("first","")}),
++            json!({"type":"response.output_text.delta","delta":"ordinary following text"}),
++            json!({"type":"response.output_item.done","output_index":1,"item":feat156_function("second",b)}),
++            json!({"type":"response.completed","response":{"id":"resp1","status":"completed","output":[feat156_function("first",a),feat156_function("second",b)]}}),
++        ]).await;
++        assert_matches!(&events[0], ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { arguments, call_id, .. }) if arguments == a && call_id == "call_first");
++        assert_matches!(&events[1], ResponseEvent::OutputTextDelta(text) if text == "ordinary following text");
++        assert_matches!(&events[2], ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { arguments, call_id, .. }) if arguments == b && call_id == "call_second");
++        assert_matches!(&events[3], ResponseEvent::Completed { .. });
++        assert_eq!(events.len(), 4);
++    }
++
++    #[tokio::test]
++    async fn feat156_nonempty_item_keeps_original_streaming_path() {
++        let item = json!({"type":"response.output_item.done","output_index":0,"item":feat156_function("ordinary",r#"{"cmd":"/bin/pwd"}"#)});
++        let mut deferred = DeferredFunctionArguments::default();
++        let events = deferred
++            .accept(serde_json::from_value(item).unwrap(), 200)
++            .unwrap();
++        assert_eq!(events.len(), 1);
++        assert!(deferred.queued.is_empty());
++        assert_matches!(
++            process_responses_event(events.into_iter().next().unwrap()).unwrap(),
++            Some(ResponseEvent::OutputItemDone(_))
++        );
++    }
++
++    #[tokio::test]
++    async fn feat156_incomplete_stream_does_not_dispatch_empty_function() {
++        let event = json!({"type":"response.output_item.done","output_index":0,"item":feat156_function("ordinary","")});
++        let body = format!("data: {event}\n\n");
++        let events = collect_events(&[body.as_bytes()]).await;
++        assert_eq!(events.len(), 1);
++        assert_matches!(&events[0], Err(ApiError::Stream(_)));
++    }
++
++    #[test]
++    fn feat156_terminal_recovery_requires_matching_identity_and_arguments() {
++        let arguments = r#"{"cmd":"/bin/pwd"}"#;
++        for case in [
++            "missing output",
++            "different call",
++            "different argument",
++            "different position",
++            "non-object",
++        ] {
++            let mut deferred = DeferredFunctionArguments::default();
++            let delta = json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"ordinary","delta":arguments});
++            deferred
++                .accept(serde_json::from_value(delta).unwrap(), 150)
++                .unwrap();
++            let item = json!({"type":"response.output_item.done","output_index":0,"item":feat156_function("ordinary","")});
++            assert!(
++                deferred
++                    .accept(serde_json::from_value(item).unwrap(), 150)
++                    .unwrap()
++                    .is_empty()
++            );
++            let mut terminal = feat156_function("ordinary", arguments);
++            match case {
++                "different call" => terminal["call_id"] = json!("other_call"),
++                "different argument" => terminal["arguments"] = json!(r#"{"cmd":"/usr/bin/true"}"#),
++                "non-object" => terminal["arguments"] = json!("[]"),
++                _ => {}
++            }
++            let output = match case {
++                "missing output" => vec![],
++                "different position" => {
++                    vec![json!({"type":"reasoning","id":"reasoning"}), terminal]
++                }
++                _ => vec![terminal],
++            };
++            let completed = json!({"type":"response.completed","response":{"id":"resp1","status":"completed","output":output}});
++            assert!(
++                deferred
++                    .accept(serde_json::from_value(completed).unwrap(), 300)
++                    .is_err(),
++                "{case}"
++            );
++        }
++    }
++
+     const CYBER_RESTRICTED_MODEL_FOR_TESTS: &str = "gpt-5.3-codex";
+ }
