@@ -1,0 +1,466 @@
+diff --git a/analytics/src/reducer.rs b/analytics/src/reducer.rs
+--- a/analytics/src/reducer.rs
++++ b/analytics/src/reducer.rs
+@@ -2526,7 +2526,7 @@
+ 
+ fn web_search_query_count(query: &str, action: Option<&WebSearchAction>) -> Option<u64> {
+     match action {
+-        Some(WebSearchAction::Search { query, queries }) => queries
++        Some(WebSearchAction::Search { query, queries, .. }) => queries
+             .as_ref()
+             .map(|queries| usize_to_u64(queries.len()))
+             .or_else(|| query.as_ref().map(|_| 1)),
+diff --git a/app-server/tests/suite/v2/web_search.rs b/app-server/tests/suite/v2/web_search.rs
+--- a/app-server/tests/suite/v2/web_search.rs
++++ b/app-server/tests/suite/v2/web_search.rs
+@@ -193,6 +193,7 @@
+         id: call_id.to_string(),
+         query: "standalone web search".to_string(),
+         action: Some(WebSearchAction::Search {
++            sources: None,
+             query: Some("standalone web search".to_string()),
+             queries: None,
+         }),
+diff --git a/app-server-protocol/src/protocol/thread_history.rs b/app-server-protocol/src/protocol/thread_history.rs
+--- a/app-server-protocol/src/protocol/thread_history.rs
++++ b/app-server-protocol/src/protocol/thread_history.rs
+@@ -2642,6 +2642,7 @@
+                 call_id: "search-1".into(),
+                 query: "codex".into(),
+                 action: CoreWebSearchAction::Search {
++                    sources: None,
+                     query: Some("codex".into()),
+                     queries: None,
+                 },
+@@ -2698,6 +2699,7 @@
+                 id: "search-1".into(),
+                 query: "codex".into(),
+                 action: Some(WebSearchAction::Search {
++                    sources: None,
+                     query: Some("codex".into()),
+                     queries: None,
+                 }),
+@@ -4146,6 +4148,7 @@
+                 call_id: "search-1".into(),
+                 query: "codex".into(),
+                 action: CoreWebSearchAction::Search {
++                    sources: None,
+                     query: Some("codex".into()),
+                     queries: None,
+                 },
+@@ -4160,6 +4163,7 @@
+                         id: "search-1".into(),
+                         query: "codex".into(),
+                         action: Some(WebSearchAction::Search {
++                            sources: None,
+                             query: Some("codex".into()),
+                             queries: None,
+                         }),
+@@ -4279,6 +4283,7 @@
+                 call_id: "search-1".into(),
+                 query: "codex".into(),
+                 action: CoreWebSearchAction::Search {
++                    sources: None,
+                     query: Some("codex".into()),
+                     queries: None,
+                 },
+@@ -4293,6 +4298,7 @@
+                         id: "search-1".into(),
+                         query: "codex".into(),
+                         action: Some(WebSearchAction::Search {
++                            sources: None,
+                             query: Some("codex".into()),
+                             queries: None,
+                         }),
+diff --git a/app-server-protocol/src/protocol/v2/item.rs b/app-server-protocol/src/protocol/v2/item.rs
+--- a/app-server-protocol/src/protocol/v2/item.rs
++++ b/app-server-protocol/src/protocol/v2/item.rs
+@@ -787,9 +787,27 @@
+     value: codex_protocol::models::WebSearchAction,
+ ) -> WebSearchAction {
+     match value {
+-        codex_protocol::models::WebSearchAction::Search { query, queries } => {
+-            WebSearchAction::Search { query, queries }
+-        }
++        codex_protocol::models::WebSearchAction::Search {
++            query,
++            queries,
++            sources,
++        } => WebSearchAction::Search {
++            query,
++            queries,
++            sources: sources.map(|items| {
++                items
++                    .into_iter()
++                    .map(|source| match source {
++                        codex_protocol::models::WebSearchSource::Url { url, title } => {
++                            codex_extension_items::web_search::WebSearchSource::Url { url, title }
++                        }
++                        codex_protocol::models::WebSearchSource::Other => {
++                            codex_extension_items::web_search::WebSearchSource::Other
++                        }
++                    })
++                    .collect()
++            }),
++        },
+         codex_protocol::models::WebSearchAction::OpenPage { url } => {
+             WebSearchAction::OpenPage { url }
+         }
+@@ -1644,3 +1662,24 @@
+ pub struct ToolRequestUserInputResponse {
+     pub answers: HashMap<String, ToolRequestUserInputAnswer>,
+ }
++
++#[cfg(test)]
++mod source_web_sources_tests {
++    use super::*;
++
++    #[test]
++    fn source_web_sources_survive_existing_action_projection() {
++        let source = serde_json::json!({"type":"search","query":"city statistics","queries":null,"sources":[{"type":"url","url":"https://example.org/statistics/2025","title":"Annual statistics"}]});
++        let core = serde_json::from_value(source.clone()).unwrap();
++        assert_eq!(
++            serde_json::to_value(web_search_action_from_core(core)).unwrap(),
++            source
++        );
++        let old = serde_json::json!({"type":"search","query":"city statistics","queries":null});
++        let core = serde_json::from_value(old.clone()).unwrap();
++        assert_eq!(
++            serde_json::to_value(web_search_action_from_core(core)).unwrap(),
++            old
++        );
++    }
++}
+diff --git a/app-server-protocol/src/protocol/v2/tests.rs b/app-server-protocol/src/protocol/v2/tests.rs
+--- a/app-server-protocol/src/protocol/v2/tests.rs
++++ b/app-server-protocol/src/protocol/v2/tests.rs
+@@ -2774,6 +2774,7 @@
+         id: "search-1".to_string(),
+         query: "docs".to_string(),
+         action: CoreWebSearchAction::Search {
++            sources: None,
+             query: Some("docs".to_string()),
+             queries: None,
+         },
+@@ -2783,6 +2784,7 @@
+         id: "search-1".to_string(),
+         query: "docs".to_string(),
+         action: Some(WebSearchAction::Search {
++            sources: None,
+             query: Some("docs".to_string()),
+             queries: None,
+         }),
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -871,11 +871,22 @@
+                 reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+             });
+         let reasoning = Self::build_reasoning(model_info, effort, summary);
+-        let include = if reasoning.is_some() {
++        let mut include = if reasoning.is_some() {
+             vec!["reasoning.encrypted_content".to_string()]
+         } else {
+             Vec::new()
+         };
++        // Kimi executes built-in search server-side; include its actual source
++        // metadata without creating another tool or modifying assistant text.
++        if model_info.slug == "kimi-k3"
++            && tools.as_ref().is_some_and(|tools| {
++                tools.iter().any(|tool| {
++                    tool.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
++                })
++            })
++        {
++            include.push("web_search_call.action.sources".to_string());
++        }
+         let verbosity = if model_info.support_verbosity {
+             self.state.model_verbosity.or(model_info.default_verbosity)
+         } else {
+diff --git a/core/src/event_mapping_tests.rs b/core/src/event_mapping_tests.rs
+--- a/core/src/event_mapping_tests.rs
++++ b/core/src/event_mapping_tests.rs
+@@ -490,6 +490,7 @@
+         id: Some("ws_1".to_string()),
+         status: Some("completed".to_string()),
+         action: Some(WebSearchAction::Search {
++            sources: None,
+             query: Some("weather".to_string()),
+             queries: None,
+         }),
+@@ -505,6 +506,7 @@
+                 id: "ws_1".to_string(),
+                 query: "weather".to_string(),
+                 action: WebSearchAction::Search {
++                    sources: None,
+                     query: Some("weather".to_string()),
+                     queries: None,
+                 },
+diff --git a/core/src/web_search.rs b/core/src/web_search.rs
+--- a/core/src/web_search.rs
++++ b/core/src/web_search.rs
+@@ -17,7 +17,7 @@
+ 
+ pub fn web_search_action_detail(action: &WebSearchAction) -> String {
+     match action {
+-        WebSearchAction::Search { query, queries } => search_action_detail(query, queries),
++        WebSearchAction::Search { query, queries, .. } => search_action_detail(query, queries),
+         WebSearchAction::OpenPage { url } => url.clone().unwrap_or_default(),
+         WebSearchAction::FindInPage { url, pattern } => match (pattern, url) {
+             (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
+diff --git a/core/tests/suite/client.rs b/core/tests/suite/client.rs
+--- a/core/tests/suite/client.rs
++++ b/core/tests/suite/client.rs
+@@ -3038,6 +3038,7 @@
+         id: Some("web-search-id".into()),
+         status: Some("completed".into()),
+         action: Some(WebSearchAction::Search {
++            sources: None,
+             query: Some("weather".into()),
+             queries: None,
+         }),
+diff --git a/core/tests/suite/items.rs b/core/tests/suite/items.rs
+--- a/core/tests/suite/items.rs
++++ b/core/tests/suite/items.rs
+@@ -382,6 +382,7 @@
+     assert_eq!(
+         completed.0.action,
+         WebSearchAction::Search {
++            sources: None,
+             query: Some("weather seattle".to_string()),
+             queries: None,
+         }
+diff --git a/exec/tests/event_processor_with_json_output.rs b/exec/tests/event_processor_with_json_output.rs
+--- a/exec/tests/event_processor_with_json_output.rs
++++ b/exec/tests/event_processor_with_json_output.rs
+@@ -367,6 +367,7 @@
+                 id: "search-1".to_string(),
+                 query: "rust async await".to_string(),
+                 action: Some(ApiWebSearchAction::Search {
++                    sources: None,
+                     query: Some("rust async await".to_string()),
+                     queries: None,
+                 }),
+@@ -387,6 +388,7 @@
+                         id: "search-1".to_string(),
+                         query: "rust async await".to_string(),
+                         action: WebSearchAction::Search {
++                            sources: None,
+                             query: Some("rust async await".to_string()),
+                             queries: None,
+                         },
+@@ -420,6 +422,7 @@
+                 id: "search-1".to_string(),
+                 query: "rust async await".to_string(),
+                 action: Some(ApiWebSearchAction::Search {
++                    sources: None,
+                     query: Some("rust async await".to_string()),
+                     queries: None,
+                 }),
+@@ -456,6 +459,7 @@
+                         id: "search-1".to_string(),
+                         query: "rust async await".to_string(),
+                         action: WebSearchAction::Search {
++                            sources: None,
+                             query: Some("rust async await".to_string()),
+                             queries: None,
+                         },
+diff --git a/ext/items/src/tests.rs b/ext/items/src/tests.rs
+--- a/ext/items/src/tests.rs
++++ b/ext/items/src/tests.rs
+@@ -43,6 +43,7 @@
+         id: "search-1".to_string(),
+         query: "docs".to_string(),
+         action: Some(WebSearchAction::Search {
++            sources: None,
+             query: Some("docs".to_string()),
+             queries: None,
+         }),
+diff --git a/ext/items/src/web_search.rs b/ext/items/src/web_search.rs
+--- a/ext/items/src/web_search.rs
++++ b/ext/items/src/web_search.rs
+@@ -16,6 +16,22 @@
+ }
+ 
+ // App-server-facing description of the action performed by standalone web search.
++
++/// Pages actually returned by the provider, not citations to assistant claims.
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
++#[serde(tag = "type", rename_all = "snake_case")]
++#[ts(export_to = "v2/")]
++pub enum WebSearchSource {
++    Url {
++        url: String,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        #[ts(optional)]
++        title: Option<String>,
++    },
++    #[serde(other)]
++    Other,
++}
++
+ #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+ #[serde(tag = "type", rename_all = "camelCase")]
+ #[ts(tag = "type", rename_all = "camelCase")]
+@@ -24,6 +40,9 @@
+ #[ts(export_to = "v2/")]
+ pub enum WebSearchAction {
+     Search {
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        #[ts(optional)]
++        sources: Option<Vec<WebSearchSource>>,
+         query: Option<String>,
+         queries: Option<Vec<String>>,
+     },
+diff --git a/ext/web-search/src/tool.rs b/ext/web-search/src/tool.rs
+--- a/ext/web-search/src/tool.rs
++++ b/ext/web-search/src/tool.rs
+@@ -130,7 +130,8 @@
+             .await
+             .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+         let legacy_action = match &command_action {
+-            WebSearchAction::Search { query, queries } => CoreWebSearchAction::Search {
++            WebSearchAction::Search { query, queries, .. } => CoreWebSearchAction::Search {
++                sources: None,
+                 query: query.clone(),
+                 queries: queries.clone(),
+             },
+@@ -204,10 +205,12 @@
+     match queries {
+         [] => None,
+         [query] => Some(WebSearchAction::Search {
++            sources: None,
+             query: Some(query.q.clone()),
+             queries: None,
+         }),
+         queries => Some(WebSearchAction::Search {
++            sources: None,
+             query: None,
+             queries: Some(queries.iter().map(|query| query.q.clone()).collect()),
+         }),
+@@ -239,6 +242,7 @@
+             (
+                 r#"{"image_query":[{"q":"waterfalls"},{"q":"mountains"}]}"#,
+                 WebSearchAction::Search {
++                    sources: None,
+                     query: None,
+                     queries: Some(vec!["waterfalls".to_string(), "mountains".to_string()]),
+                 },
+diff --git a/protocol/src/models.rs b/protocol/src/models.rs
+--- a/protocol/src/models.rs
++++ b/protocol/src/models.rs
+@@ -1668,11 +1668,29 @@
+     pub user: Option<String>,
+ }
+ 
++/// Pages actually returned by the provider, not citations to assistant claims.
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
++#[serde(tag = "type", rename_all = "snake_case")]
++#[schemars(rename = "ResponsesApiWebSearchSource")]
++pub enum WebSearchSource {
++    Url {
++        url: String,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        #[ts(optional)]
++        title: Option<String>,
++    },
++    #[serde(other)]
++    Other,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
+ #[serde(tag = "type", rename_all = "snake_case")]
+ #[schemars(rename = "ResponsesApiWebSearchAction")]
+ pub enum WebSearchAction {
+     Search {
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        #[ts(optional)]
++        sources: Option<Vec<WebSearchSource>>,
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         #[ts(optional)]
+         query: Option<String>,
+@@ -3182,6 +3200,7 @@
+                 }"#,
+                 None,
+                 Some(WebSearchAction::Search {
++                    sources: None,
+                     query: Some("weather seattle".into()),
+                     queries: Some(vec!["weather seattle".into(), "seattle weather now".into()]),
+                 }),
+@@ -3658,3 +3677,18 @@
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod source_web_sources_tests {
++    use super::*;
++
++    #[test]
++    fn source_web_sources_round_trip_and_legacy_absence() {
++        let value = serde_json::json!({"type":"search","query":"city statistics","sources":[{"type":"url","url":"https://example.org/statistics/2025","title":"Annual statistics"}]});
++        let parsed: WebSearchAction = serde_json::from_value(value.clone()).unwrap();
++        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
++        let old = serde_json::json!({"type":"search","query":"city statistics"});
++        let parsed: WebSearchAction = serde_json::from_value(old.clone()).unwrap();
++        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
++    }
++}
+diff --git a/protocol/src/protocol.rs b/protocol/src/protocol.rs
+--- a/protocol/src/protocol.rs
++++ b/protocol/src/protocol.rs
+@@ -5084,6 +5084,7 @@
+                 id: "search-1".into(),
+                 query: "find docs".into(),
+                 action: WebSearchAction::Search {
++                    sources: None,
+                     query: Some("find docs".into()),
+                     queries: None,
+                 },
+diff --git a/tui/src/history_cell/search.rs b/tui/src/history_cell/search.rs
+--- a/tui/src/history_cell/search.rs
++++ b/tui/src/history_cell/search.rs
+@@ -12,7 +12,7 @@
+ 
+ fn web_search_action_detail(action: &WebSearchAction) -> String {
+     match action {
+-        WebSearchAction::Search { query, queries } => {
++        WebSearchAction::Search { query, queries, .. } => {
+             query.clone().filter(|q| !q.is_empty()).unwrap_or_else(|| {
+                 let items = queries.as_ref();
+                 let first = items
+diff --git a/tui/src/history_cell/tests.rs b/tui/src/history_cell/tests.rs
+--- a/tui/src/history_cell/tests.rs
++++ b/tui/src/history_cell/tests.rs
+@@ -1110,6 +1110,7 @@
+         "call-1".to_string(),
+         query.clone(),
+         WebSearchAction::Search {
++            sources: None,
+             query: Some(query),
+             queries: None,
+         },
+@@ -1161,6 +1162,7 @@
+         "call-1".to_string(),
+         query.clone(),
+         WebSearchAction::Search {
++            sources: None,
+             query: Some(query),
+             queries: None,
+         },
+@@ -1183,6 +1185,7 @@
+         "call-1".to_string(),
+         query.clone(),
+         WebSearchAction::Search {
++            sources: None,
+             query: Some(query),
+             queries: None,
+         },
+@@ -1202,6 +1205,7 @@
+         "call-1".to_string(),
+         query.clone(),
+         WebSearchAction::Search {
++            sources: None,
+             query: Some(query),
+             queries: None,
+         },

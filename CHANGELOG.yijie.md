@@ -41,3 +41,7 @@ The parameter change is semantic; the complete FEAT-156 candidate retains its co
 Owner已明确批准最小流式兼容补丁 `chat-models/0005-feat-156-terminal-tool-arguments.patch`（semantic）。固定上游与0001/0002/input-only0003/已批准0004保持。仅在中间function_call完成Item参数为空时暂存后续事件，等完整response.completed后校验Item索引、ID、callID、函数名、namespace、有效JSON对象及参数增量一致，再按原顺序进入工具处理。非空参数继续流式处理；未获完整一致终态时安全错误，不执行空/猜测参数。缓冲有界，不新增权限或工具，input-only原拒绝路径保持。
 
 新候选由 `make chat-model-stream-build` 生成到 `.yijie/build/chat-models-stream-args/aarch64-apple-darwin/`，复用原 `codex-rs/target`。原input-only和chat-models产物不覆盖；原始codex-rs子树不修改。`make chat-model-stream-test`检验重放/逆向、schema和正常EOF握手。实际构建/资格结果及精确hash以FEAT-156 evidence为准，不能把本说明当已通过或已发布。
+# 2026-10-23 本地搜索来源候选
+
+- 在现有 Responses/WebSearchAction 链路请求并保留真实搜索来源；不生成答案引用或进度。
+- 独立补丁和构建产物，保留固定上游、权限策略与旧产物。详见 `docs/native-web-search-sources.md`。

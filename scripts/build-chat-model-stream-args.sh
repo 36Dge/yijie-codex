@@ -15,7 +15,16 @@ if [[ "$(rustc --version | awk '{print $2}')" != "$YIJIE_CODEX_RUST_TOOLCHAIN" ]
   echo "Pinned Rust toolchain is required." >&2
   exit 2
 fi
-artifact_dir="$repo_root/.yijie/build/chat-models-stream-args/$target"
+candidate=chat-models-stream-args
+manifest_writer=write-chat-model-stream-runtime-manifest.py
+if [[ "${1:-}" == --web-search-sources && "$#" == 1 ]]; then
+  candidate=chat-models-web-sources
+  manifest_writer=write-web-search-sources-runtime-manifest.py
+elif [[ "$#" != 0 ]]; then
+  echo "Expected no arguments or --web-search-sources." >&2
+  exit 2
+fi
+artifact_dir="$repo_root/.yijie/build/$candidate/$target"
 schema_dir="$artifact_dir/generated-json-schema"
 if [[ -e "$artifact_dir/codex" || -e "$artifact_dir/runtime-manifest.json" ]]; then
   echo "Candidate already exists; refusing to overwrite. Verify it or choose a reviewed new revision." >&2
@@ -35,6 +44,9 @@ patches=(
   .yijie/patches/chat-models/0004-feat-156-upstream-tool-choice.patch
   .yijie/patches/chat-models/0005-feat-156-terminal-tool-arguments.patch
 )
+if [[ "$candidate" == chat-models-web-sources ]]; then
+  patches+=(.yijie/patches/chat-models/0006-native-web-search-sources.patch)
+fi
 for patch in "${patches[@]}"; do
   [[ -f "$repo_root/$patch" && ! -L "$repo_root/$patch" ]]
   git -C "$workspace" apply --check "$repo_root/$patch"
@@ -62,6 +74,11 @@ CARGO_TARGET_DIR="$repo_root/codex-rs/target" cargo test --offline --locked \
   --manifest-path "$workspace/Cargo.toml" --package codex-api feat156_ -- --test-threads=1
 CARGO_TARGET_DIR="$repo_root/codex-rs/target" cargo clippy --offline --locked \
   --manifest-path "$workspace/Cargo.toml" --package codex-api --lib -- -D warnings
+if [[ "$candidate" == chat-models-web-sources ]]; then
+  CARGO_TARGET_DIR="$repo_root/codex-rs/target" cargo test --offline --locked \
+    --manifest-path "$workspace/Cargo.toml" --package codex-protocol --package codex-app-server-protocol \
+    --lib source_web_sources -- --test-threads=1
+fi
 CARGO_TARGET_DIR="$repo_root/codex-rs/target" cargo build --offline --locked \
   --manifest-path "$workspace/Cargo.toml" --release \
   --package codex-cli --bin codex --target "$target"
@@ -90,13 +107,16 @@ for name, digest in json.loads(record.read_text()).items():
     if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
         raise SystemExit("Source changed during build; refusing a mismatched manifest")
 PY
-python3 "$repo_root/scripts/write-chat-model-stream-runtime-manifest.py" \
+python3 "$repo_root/scripts/$manifest_writer" \
   --profile input-only --binary "$artifact_dir/codex" --schema-dir "$schema_dir" \
   --output "$artifact_dir/runtime-manifest.json" --target "$target" \
   --upstream-url "$YIJIE_CODEX_UPSTREAM_URL" --upstream-tag "$YIJIE_CODEX_UPSTREAM_TAG" \
   --upstream-commit "$YIJIE_CODEX_UPSTREAM_COMMIT" --runtime-version "$YIJIE_CODEX_RUNTIME_VERSION" \
   --rust-toolchain "$YIJIE_CODEX_RUST_TOOLCHAIN" --patch-dir "$repo_root/.yijie/patches" \
   --lock-normalization "$artifact_dir/lock-normalization.json"
+if [[ "$candidate" == chat-models-web-sources ]]; then
+  python3 "$repo_root/scripts/verify-web-search-sources-schema.py" "$schema_dir"
+else
 python3 - "$repo_root" "$schema_dir" <<'PYSCHEMA'
 import sys
 from pathlib import Path
@@ -108,4 +128,5 @@ if a != b or len(b) != 269:
     raise SystemExit("FEAT-156 canonical schema differs from fixed input-only authority")
 print("269 stable schemas equal the fixed input-only source")
 PYSCHEMA
+fi
 echo "Chat-model stream-arguments candidate built with shared codex-rs/target cache: $artifact_dir"
