@@ -95,3 +95,7 @@ Owner已明确批准最小流式兼容补丁 `chat-models/0005-feat-156-terminal
 固定上游不变。新增可重放 `0006-native-web-search-sources.patch`，复用现有构建入口的
 `--web-search-sources` 选项与独立产物目录；旧产物保留。详情见
 [原生搜索来源候选](docs/native-web-search-sources.md)。未发布，真实资格以本轮证据为准。
+
+## FEAT-164 isolated Kimi K3.1 Pro candidate (2026-10-24)
+
+Owner confirmed the FEAT-164 implementation plan. Preserve the upstream version and patches 0001–0006, then apply `chat-models/0007-feat-164-kimi-k31-pro.patch` only in the new canonical temporary build. It refuses retired K3 Responses requests and enables real search-source inclusion for K3.1 Pro; historical text, permission and app-server schema semantics remain unchanged. `bash scripts/build-kimi-k31-pro.sh` produces the independent `kimi-k31-pro-r1` artifact and validates ordinary request construction, schema equality and normal EOF. Existing Runtime artifacts and current Host/Desktop pins are not replaced. Actual qualification is recorded in the FEAT-164 implementation evidence, not inferred from this entry. See [candidate details](docs/kimi-k31-pro-candidate.md).

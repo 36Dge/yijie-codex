@@ -1,0 +1,138 @@
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -836,6 +836,13 @@
+         service_tier: Option<String>,
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<ResponsesApiRequest> {
++        // The retired identity remains readable in historical context but must
++        // never produce another Responses request, including auxiliary turns.
++        if model_info.slug == "kimi-k3" {
++            return Err(CodexErr::InvalidRequest(
++                "The kimi-k3 model is retired; select kimi-k3.1-pro before executing.".to_string(),
++            ));
++        }
+         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+         let is_openai = self.state.provider.info().is_openai();
+         if !is_openai {
+@@ -878,7 +885,7 @@
+         };
+         // Kimi executes built-in search server-side; include its actual source
+         // metadata without creating another tool or modifying assistant text.
+-        if model_info.slug == "kimi-k3"
++        if model_info.slug == "kimi-k3.1-pro"
+             && tools.as_ref().is_some_and(|tools| {
+                 tools.iter().any(|tool| {
+                     tool.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
+diff --git a/core/src/client_tests.rs b/core/src/client_tests.rs
+--- a/core/src/client_tests.rs
++++ b/core/src/client_tests.rs
+@@ -893,3 +893,108 @@
+     );
+     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+ }
++
++// FEAT-164: ordinary in-memory request construction; no transport or process.
++fn feat164_request(
++    model: &str,
++    search: bool,
++) -> codex_protocol::error::Result<codex_api::ResponsesApiRequest> {
++    let client = test_model_client(SessionSource::Cli);
++    let mut info = test_model_info();
++    info.slug = model.to_string();
++    info.supports_reasoning_summaries = true;
++    info.default_reasoning_level = Some(ReasoningEffort::Max);
++    let mut prompt = Prompt::default();
++    prompt
++        .input
++        .push(output_message("history", "Historical model: kimi-k3"));
++    if search {
++        prompt.tools.push(codex_tools::ToolSpec::WebSearch {
++            external_web_access: Some(true),
++            indexed_web_access: None,
++            filters: None,
++            user_location: None,
++            search_context_size: None,
++            search_content_types: None,
++        });
++    }
++    let provider = codex_api::Provider {
++        name: "Kimi".to_string(),
++        base_url: "http://127.0.0.1:1/v1".to_string(),
++        query_params: None,
++        headers: Default::default(),
++        retry: codex_api::RetryConfig {
++            max_attempts: 1,
++            base_delay: Duration::ZERO,
++            retry_429: false,
++            retry_5xx: false,
++            retry_transport: false,
++        },
++        stream_idle_timeout: Duration::from_secs(1),
++    };
++    let metadata = test_responses_metadata_for_client(
++        &client,
++        None,
++        "feat164".to_string(),
++        None,
++        TestCodexResponsesRequestKind::Turn,
++    );
++    client.build_responses_request(
++        &provider,
++        &prompt,
++        &info,
++        Some(ReasoningEffort::Max),
++        codex_protocol::config_types::ReasoningSummary::None,
++        None,
++        &metadata,
++    )
++}
++
++#[test]
++fn feat164_retired_request_is_rejected_before_transport() {
++    for search in [false, true] {
++        assert!(matches!(
++            feat164_request("kimi-k3", search),
++            Err(codex_protocol::error::CodexErr::InvalidRequest(_))
++        ));
++    }
++}
++
++#[test]
++fn feat164_new_model_search_preserves_sources_reasoning_and_historical_text() {
++    let request = feat164_request("kimi-k3.1-pro", true).expect("new model request");
++    assert_eq!(request.model, "kimi-k3.1-pro");
++    assert_eq!(request.tool_choice, "auto");
++    assert!(
++        request
++            .include
++            .contains(&"web_search_call.action.sources".to_string())
++    );
++    assert!(
++        request
++            .include
++            .contains(&"reasoning.encrypted_content".to_string())
++    );
++    assert_eq!(
++        request.reasoning.expect("reasoning").effort,
++        Some(ReasoningEffort::Max)
++    );
++    assert!(
++        serde_json::to_string(&request.input)
++            .unwrap()
++            .contains("Historical model: kimi-k3")
++    );
++}
++
++#[test]
++fn feat164_sources_are_not_added_to_no_search_or_other_models() {
++    for (model, search) in [("kimi-k3.1-pro", false), ("MiniMax-M3", true)] {
++        let request = feat164_request(model, search).expect("active model request");
++        assert_eq!(request.model, model);
++        assert!(
++            !request
++                .include
++                .contains(&"web_search_call.action.sources".to_string())
++        );
++    }
++}
