@@ -42,3 +42,9 @@ chat-model-stream-build:
 
 chat-model-stream-test:
 	bash scripts/test-chat-model-stream-args.sh
+
+.PHONY: kimi-k31-pro-r3-build kimi-k31-pro-r3-check
+kimi-k31-pro-r3-build:
+	bash scripts/build-kimi-k31-pro-r3.sh
+kimi-k31-pro-r3-check:
+	bash scripts/check-kimi-k31-pro-r3.sh

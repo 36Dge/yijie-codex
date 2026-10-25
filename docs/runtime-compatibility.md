@@ -98,3 +98,9 @@ Schema tree 哈希实现，避免两套算法独立漂移。若 sibling checkout
 6. cloud runner transport 确认后建立独立矩阵。
 
 每次上游升级都必须重新生成 Schema，并将兼容性差异映射到 Agent Host。Schema 无 diff 也不能替代真实下游集成测试。
+
+## FEAT-164 r3 native failure terminal candidate (2026-10-25)
+
+Owner explicitly authorized the minimal core/patch repair and Contract First consumer projection. Independent `0009-feat-164-native-failure-terminals.patch` follows the retained r2 eight-patch chain. It preserves an errored native agent through TurnComplete, resets on TurnStarted, retains cancellation behavior, and ignores errors that do not affect the turn. Rollout persists only turn-affecting ErrorEvent facts with a fixed generic message and existing typed error code; original error prose is never copied to durable history. Both ordinary and metrics-enabled persistence paths use the same sanitizer. Existing history readers already recognize this unchanged event shape. No old rollout is rewritten.
+
+Increment contract-impact=semantic pending directional conformance; complete FEAT-164 remains breaking. No app-server field/type change, authentication, approval, sandbox, provider retry or database migration. Canonical upstream stays byte-identical; only disposable build trees receive the patch. `make kimi-k31-pro-r3-check` runs safe focused tests and scoped clippy; `make kimi-k31-pro-r3-build` writes a new non-overwritable `.yijie/build/kimi-k31-pro-r3/` artifact, verifies canonical schema against retained r2, and performs normal-EOF handshake. The retained r2/legacy binaries and generators are unchanged. Qualification results and immutable downstream pins must be completed before use; this is not a release or full FEAT-164 acceptance.

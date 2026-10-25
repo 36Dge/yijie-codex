@@ -1,0 +1,326 @@
+diff --git a/app-server-protocol/src/protocol/thread_history.rs b/app-server-protocol/src/protocol/thread_history.rs
+index d3e1765..6a4c8b5 100644
+--- a/app-server-protocol/src/protocol/thread_history.rs
++++ b/app-server-protocol/src/protocol/thread_history.rs
+@@ -3828,6 +3828,48 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn feat164_safe_failure_replay_and_next_turn_success() {
++        let mut items = Vec::new();
++        for id in ["failed-turn", "next-turn"] {
++            items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
++                TurnStartedEvent {
++                    turn_id: id.into(),
++                    trace_id: None,
++                    started_at: None,
++                    model_context_window: None,
++                    collaboration_mode_kind: Default::default(),
++                },
++            )));
++            if id == "failed-turn" {
++                items.push(RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
++                    message: "Turn failed; error details were not retained.".into(),
++                    codex_error_info: Some(CodexErrorInfo::BadRequest),
++                })));
++            }
++            items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
++                TurnCompleteEvent {
++                    turn_id: id.into(),
++                    last_agent_message: None,
++                    completed_at: None,
++                    duration_ms: None,
++                    time_to_first_token_ms: None,
++                },
++            )));
++        }
++        let serialized = serde_json::to_string(&items).unwrap();
++        let decoded: Vec<RolloutItem> = serde_json::from_str(&serialized).unwrap();
++        let turns = build_turns_from_rollout_items(&decoded);
++        assert_eq!(turns.len(), 2);
++        assert_eq!(turns[0].status, TurnStatus::Failed);
++        assert_eq!(
++            turns[0].error.as_ref().unwrap().message,
++            "Turn failed; error details were not retained."
++        );
++        assert_eq!(turns[1].status, TurnStatus::Completed);
++        assert!(turns[1].error.is_none());
++    }
++
+     #[test]
+     fn rollback_failed_error_does_not_mark_turn_failed() {
+         let events = vec![
+diff --git a/core/src/agent/mod.rs b/core/src/agent/mod.rs
+index 350962d..57acb85 100644
+--- a/core/src/agent/mod.rs
++++ b/core/src/agent/mod.rs
+@@ -8,4 +8,5 @@ pub(crate) use codex_protocol::protocol::AgentStatus;
+ pub(crate) use control::AgentControl;
+ pub(crate) use registry::exceeds_thread_spawn_depth_limit;
+ pub(crate) use registry::next_thread_spawn_depth;
++pub(crate) use status::agent_status_after_event;
+ pub(crate) use status::agent_status_from_event;
+diff --git a/core/src/agent/status.rs b/core/src/agent/status.rs
+index 43be718..30f4246 100644
+--- a/core/src/agent/status.rs
++++ b/core/src/agent/status.rs
+@@ -14,7 +14,9 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
+             }
+             _ => Some(AgentStatus::Errored(format!("{:?}", ev.reason))),
+         },
+-        EventMsg::Error(ev) => Some(AgentStatus::Errored(ev.message.clone())),
++        EventMsg::Error(ev) if ev.affects_turn_status() => {
++            Some(AgentStatus::Errored(ev.message.clone()))
++        }
+         EventMsg::ShutdownComplete => Some(AgentStatus::Shutdown),
+         _ => None,
+     }
+@@ -26,3 +28,83 @@ pub(crate) fn is_final(status: &AgentStatus) -> bool {
+         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
+     )
+ }
++
++/// A completion closes the turn; it cannot erase that turn's failure.
++/// TurnStarted resets the status for the next turn, and cancellation keeps its
++/// existing projection. Non-turn errors do not change the current status.
++pub(crate) fn agent_status_after_event(
++    current: &AgentStatus,
++    msg: &EventMsg,
++) -> Option<AgentStatus> {
++    if matches!(msg, EventMsg::TurnComplete(_)) && matches!(current, AgentStatus::Errored(_)) {
++        return None;
++    }
++    agent_status_from_event(msg)
++}
++
++#[cfg(test)]
++mod feat164_tests {
++    use super::*;
++    use codex_protocol::protocol::{
++        CodexErrorInfo, ErrorEvent, TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent,
++        TurnStartedEvent,
++    };
++
++    fn complete() -> EventMsg {
++        EventMsg::TurnComplete(TurnCompleteEvent {
++            turn_id: "local-turn".into(),
++            last_agent_message: None,
++            completed_at: None,
++            duration_ms: None,
++            time_to_first_token_ms: None,
++        })
++    }
++    #[test]
++    fn feat164_failure_survives_completion_and_next_turn_resets() {
++        let failed = agent_status_after_event(
++            &AgentStatus::Running,
++            &EventMsg::Error(ErrorEvent {
++                message: "ordinary local rejection".into(),
++                codex_error_info: Some(CodexErrorInfo::BadRequest),
++            }),
++        )
++        .unwrap();
++        assert!(matches!(failed, AgentStatus::Errored(_)));
++        assert!(agent_status_after_event(&failed, &complete()).is_none());
++        let started = EventMsg::TurnStarted(TurnStartedEvent {
++            turn_id: "next-turn".into(),
++            trace_id: None,
++            started_at: None,
++            model_context_window: None,
++            collaboration_mode_kind: Default::default(),
++        });
++        let running = agent_status_after_event(&failed, &started).unwrap();
++        assert!(matches!(running, AgentStatus::Running));
++        assert!(matches!(
++            agent_status_after_event(&running, &complete()),
++            Some(AgentStatus::Completed(None))
++        ));
++    }
++    #[test]
++    fn feat164_non_turn_error_and_cancel_keep_native_meaning() {
++        let error = EventMsg::Error(ErrorEvent {
++            message: "ordinary rollback request rejected".into(),
++            codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
++        });
++        assert!(agent_status_after_event(&AgentStatus::Running, &error).is_none());
++        let cancelled = EventMsg::TurnAborted(TurnAbortedEvent {
++            turn_id: Some("local-turn".into()),
++            reason: TurnAbortReason::Interrupted,
++            completed_at: None,
++            duration_ms: None,
++        });
++        assert!(matches!(
++            agent_status_after_event(&AgentStatus::Errored("local".into()), &cancelled),
++            Some(AgentStatus::Interrupted)
++        ));
++        assert!(matches!(
++            agent_status_after_event(&AgentStatus::Running, &EventMsg::ShutdownComplete),
++            Some(AgentStatus::Shutdown)
++        ));
++    }
++}
+diff --git a/core/src/session/mod.rs b/core/src/session/mod.rs
+index cc7c9ad..8da622c 100644
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
+ 
+ use crate::agent::AgentControl;
+ use crate::agent::AgentStatus;
++use crate::agent::agent_status_after_event;
+ use crate::agent::agent_status_from_event;
+ use crate::agent::status::is_final;
+ use crate::agent_communication::AgentCommunicationContext;
+@@ -1995,9 +1996,14 @@ impl Session {
+ 
+     async fn deliver_event_raw(&self, event: Event) {
+         // Record the last known agent status.
+-        if let Some(status) = agent_status_from_event(&event.msg) {
+-            self.agent_status.send_replace(status);
+-        }
++        self.agent_status.send_if_modified(|current| {
++            if let Some(status) = agent_status_after_event(current, &event.msg) {
++                *current = status;
++                true
++            } else {
++                false
++            }
++        });
+         if let Err(e) = self.tx_event.send(event).await {
+             debug!("dropping event because channel is closed: {e}");
+         }
+diff --git a/rollout/src/persistence_metrics.rs b/rollout/src/persistence_metrics.rs
+index a3ee1dc..9891b7c 100644
+--- a/rollout/src/persistence_metrics.rs
++++ b/rollout/src/persistence_metrics.rs
+@@ -11,6 +11,7 @@ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::ThreadHistoryMode;
+ 
+ use crate::policy::is_persisted_rollout_item;
++use crate::policy::safe_persisted_rollout_item;
+ 
+ const ITEM_BYTES_METRIC: &str = "codex.rollout.persistence.item_bytes";
+ const APPEND_METRIC: &str = "codex.rollout.persistence.append";
+@@ -114,8 +115,12 @@ pub fn measure_and_filter_rollout_items(
+         let payload_bytes = serialized_len(item).ok();
+         add_to_totals(&mut measurement.pre_filter, payload_bytes);
+         if kept {
+-            add_to_totals(&mut measurement.post_filter, payload_bytes);
+-            persisted.push(item.clone());
++            let safe_item = safe_persisted_rollout_item(item);
++            add_to_totals(
++                &mut measurement.post_filter,
++                serialized_len(&safe_item).ok(),
++            );
++            persisted.push(safe_item);
+         }
+         measurement.items.push(RolloutItemMeasurement {
+             decision,
+diff --git a/rollout/src/policy.rs b/rollout/src/policy.rs
+index 75ddec3..098ffe9 100644
+--- a/rollout/src/policy.rs
++++ b/rollout/src/policy.rs
+@@ -27,12 +27,26 @@ pub fn persisted_rollout_items(
+     let mut persisted = Vec::new();
+     for item in items {
+         if is_persisted_rollout_item(item, history_mode) {
+-            persisted.push(item.clone());
++            persisted.push(safe_persisted_rollout_item(item));
+         }
+     }
+     persisted
+ }
+ 
++/// Retain the native failure fact without retaining provider/error prose.
++/// The existing ErrorEvent shape is understood by retained history readers.
++pub(crate) fn safe_persisted_rollout_item(item: &RolloutItem) -> RolloutItem {
++    match item {
++        RolloutItem::EventMsg(EventMsg::Error(error)) => {
++            RolloutItem::EventMsg(EventMsg::Error(codex_protocol::protocol::ErrorEvent {
++                message: "Turn failed; error details were not retained.".into(),
++                codex_error_info: error.codex_error_info.clone(),
++            }))
++        }
++        _ => item.clone(),
++    }
++}
++
+ /// Whether a `ResponseItem` should be persisted in rollout files.
+ #[inline]
+ pub fn should_persist_response_item(item: &ResponseItem) -> bool {
+@@ -114,9 +128,10 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode)
+         | EventMsg::ImageGenerationEnd(_)
+         | EventMsg::SubAgentActivity(_) => matches!(history_mode, ThreadHistoryMode::Legacy),
+ 
++        EventMsg::Error(error) => error.affects_turn_status(),
++
+         // Transient, non-durable events.
+-        EventMsg::Error(_)
+-        | EventMsg::GuardianAssessment(_)
++        EventMsg::GuardianAssessment(_)
+         | EventMsg::ExecCommandEnd(_)
+         | EventMsg::ViewImageToolCall(_)
+         | EventMsg::CollabAgentSpawnEnd(_)
+@@ -174,3 +189,61 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode)
+         | EventMsg::CollabResumeBegin(_) => false,
+     }
+ }
++
++#[cfg(test)]
++mod feat164_tests {
++    use super::*;
++    use codex_protocol::protocol::{CodexErrorInfo, ErrorEvent};
++    #[test]
++    fn feat164_persisted_error_is_safe_in_both_history_modes_and_metrics_paths() {
++        let raw = RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
++            message: "ordinary local fixture detail".into(),
++            codex_error_info: Some(CodexErrorInfo::BadRequest),
++        }));
++        for mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
++            let plain = persisted_rollout_items(std::slice::from_ref(&raw), mode);
++            let (measured, metrics) = crate::persistence_metrics::measure_and_filter_rollout_items(
++                std::slice::from_ref(&raw),
++                mode,
++            );
++            assert_eq!(plain.len(), 1);
++            assert_eq!(
++                serde_json::to_value(&plain).unwrap(),
++                serde_json::to_value(&measured).unwrap()
++            );
++            let RolloutItem::EventMsg(EventMsg::Error(error)) = &plain[0] else {
++                panic!("failure fact lost");
++            };
++            assert_eq!(
++                error.message,
++                "Turn failed; error details were not retained."
++            );
++            assert_eq!(error.codex_error_info, Some(CodexErrorInfo::BadRequest));
++            assert_eq!(metrics.post_filter.items, 1);
++            assert!(
++                !serde_json::to_string(&plain)
++                    .unwrap()
++                    .contains("ordinary local fixture detail")
++            );
++        }
++        let RolloutItem::EventMsg(EventMsg::Error(error)) = raw else {
++            unreachable!()
++        };
++        assert_eq!(error.message, "ordinary local fixture detail");
++    }
++    #[test]
++    fn feat164_non_turn_errors_stay_transient() {
++        for info in [
++            CodexErrorInfo::ThreadRollbackFailed,
++            CodexErrorInfo::ActiveTurnNotSteerable {
++                turn_kind: codex_protocol::protocol::NonSteerableTurnKind::Compact,
++            },
++        ] {
++            let error = RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
++                message: "ordinary request refused".into(),
++                codex_error_info: Some(info),
++            }));
++            assert!(persisted_rollout_items(&[error], ThreadHistoryMode::Legacy).is_empty());
++        }
++    }
++}

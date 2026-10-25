@@ -55,3 +55,9 @@ canonical `codex-rs/` 必须继续与 Runtime Baseline 0 的固定上游 commit 
 - 下一次上游升级时的删除条件。
 
 patch 必须能从 `UPSTREAM.md` 固定的零修改源码按上述顺序重复应用。不得直接修改 `codex-rs/` 后再补写 patch 文件。每个构建 manifest 必须记录全部 patch 的相对路径和 SHA-256；Host 必须固定接受的完整 patch 集与 binary identity。
+
+## FEAT-164 r3 native failure terminal candidate (2026-10-25)
+
+Owner explicitly authorized the minimal core/patch repair and Contract First consumer projection. Independent `0009-feat-164-native-failure-terminals.patch` follows the retained r2 eight-patch chain. It preserves an errored native agent through TurnComplete, resets on TurnStarted, retains cancellation behavior, and ignores errors that do not affect the turn. Rollout persists only turn-affecting ErrorEvent facts with a fixed generic message and existing typed error code; original error prose is never copied to durable history. Both ordinary and metrics-enabled persistence paths use the same sanitizer. Existing history readers already recognize this unchanged event shape. No old rollout is rewritten.
+
+Increment contract-impact=semantic pending directional conformance; complete FEAT-164 remains breaking. No app-server field/type change, authentication, approval, sandbox, provider retry or database migration. Canonical upstream stays byte-identical; only disposable build trees receive the patch. `make kimi-k31-pro-r3-check` runs safe focused tests and scoped clippy; `make kimi-k31-pro-r3-build` writes a new non-overwritable `.yijie/build/kimi-k31-pro-r3/` artifact, verifies canonical schema against retained r2, and performs normal-EOF handshake. The retained r2/legacy binaries and generators are unchanged. Qualification results and immutable downstream pins must be completed before use; this is not a release or full FEAT-164 acceptance.
