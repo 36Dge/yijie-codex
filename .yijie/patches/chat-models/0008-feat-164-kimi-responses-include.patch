@@ -1,0 +1,47 @@
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -878,7 +878,10 @@
+                 reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+             });
+         let reasoning = Self::build_reasoning(model_info, effort, summary);
+-        let mut include = if reasoning.is_some() {
++        // Kimi's Responses include enum is limited to search metadata. Its
++        // reasoning items are returned without the OpenAI encrypted-content
++        // opt-in; preserve reasoning effort and all response replay handling.
++        let mut include = if reasoning.is_some() && model_info.slug != "kimi-k3.1-pro" {
+             vec!["reasoning.encrypted_content".to_string()]
+         } else {
+             Vec::new()
+diff --git a/core/src/client_tests.rs b/core/src/client_tests.rs
+--- a/core/src/client_tests.rs
++++ b/core/src/client_tests.rs
+@@ -970,11 +970,7 @@
+             .include
+             .contains(&"web_search_call.action.sources".to_string())
+     );
+-    assert!(
+-        request
+-            .include
+-            .contains(&"reasoning.encrypted_content".to_string())
+-    );
++    assert_eq!(request.include, ["web_search_call.action.sources"]);
+     assert_eq!(
+         request.reasoning.expect("reasoning").effort,
+         Some(ReasoningEffort::Max)
+@@ -998,3 +994,15 @@
+         );
+     }
+ }
++
++#[test]
++fn feat164_include_matches_kimi_documented_enum_without_changing_other_models() {
++    let kimi = feat164_request("kimi-k3.1-pro", false).expect("Kimi request");
++    assert!(kimi.include.is_empty());
++    assert_eq!(
++        kimi.reasoning.expect("reasoning").effort,
++        Some(ReasoningEffort::Max)
++    );
++    let minimax = feat164_request("MiniMax-M3", false).expect("MiniMax request");
++    assert_eq!(minimax.include, ["reasoning.encrypted_content"]);
++}

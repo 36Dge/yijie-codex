@@ -1,5 +1,7 @@
 # Upstream
 
+FEAT-164 r2 (2026-10-25) keeps the fixed upstream and original candidate patches intact. Its separate canonical build appends `chat-models/0008-feat-164-kimi-responses-include.patch` after 0007 to align K3.1 Pro's request include values with the official Responses enum. This is a semantic provider adaptation, not an app-server schema change. See `docs/kimi-k31-pro-candidate.md`; real G2V remains unqualified pending actual evidence.
+
 ## 固定版本
 
 | 字段 | 值 |
