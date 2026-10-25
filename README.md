@@ -73,3 +73,7 @@ YIJIE_RUNTIME_TARGET=aarch64-apple-darwin make runtime-baseline
 `compatibility/agent-host-runtime-approval-v6-v3.json` stable approval authority；可用
 `YIJIE_CONTRACTS_REPO` 指定其它位置，
 未检出 sibling 时该跨仓检查会输出 `SKIP`，不影响独立仓验证。
+
+## FEAT-164 native terminal repair candidate
+
+Owner-approved r4 continues the retained r2 model candidate with native failure-state and sanitized durable-history repair plus consistent persistence byte accounting. It is an independent local artifact, not the default or a release. See [repair and compatibility boundaries](docs/feat164-native-failure-terminals.md), `make kimi-k31-pro-r4-check` and `make kimi-k31-pro-r4-build`. Keep earlier artifacts and history; rollback uses the matching compatible reader with execution paused, never an older writer against new records.

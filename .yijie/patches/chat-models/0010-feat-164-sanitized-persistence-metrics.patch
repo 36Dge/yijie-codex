@@ -1,0 +1,96 @@
+diff --git a/rollout/src/persistence_metrics.rs b/rollout/src/persistence_metrics.rs
+index 9891b7c..f0c385f 100644
+--- a/rollout/src/persistence_metrics.rs
++++ b/rollout/src/persistence_metrics.rs
+@@ -46,6 +46,7 @@ pub struct RolloutItemMeasurement {
+     pub decision: PersistenceDecision,
+     pub rollout_item_type: String,
+     pub payload_bytes: Option<u64>,
++    pub persisted_payload_bytes: Option<u64>,
+ }
+ 
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+@@ -114,18 +115,20 @@ pub fn measure_and_filter_rollout_items(
+         };
+         let payload_bytes = serialized_len(item).ok();
+         add_to_totals(&mut measurement.pre_filter, payload_bytes);
+-        if kept {
++        let persisted_payload_bytes = if kept {
+             let safe_item = safe_persisted_rollout_item(item);
+-            add_to_totals(
+-                &mut measurement.post_filter,
+-                serialized_len(&safe_item).ok(),
+-            );
++            let bytes = serialized_len(&safe_item).ok();
++            add_to_totals(&mut measurement.post_filter, bytes);
+             persisted.push(safe_item);
+-        }
++            bytes
++        } else {
++            None
++        };
+         measurement.items.push(RolloutItemMeasurement {
+             decision,
+             rollout_item_type: rollout_item_type(item),
+             payload_bytes,
++            persisted_payload_bytes,
+         });
+     }
+ 
+@@ -203,7 +206,7 @@ fn finish_turn(
+ fn add_item_to_turn(totals: &mut TurnSizeTotals, item: &RolloutItemMeasurement) {
+     add_to_totals(&mut totals.pre_filter, item.payload_bytes);
+     if item.decision == PersistenceDecision::Kept {
+-        add_to_totals(&mut totals.post_filter, item.payload_bytes);
++        add_to_totals(&mut totals.post_filter, item.persisted_payload_bytes);
+     }
+ }
+ 
+@@ -423,3 +426,47 @@ fn is_thread_sampled(thread_id: ThreadId) -> bool {
+ #[cfg(test)]
+ #[path = "persistence_metrics_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++mod feat164_terminal_metrics_tests {
++    use super::*;
++    use codex_protocol::protocol::{
++        CodexErrorInfo, ErrorEvent, TurnCompleteEvent, TurnStartedEvent,
++    };
++
++    #[test]
++    fn feat164_turn_sizes_measure_sanitized_failure_bytes() {
++        let items = vec![
++            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
++                turn_id: "ordinary-turn".into(),
++                trace_id: None,
++                started_at: None,
++                model_context_window: None,
++                collaboration_mode_kind: Default::default(),
++            })),
++            RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
++                message: "ordinary local diagnostic".repeat(10),
++                codex_error_info: Some(CodexErrorInfo::BadRequest),
++            })),
++            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                turn_id: "ordinary-turn".into(),
++                last_agent_message: None,
++                completed_at: None,
++                duration_ms: None,
++                time_to_first_token_ms: None,
++            })),
++        ];
++        let (persisted, batch) =
++            measure_and_filter_rollout_items(&items, ThreadHistoryMode::Legacy);
++        let actual: u64 = persisted
++            .iter()
++            .map(|item| serialized_len(item).unwrap())
++            .sum();
++        let mut state = TurnMeasurementState::default();
++        let turns = update_turn_measurements(&mut state, &items, &batch);
++        assert_eq!(turns.completed.len(), 1);
++        assert_eq!(turns.completed[0].totals.post_filter.payload_bytes, actual);
++        assert_eq!(batch.post_filter.payload_bytes, actual);
++        assert!(batch.pre_filter.payload_bytes > actual);
++    }
++}
