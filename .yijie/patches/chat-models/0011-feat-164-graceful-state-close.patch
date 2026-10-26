@@ -1,0 +1,756 @@
+diff --git a/app-server/src/lib.rs b/app-server/src/lib.rs
+--- a/app-server/src/lib.rs
++++ b/app-server/src/lib.rs
+@@ -573,6 +573,10 @@
+         }
+     };
+     let state_db = state_db_init.state_db;
++    let owns_stdio_state = matches!(&transport, AppServerTransport::Stdio);
++    let mut log_db_owner = None;
++    let mut writers_quiesced = true;
++    let result = async {
+     if let Some(recovery_notice) = state_db_init.recovery_notice {
+         config_warnings.push(ConfigWarningNotification {
+             summary: SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY.to_string(),
+@@ -670,6 +674,7 @@
+     let feedback_layer = feedback.logger_layer();
+     let feedback_metadata_layer = feedback.metadata_layer();
+     let log_db = state_db.clone().map(log_db::start);
++    log_db_owner = log_db.clone();
+     let log_db_layer = log_db
+         .clone()
+         .map(|layer| layer.with_filter(log_db::default_filter()));
+@@ -878,6 +883,7 @@
+         info!("outbound router task exited (channel closed)");
+     });
+ 
++    writers_quiesced = false;
+     let processor_handle = tokio::spawn({
+         let auth_manager = Arc::clone(&auth_manager);
+         let analytics_events_client =
+@@ -1004,9 +1010,11 @@
+                                     .is_ok();
+                                 let processor = Arc::clone(&processor);
+                                 connection_cleanup_tasks.spawn(async move {
+-                                    processor
+-                                        .connection_closed(connection_id, &connection_state.session)
+-                                        .await;
++                                    if owns_stdio_state {
++                                        processor.connection_closed_stdio(connection_id, &connection_state.session).await;
++                                    } else {
++                                        processor.connection_closed(connection_id, &connection_state.session).await;
++                                    }
+                                 });
+                                 if !outbound_closed {
+                                     break "outbound_router_closed";
+@@ -1161,8 +1169,12 @@
+                 )
+                 .await;
+                 connection_cleanup_tasks.drain().await;
+-                processor.drain_background_tasks().await;
+-                processor.shutdown_threads().await;
++                if owns_stdio_state {
++                    processor.shutdown_stdio().await?;
++                } else {
++                    processor.drain_background_tasks().await;
++                    processor.shutdown_threads().await;
++                }
+             } else {
+                 connection_cleanup_tasks.abort();
+             }
+@@ -1172,13 +1184,15 @@
+                 shutdown_forced = shutdown_state.forced(),
+                 "processor task exited"
+             );
++            Ok::<(), std::io::Error>(())
+         }
+     });
+ 
+     drop(transport_event_tx);
+ 
+-    let _ = processor_handle.await;
++    let processor_result = processor_handle.await;
+     let _ = outbound_handle.await;
++    writers_quiesced = matches!(&processor_result, Ok(Ok(())));
+ 
+     transport_shutdown_token.cancel();
+     for handle in transport_accept_handles {
+@@ -1189,7 +1203,29 @@
+         otel.shutdown();
+     }
+ 
++    if owns_stdio_state {
++        processor_result.map_err(|_| std::io::Error::other("stdio processor stopped before cleanup"))??;
++    }
+     Ok(())
++    }.await;
++
++    if owns_stdio_state && writers_quiesced {
++        let log_result = if let Some(log_db) = log_db_owner {
++            log_db.shutdown().await
++        } else {
++            Ok(())
++        };
++        if let Some(state_db) = state_db {
++            state_db.close().await;
++        }
++        if log_result.is_err() {
++            error!("Runtime local log shutdown failed; database files retained");
++            if result.is_ok() {
++                return Err(std::io::Error::other("local log shutdown failed"));
++            }
++        }
++    }
++    result
+ }
+ 
+ struct SqliteRecoveryNotice {
+diff --git a/app-server/src/message_processor.rs b/app-server/src/message_processor.rs
+--- a/app-server/src/message_processor.rs
++++ b/app-server/src/message_processor.rs
+@@ -688,8 +688,24 @@
+         self.thread_processor.clear_all_thread_listeners().await;
+     }
+ 
++    pub(crate) async fn shutdown_stdio(&self) -> std::io::Result<()> {
++        self.models_refresh_worker.shutdown();
++        self.thread_processor.shutdown_stdio_threads().await
++    }
++
+     pub(crate) async fn shutdown_threads(&self) {
+         self.thread_processor.shutdown_threads().await;
++    }
++
++    pub(crate) async fn connection_closed_stdio(
++        &self,
++        connection_id: ConnectionId,
++        session_state: &ConnectionSessionState,
++    ) {
++        // Preserve the existing normal cleanup that can unblock an RPC, then
++        // require its completion before the stdio owner closes shared state.
++        self.connection_closed(connection_id, session_state).await;
++        session_state.rpc_gate.shutdown().await;
+     }
+ 
+     pub(crate) async fn connection_closed(
+diff --git a/app-server/src/request_processors/thread_processor.rs b/app-server/src/request_processors/thread_processor.rs
+--- a/app-server/src/request_processors/thread_processor.rs
++++ b/app-server/src/request_processors/thread_processor.rs
+@@ -1094,6 +1094,40 @@
+ 
+     pub(crate) async fn clear_all_thread_listeners(&self) {
+         self.thread_state_manager.clear_all_listeners().await;
++    }
++
++    pub(crate) async fn shutdown_stdio_threads(&self) -> std::io::Result<()> {
++        self.background_tasks.close();
++        wait_for_stdio_shutdown(self.background_tasks.wait()).await;
++        let mut shutdowns = Vec::new();
++        for id in self.thread_manager.list_thread_ids().await {
++            if let Ok(thread) = self.thread_manager.get_thread(id).await {
++                shutdowns.push(async move {
++                    let result = thread.shutdown_and_wait().await;
++                    // A submission error must not be mistaken for termination.
++                    thread.wait_until_terminated().await;
++                    (id, result)
++                });
++            }
++        }
++        let results = wait_for_stdio_shutdown(futures::future::join_all(shutdowns)).await;
++        let mut failed = false;
++        for (id, result) in results {
++            if result.is_ok() {
++                self.thread_manager.remove_thread(&id).await;
++            } else {
++                failed = true;
++            }
++        }
++        let listeners_complete =
++            wait_for_stdio_shutdown(self.thread_state_manager.shutdown_listeners()).await;
++        if failed || !listeners_complete {
++            Err(std::io::Error::other(
++                "stdio thread shutdown did not complete cleanly",
++            ))
++        } else {
++            Ok(())
++        }
+     }
+ 
+     pub(crate) async fn shutdown_threads(&self) {
+@@ -4659,3 +4693,29 @@
+ #[cfg(test)]
+ #[path = "thread_processor_tests.rs"]
+ mod thread_processor_tests;
++
++/// The deadline is diagnostic only; it never drops the in-flight cleanup.
++async fn wait_for_stdio_shutdown<T>(work: impl std::future::Future<Output = T>) -> T {
++    tokio::pin!(work);
++    tokio::select! {
++        result = &mut work => result,
++        _ = tokio::time::sleep(Duration::from_secs(10)) => {
++            warn!("stdio shutdown pending; waiting for normal cleanup");
++            work.await
++        }
++    }
++}
++
++#[cfg(test)]
++mod feat164_stdio_shutdown_tests {
++    use super::wait_for_stdio_shutdown;
++
++    #[tokio::test(start_paused = true)]
++    async fn feat164_stdio_deadline_retains_finite_cleanup() {
++        let work = async {
++            tokio::time::sleep(std::time::Duration::from_secs(11)).await;
++            17
++        };
++        assert_eq!(wait_for_stdio_shutdown(work).await, 17);
++    }
++}
+diff --git a/state/src/log_db.rs b/state/src/log_db.rs
+--- a/state/src/log_db.rs
++++ b/state/src/log_db.rs
+@@ -25,8 +25,10 @@
+ use std::time::SystemTime;
+ use std::time::UNIX_EPOCH;
+ 
++use std::sync::Arc;
+ use tokio::sync::mpsc;
+ use tokio::sync::oneshot;
++use tokio::sync::watch;
+ use tracing::Event;
+ use tracing::field::Field;
+ use tracing::field::Visit;
+@@ -117,6 +119,40 @@
+ pub struct LogDbLayer {
+     sender: mpsc::Sender<LogDbCommand>,
+     process_uuid: String,
++    shutdown: Arc<LogDbShutdown>,
++}
++
++/// A fixed, non-sensitive failure classification for the local shutdown owner.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum LogDbShutdownError {
++    InsertFailed,
++    WorkerStopped,
++}
++
++struct LogDbShutdown {
++    requested: watch::Sender<bool>,
++    completed: watch::Receiver<Option<Result<(), LogDbShutdownError>>>,
++}
++
++impl LogDbShutdown {
++    fn joining(
++        requested: watch::Sender<bool>,
++        worker: tokio::task::JoinHandle<Result<(), LogDbShutdownError>>,
++    ) -> Self {
++        let (done, completed) = watch::channel(None);
++        // Joining is owned independently of any shutdown caller. Cancelling a
++        // waiter cannot detach the inserter or consume the shared result.
++        tokio::spawn(async move {
++            let result = worker
++                .await
++                .unwrap_or(Err(LogDbShutdownError::WorkerStopped));
++            done.send_replace(Some(result));
++        });
++        Self {
++            requested,
++            completed,
++        }
++    }
+ }
+ 
+ pub fn start(state_db: std::sync::Arc<StateRuntime>) -> LogDbLayer {
+@@ -128,6 +164,7 @@
+         Self {
+             sender: self.sender.clone(),
+             process_uuid: self.process_uuid.clone(),
++            shutdown: Arc::clone(&self.shutdown),
+         }
+     }
+ }
+@@ -143,10 +180,12 @@
+     ) -> Self {
+         let config = config.normalized();
+         let (sender, receiver) = mpsc::channel(config.queue_capacity);
+-        tokio::spawn(run_inserter(state_db, receiver, config));
++        let (requested, stop) = watch::channel(false);
++        let worker = tokio::spawn(run_inserter(state_db, receiver, config, stop));
+         Self {
+             sender,
+             process_uuid: current_process_log_uuid().to_string(),
++            shutdown: Arc::new(LogDbShutdown::joining(requested, worker)),
+         }
+     }
+ 
+@@ -155,6 +194,19 @@
+         if self.sender.send(LogDbCommand::Flush(tx)).await.is_ok() {
+             let _ = rx.await;
+         }
++    }
++
++    /// Close admission, drain accepted entries, and join the owned inserter.
++    /// Clones share the result. Cancellation leaves the join owner running so
++    /// a later caller can continue waiting without restarting the task.
++    pub async fn shutdown(&self) -> Result<(), LogDbShutdownError> {
++        self.shutdown.requested.send_replace(true);
++        let mut completed = self.shutdown.completed.clone();
++        completed
++            .wait_for(Option::is_some)
++            .await
++            .map(|result| result.unwrap_or(Err(LogDbShutdownError::WorkerStopped)))
++            .unwrap_or(Err(LogDbShutdownError::WorkerStopped))
+     }
+ 
+     fn try_send(&self, entry: LogEntry) {
+@@ -405,44 +457,63 @@
+     state_db: std::sync::Arc<StateRuntime>,
+     mut receiver: mpsc::Receiver<LogDbCommand>,
+     config: LogSinkQueueConfig,
+-) {
++    mut stop: watch::Receiver<bool>,
++) -> Result<(), LogDbShutdownError> {
++    let mut failed = false;
++    let mut closing = false;
+     let mut buffer = Vec::with_capacity(config.batch_size);
+     let mut ticker = tokio::time::interval(config.flush_interval);
+     // Consume the immediate startup tick so entries flush after the interval.
+     ticker.tick().await;
+     loop {
+         tokio::select! {
++            _ = stop.changed(), if !closing => {
++                receiver.close();
++                closing = true;
++            }
+             maybe_command = receiver.recv() => {
+                 match maybe_command {
+                     Some(LogDbCommand::Entry(entry)) => {
+                         buffer.push(*entry);
+                         if buffer.len() >= config.batch_size {
+-                            flush(&state_db, &mut buffer).await;
++                            failed |= flush(&state_db, &mut buffer).await.is_err();
+                         }
+                     }
+                     Some(LogDbCommand::Flush(reply)) => {
+-                        flush(&state_db, &mut buffer).await;
++                        failed |= flush(&state_db, &mut buffer).await.is_err();
+                         let _ = reply.send(());
+                     }
+                     None => {
+-                        flush(&state_db, &mut buffer).await;
++                        failed |= flush(&state_db, &mut buffer).await.is_err();
+                         break;
+                     }
+                 }
+             }
+             _ = ticker.tick() => {
+-                flush(&state_db, &mut buffer).await;
+-            }
+-        }
+-    }
+-}
+-
+-async fn flush(state_db: &StateRuntime, buffer: &mut Vec<LogEntry>) {
++                failed |= flush(&state_db, &mut buffer).await.is_err();
++            }
++        }
++    }
++    if failed {
++        Err(LogDbShutdownError::InsertFailed)
++    } else {
++        Ok(())
++    }
++}
++
++async fn flush(
++    state_db: &StateRuntime,
++    buffer: &mut Vec<LogEntry>,
++) -> Result<(), LogDbShutdownError> {
+     if buffer.is_empty() {
+-        return;
++        return Ok(());
+     }
+     let entries = buffer.split_off(0);
+-    let _ = state_db.insert_logs(entries.as_slice()).await;
++    state_db
++        .insert_logs(entries.as_slice())
++        .await
++        .map(|_| ())
++        .map_err(|_| LogDbShutdownError::InsertFailed)
+ }
+ 
+ #[derive(Default)]
+@@ -766,6 +837,10 @@
+         let layer = LogDbLayer {
+             sender,
+             process_uuid: "process-1".to_string(),
++            shutdown: Arc::new(LogDbShutdown {
++                requested: watch::channel(false).0,
++                completed: watch::channel(None).1,
++            }),
+         };
+ 
+         layer.try_send(test_entry("first-queued-log"));
+@@ -786,6 +861,10 @@
+         let layer = LogDbLayer {
+             sender,
+             process_uuid: "process-1".to_string(),
++            shutdown: Arc::new(LogDbShutdown {
++                requested: watch::channel(false).0,
++                completed: watch::channel(None).1,
++            }),
+         };
+ 
+         layer.try_send(test_entry("queued-before-flush"));
+@@ -819,4 +898,153 @@
+             .expect("flush task completes")
+             .expect("flush task succeeds");
+     }
+-}
++
++    #[tokio::test]
++    async fn feat164_shutdown_drains_with_live_clones_and_rejects_late_logs() {
++        let home = temp_codex_home();
++        let runtime = StateRuntime::init(home.clone(), "test-provider".to_string())
++            .await
++            .unwrap();
++        let layer = LogDbLayer::start_with_config(
++            runtime.clone(),
++            LogSinkQueueConfig {
++                queue_capacity: 32,
++                batch_size: 32,
++                flush_interval: Duration::from_secs(60),
++            },
++        );
++        let retained = layer.clone();
++        layer.try_send(test_entry("accepted-before-close"));
++        let (first, second) = tokio::join!(layer.shutdown(), retained.shutdown());
++        assert_eq!(first, Ok(()));
++        assert_eq!(second, Ok(()));
++        assert!(retained.sender.is_closed());
++        retained.try_send(test_entry("after-close"));
++        retained.flush().await;
++        let rows = runtime
++            .query_logs(&crate::LogQuery::default())
++            .await
++            .unwrap();
++        assert_eq!(rows.len(), 1);
++        assert_eq!(rows[0].message.as_deref(), Some("accepted-before-close"));
++        runtime.close().await;
++        assert_eq!(retained.shutdown().await, Ok(()));
++    }
++
++    #[tokio::test]
++    async fn feat164_shutdown_settles_queued_flush_before_join() {
++        let home = temp_codex_home();
++        let runtime = StateRuntime::init(home, "test-provider".to_string())
++            .await
++            .unwrap();
++        let layer = LogDbLayer::start(runtime.clone());
++        layer.try_send(test_entry("accepted-entry"));
++        let (tx, rx) = oneshot::channel();
++        layer.sender.send(LogDbCommand::Flush(tx)).await.unwrap();
++        assert_eq!(layer.shutdown().await, Ok(()));
++        rx.await.unwrap();
++        assert_eq!(
++            runtime
++                .query_logs(&crate::LogQuery::default())
++                .await
++                .unwrap()
++                .len(),
++            1
++        );
++        runtime.close().await;
++    }
++
++    #[tokio::test]
++    async fn feat164_shutdown_then_four_pool_close_preserves_new_database_content() {
++        use sqlx::Connection;
++        let home = temp_codex_home();
++        let runtime = StateRuntime::init(home.clone(), "test-provider".to_string())
++            .await
++            .unwrap();
++        let layer = LogDbLayer::start(runtime.clone());
++        layer.try_send(test_entry("durable-close-check"));
++        layer.shutdown().await.unwrap();
++        runtime.close().await;
++        for name in [
++            crate::STATE_DB_FILENAME,
++            crate::LOGS_DB_FILENAME,
++            crate::GOALS_DB_FILENAME,
++            crate::MEMORIES_DB_FILENAME,
++        ] {
++            let path = home.join(name);
++            // This private test has no external reader or persistent-WAL option.
++            // Inspect before reopening; never remove/checkpoint a leftover WAL.
++            let wal = home.join(format!("{name}-wal"));
++            assert!(
++                !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
++                "uncheckpointed owned test database"
++            );
++            let options = sqlx::sqlite::SqliteConnectOptions::new()
++                .filename(&path)
++                .read_only(true);
++            let mut connection = sqlx::SqliteConnection::connect_with(&options)
++                .await
++                .unwrap();
++            let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
++                .fetch_one(&mut connection)
++                .await
++                .unwrap();
++            assert_eq!(integrity, "ok");
++            if name == crate::LOGS_DB_FILENAME {
++                let count: i64 = sqlx::query_scalar("SELECT count(*) FROM logs")
++                    .fetch_one(&mut connection)
++                    .await
++                    .unwrap();
++                assert_eq!(count, 1);
++            }
++            connection.close().await.unwrap();
++        }
++    }
++
++    fn feat164_layer_with_worker(
++        worker: tokio::task::JoinHandle<Result<(), LogDbShutdownError>>,
++    ) -> LogDbLayer {
++        LogDbLayer {
++            sender: mpsc::channel(1).0,
++            process_uuid: "typed-lifecycle-test".to_string(),
++            shutdown: Arc::new(LogDbShutdown::joining(watch::channel(false).0, worker)),
++        }
++    }
++
++    #[tokio::test]
++    async fn feat164_cancelled_waiter_retains_owned_cleanup() {
++        let (finish, pending) = oneshot::channel();
++        let layer = feat164_layer_with_worker(tokio::spawn(async move {
++            pending.await.unwrap();
++            Ok(())
++        }));
++        {
++            let mut waiter = Box::pin(layer.shutdown());
++            tokio::select! {
++                biased;
++                _ = &mut waiter => panic!("cleanup must still be pending"),
++                _ = tokio::task::yield_now() => {},
++            }
++        }
++        finish.send(()).unwrap();
++        assert_eq!(layer.shutdown().await, Ok(()));
++        assert_eq!(layer.shutdown().await, Ok(()));
++    }
++
++    #[tokio::test]
++    async fn feat164_shutdown_retains_typed_writer_failure_for_clones() {
++        // Pure result propagation, without corrupting a database or injecting I/O failures.
++        let layer = feat164_layer_with_worker(tokio::spawn(async {
++            Err(LogDbShutdownError::InsertFailed)
++        }));
++        let clone = layer.clone();
++        assert_eq!(
++            layer.shutdown().await,
++            Err(LogDbShutdownError::InsertFailed)
++        );
++        assert_eq!(
++            clone.shutdown().await,
++            Err(LogDbShutdownError::InsertFailed)
++        );
++    }
++}
+diff --git a/app-server/src/thread_state.rs b/app-server/src/thread_state.rs
+--- a/app-server/src/thread_state.rs
++++ b/app-server/src/thread_state.rs
+@@ -21,10 +21,14 @@
+ use std::sync::Arc;
+ use std::sync::Mutex as StdMutex;
+ use std::sync::Weak;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
+ use tokio::sync::Mutex;
+ use tokio::sync::mpsc;
+ use tokio::sync::oneshot;
+ use tokio::sync::watch;
++use tokio_util::task::TaskTracker;
++use tokio_util::task::task_tracker::TaskTrackerToken;
+ use tracing::error;
+ 
+ type PendingInterruptQueue = Vec<ConnectionRequestId>;
+@@ -289,6 +293,7 @@
+ 
+ #[derive(Clone, Default)]
+ pub(crate) struct ThreadStateManager {
++    listener_tasks: Arc<ListenerTasks>,
+     state: Arc<Mutex<ThreadStateManagerInner>>,
+     // Extension event sinks are synchronous, so they need an await-free way to
+     // enqueue work on the active per-thread listener.
+@@ -296,9 +301,64 @@
+         Arc<StdMutex<HashMap<ThreadId, mpsc::UnboundedSender<ThreadListenerCommand>>>>,
+ }
+ 
++#[derive(Default)]
++struct ListenerTasks {
++    closed: StdMutex<bool>,
++    registering: TaskTracker,
++    running: TaskTracker,
++    failed: Arc<AtomicBool>,
++}
++
+ impl ThreadStateManager {
+     pub(crate) fn new() -> Self {
+         Self::default()
++    }
++
++    /// Registration and closure share one admission lock; no lock spans an await.
++    pub(crate) fn begin_listener_registration(&self) -> Option<TaskTrackerToken> {
++        let closed = self
++            .listener_tasks
++            .closed
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if *closed {
++            None
++        } else {
++            Some(self.listener_tasks.registering.token())
++        }
++    }
++
++    /// Called while holding a registration token, before its drop. Tracking the
++    /// join owner makes panic/termination visible before reporting completion.
++    pub(crate) fn spawn_listener(
++        &self,
++        work: impl std::future::Future<Output = ()> + Send + 'static,
++    ) {
++        let worker = tokio::spawn(work);
++        let failed = Arc::clone(&self.listener_tasks.failed);
++        self.listener_tasks.running.spawn(async move {
++            if worker.await.is_err() {
++                failed.store(true, Ordering::Release);
++            }
++        });
++    }
++
++    pub(crate) async fn shutdown_listeners(&self) -> bool {
++        {
++            let mut closed = self
++                .listener_tasks
++                .closed
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            *closed = true;
++            self.listener_tasks.registering.close();
++        }
++        // A registration already admitted may still install its cancel sender.
++        self.listener_tasks.registering.wait().await;
++        self.clear_all_listeners().await;
++        self.listener_tasks.running.close();
++        self.listener_tasks.running.wait().await;
++        !self.listener_tasks.failed.load(Ordering::Acquire)
+     }
+ 
+     pub(crate) async fn connection_initialized(
+@@ -576,3 +636,70 @@
+             .map(|thread_entry| thread_entry.has_connections_watcher.subscribe())
+     }
+ }
++
++#[cfg(test)]
++mod feat164_listener_shutdown_tests {
++    use super::*;
++
++    async fn install_finite_listener(manager: &ThreadStateManager) -> oneshot::Receiver<()> {
++        let state = manager.thread_state(ThreadId::new()).await;
++        let (cancel, cancelled) = oneshot::channel();
++        state.lock().await.cancel_tx = Some(cancel);
++        let (finished, completion) = oneshot::channel();
++        manager.spawn_listener(async move {
++            let _ = cancelled.await;
++            let _ = finished.send(());
++        });
++        completion
++    }
++
++    #[tokio::test]
++    async fn feat164_listener_normal_cancel_is_joined_and_idempotent() {
++        let manager = ThreadStateManager::new();
++        let registration = manager.begin_listener_registration().unwrap();
++        let completion = install_finite_listener(&manager).await;
++        drop(registration);
++        let clone = manager.clone();
++        let (a, b) = tokio::join!(manager.shutdown_listeners(), clone.shutdown_listeners());
++        assert!(a && b);
++        completion.await.unwrap();
++        assert!(clone.begin_listener_registration().is_none());
++        assert!(manager.shutdown_listeners().await);
++    }
++
++    #[tokio::test]
++    async fn feat164_listener_registration_finishes_before_cancel_snapshot() {
++        let manager = ThreadStateManager::new();
++        let registration = manager.begin_listener_registration().unwrap();
++        let shutting_down = tokio::spawn({
++            let owner = manager.clone();
++            async move { owner.shutdown_listeners().await }
++        });
++        loop {
++            let closed = *manager.listener_tasks.closed.lock().unwrap();
++            if closed {
++                break;
++            }
++            tokio::task::yield_now().await;
++        }
++        assert!(!shutting_down.is_finished());
++        assert!(manager.begin_listener_registration().is_none());
++        let completion = install_finite_listener(&manager).await;
++        drop(registration);
++        assert!(shutting_down.await.unwrap());
++        completion.await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn feat164_listener_natural_completion_and_owner_isolation() {
++        let manager = ThreadStateManager::new();
++        let other = ThreadStateManager::new();
++        let registration = manager.begin_listener_registration().unwrap();
++        manager.spawn_listener(async {});
++        drop(registration);
++        assert!(manager.shutdown_listeners().await);
++        let other_registration = other.begin_listener_registration().unwrap();
++        drop(other_registration);
++        assert!(other.shutdown_listeners().await);
++    }
++}
+diff --git a/app-server/src/request_processors/thread_lifecycle.rs b/app-server/src/request_processors/thread_lifecycle.rs
+--- a/app-server/src/request_processors/thread_lifecycle.rs
++++ b/app-server/src/request_processors/thread_lifecycle.rs
+@@ -216,6 +216,12 @@
+     conversation: Arc<CodexThread>,
+     thread_state: Arc<Mutex<ThreadState>>,
+ ) -> Result<(), JSONRPCErrorError> {
++    let Some(registration) = listener_task_context
++        .thread_state_manager
++        .begin_listener_registration()
++    else {
++        return Err(internal_error("thread listener owner is shutting down"));
++    };
+     let (cancel_tx, mut cancel_rx) = oneshot::channel();
+     let Some(mut unloading_state) = UnloadingState::new(
+         &listener_task_context,
+@@ -274,7 +280,8 @@
+         ..
+     } = listener_task_context;
+     let outgoing_for_task = Arc::clone(&outgoing);
+-    tokio::spawn(async move {
++    let listener_owner = thread_state_manager.clone();
++    listener_owner.spawn_listener(async move {
+         loop {
+             tokio::select! {
+                 biased;
+@@ -383,6 +390,7 @@
+             thread_state.clear_listener();
+         }
+     });
++    drop(registration);
+     Ok(())
+ }
+ 

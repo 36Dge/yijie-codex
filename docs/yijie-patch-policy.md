@@ -65,3 +65,7 @@ Increment contract-impact=semantic pending directional conformance; complete FEA
 ### r4 review correction
 
 Review of r3 found that turn-level post-filter byte totals still reused the raw error length while batch totals counted the sanitized ErrorEvent. Preserve the r3 source/0009 and artifact, and add the minimal `0010-feat-164-sanitized-persistence-metrics.patch`: keep pre-filter lengths, carry persisted lengths separately, and use them for turn post-filter totals. This does not add a new public event, telemetry field or permission. An ordinary failure-fact regression compares actual serialized persisted bytes with both batch and turn totals. Independent r4 canonical build/check/manifest use the exact ten-patch chain and a new non-overwritable output directory. r3 is not promoted or consumed downstream.
+
+## FEAT-164 r5 normal state shutdown candidate (2026-10-26)
+
+Owner approved the minimal six-existing-file shutdown repair after report41 necessity review. Independent 0011 follows r4, retains the pinned upstream and all previous artifacts, and provides owned stdio RPC/thread/listener/log drain then the existing four-pool close. No manual checkpoint, WAL deletion, schema, model, permission or core execution change. See [scope, source validation and rollback](feat164-graceful-state-close.md). Build/schema/consumer qualification remains separately required; not activation or release.

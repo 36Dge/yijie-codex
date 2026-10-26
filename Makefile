@@ -54,3 +54,9 @@ kimi-k31-pro-r4-build:
 	bash scripts/build-kimi-k31-pro-r4.sh
 kimi-k31-pro-r4-check:
 	bash scripts/check-kimi-k31-pro-r4.sh
+
+.PHONY: kimi-k31-pro-r5-build kimi-k31-pro-r5-check
+kimi-k31-pro-r5-build:
+	bash scripts/build-kimi-k31-pro-r5.sh
+kimi-k31-pro-r5-check:
+	bash scripts/check-kimi-k31-pro-r5.sh

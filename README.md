@@ -77,3 +77,7 @@ YIJIE_RUNTIME_TARGET=aarch64-apple-darwin make runtime-baseline
 ## FEAT-164 native terminal repair candidate
 
 Owner-approved r4 continues the retained r2 model candidate with native failure-state and sanitized durable-history repair plus consistent persistence byte accounting. It is an independent local artifact, not the default or a release. See [repair and compatibility boundaries](docs/feat164-native-failure-terminals.md), `make kimi-k31-pro-r4-check` and `make kimi-k31-pro-r4-build`. Keep earlier artifacts and history; rollback uses the matching compatible reader with execution paused, never an older writer against new records.
+
+## FEAT-164 r5 normal state shutdown candidate (2026-10-26)
+
+Owner approved the minimal six-existing-file shutdown repair after report41 necessity review. Independent 0011 follows r4, retains the pinned upstream and all previous artifacts, and provides owned stdio RPC/thread/listener/log drain then the existing four-pool close. No manual checkpoint, WAL deletion, schema, model, permission or core execution change. See [scope, source validation and rollback](docs/feat164-graceful-state-close.md). Build/schema/consumer qualification remains separately required; not activation or release.
