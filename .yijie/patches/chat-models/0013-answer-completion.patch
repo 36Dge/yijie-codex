@@ -1,0 +1,441 @@
+diff --git a/core/src/session/mod.rs b/core/src/session/mod.rs
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -1,3 +1,5 @@
++pub(crate) mod answer_completion;
++
+ use std::borrow::Cow;
+ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+@@ -2858,6 +2860,7 @@
+         items: &[ResponseItem],
+     ) {
+         crate::tools::web_retrieval_guard::observe(turn_context, items);
++        answer_completion::observe(turn_context, items);
+         let items = self.prepare_conversation_items_for_history(turn_context, items);
+         let items = items.as_ref();
+         {
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -369,6 +369,38 @@
+                     continue;
+                 }
+ 
++                match super::answer_completion::decide(
++                    &turn_context,
++                    sampling_request_last_agent_message.as_deref(),
++                    needs_follow_up,
++                ) {
++                    super::answer_completion::Decision::Continue => {
++                        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent {
++                            message: "YIJIE_ANSWER_CONTINUATION：当前只有过程说明，正在根据已有结果补全回答。".into(),
++                        })).await;
++                        sess.record_conversation_items(
++                            &turn_context,
++                            &[super::answer_completion::feedback()],
++                        )
++                        .await;
++                        continue;
++                    }
++                    super::answer_completion::Decision::Failed => {
++                        let error = CodexErrorInfo::Other;
++                        sess.emit_turn_error_lifecycle(&turn_context, error.clone())
++                            .await;
++                        sess.send_event(
++                            &turn_context,
++                            EventMsg::Error(ErrorEvent {
++                                message: super::answer_completion::FAILED.into(),
++                                codex_error_info: Some(error),
++                            }),
++                        )
++                        .await;
++                        return Ok(None);
++                    }
++                    super::answer_completion::Decision::Accept => {}
++                }
+                 if !needs_follow_up {
+                     last_agent_message = sampling_request_last_agent_message;
+                     let stop_outcome = run_turn_stop_hooks(
+@@ -1089,7 +1121,11 @@
+ ) -> Prompt {
+     Prompt {
+         input,
+-        tools: router.model_visible_specs(),
++        tools: if super::answer_completion::finalizing(turn_context) {
++            Vec::new()
++        } else {
++            router.model_visible_specs()
++        },
+         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+         base_instructions,
+         output_schema: turn_context.final_output_json_schema.clone(),
+diff --git a/core/src/tools/registry.rs b/core/src/tools/registry.rs
+--- a/core/src/tools/registry.rs
++++ b/core/src/tools/registry.rs
+@@ -540,7 +540,9 @@
+ 
+         // Reuse the native pre-execution refusal path. No handler, approval
+         // escalation, process or connector request starts after a refusal.
+-        if let Err(err) = crate::tools::web_retrieval_guard::before(&invocation) {
++        if let Err(err) = crate::session::answer_completion::before_tool(&invocation.turn)
++            .and_then(|()| crate::tools::web_retrieval_guard::before(&invocation))
++        {
+             dispatch_trace.record_failed(&err);
+             if let FunctionCallError::RespondToModel(message) = &err {
+                 invocation
+diff --git a/core/src/session/answer_completion.rs b/core/src/session/answer_completion.rs
+new file mode 100644
+--- /dev/null
++++ b/core/src/session/answer_completion.rs
+@@ -0,0 +1,350 @@
++//! Bounded answer finalization inside the existing turn, not task resubmission.
++//! Only the Host-owned ordinary-chat instruction opts in. Structured outputs
++//! and other Runtime consumers retain their original completion semantics.
++use std::sync::{Arc, Mutex, PoisonError};
++
++use codex_protocol::models::MessagePhase;
++use codex_protocol::models::{ContentItem, ResponseItem};
++
++use super::turn_context::TurnContext;
++use crate::function_tool::FunctionCallError;
++
++pub(crate) const MARKER: &str = "[yijie-answer-completion-v1]";
++pub(crate) const FAILED: &str = "YIJIE_ANSWER_INCOMPLETE：模型仍只返回过程说明，未生成可交付的回答。本轮已停止，已取得的内容保留。";
++const FEEDBACK: &str = "The previous response ended without a deliverable answer. Continue this SAME user turn using the results already obtained. Do not repeat completed actions or call tools: this is a bounded, answer-only finalization. Give the requested answer now, or clearly explain what could not be completed and provide the supported partial result. Do not end with a promise, progress update, or statement that you will continue. Respect an explicit user request for only a plan, quotation, or no reply. Use final_answer phase when supported.";
++const MAX_RECOVERIES: usize = 2;
++
++#[derive(Default)]
++struct State {
++    request: String,
++    phase: Option<MessagePhase>,
++    attempts: usize,
++    finalizing: bool,
++    delivered_media: bool,
++}
++
++#[derive(Debug, PartialEq)]
++pub(crate) enum Decision {
++    Accept,
++    Continue,
++    Failed,
++}
++
++fn enabled(turn: &TurnContext) -> bool {
++    turn.final_output_json_schema.is_none()
++        && turn
++            .developer_instructions
++            .as_deref()
++            .is_some_and(|s| s.contains(MARKER))
++}
++
++fn state(turn: &TurnContext) -> Arc<Mutex<State>> {
++    turn.extension_data
++        .get_or_init(|| Mutex::new(State::default()))
++}
++
++pub(crate) fn observe(turn: &TurnContext, items: &[ResponseItem]) {
++    if !enabled(turn) {
++        return;
++    }
++    let shared = state(turn);
++    let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
++    for item in items {
++        match item {
++            ResponseItem::Message { role, content, .. } if role == "user" => {
++                let request = content
++                    .iter()
++                    .filter_map(|part| match part {
++                        ContentItem::InputText { text } => Some(text.as_str()),
++                        _ => None,
++                    })
++                    .collect::<Vec<_>>()
++                    .join("\n");
++                // Steered input starts a new decision context, not a replay.
++                *state = State {
++                    request,
++                    ..State::default()
++                };
++            }
++            ResponseItem::Message { role, phase, .. } if role == "assistant" => {
++                state.phase = phase.clone()
++            }
++            ResponseItem::ImageGenerationCall { status, result, .. }
++                if status == "completed" && !result.is_empty() =>
++            {
++                state.delivered_media = true
++            }
++            _ => {}
++        }
++    }
++}
++
++pub(crate) fn finalizing(turn: &TurnContext) -> bool {
++    enabled(turn)
++        && state(turn)
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .finalizing
++}
++
++pub(crate) fn before_tool(turn: &TurnContext) -> Result<(), FunctionCallError> {
++    if finalizing(turn) {
++        Err(FunctionCallError::RespondToModel("YIJIE_ANSWER_FINALIZING：当前只补全回答，不重复执行操作。请根据现有结果直接回答，证据不足时说明限制。".into()))
++    } else {
++        Ok(())
++    }
++}
++
++pub(crate) fn decide(turn: &TurnContext, answer: Option<&str>, needs_follow_up: bool) -> Decision {
++    if !enabled(turn) {
++        return Decision::Accept;
++    }
++    let shared = state(turn);
++    let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
++    if needs_follow_up && !state.finalizing {
++        return Decision::Accept;
++    }
++    state.decide(answer, needs_follow_up)
++}
++
++impl State {
++    fn decide(&mut self, answer: Option<&str>, needs_follow_up: bool) -> Decision {
++        let text = answer.unwrap_or_default().trim();
++        let requested_form = requested_process_only(&self.request)
++            || (!text.is_empty()
++                && self.request.contains(text)
++                && ["只回复", "原样", "照抄", "repeat exactly", "echo exactly"]
++                    .iter()
++                    .any(|part| self.request.to_lowercase().contains(part)));
++        let deliverable = (!text.is_empty()
++            && self.phase != Some(MessagePhase::Commentary)
++            && !process_only(text))
++            || (text.is_empty() && self.delivered_media);
++        if !needs_follow_up && (requested_form || deliverable) {
++            return Decision::Accept;
++        }
++        if self.attempts >= MAX_RECOVERIES {
++            return Decision::Failed;
++        }
++        self.attempts += 1;
++        self.finalizing = true;
++        Decision::Continue
++    }
++}
++
++fn requested_process_only(request: &str) -> bool {
++    let request = request.to_lowercase();
++    [
++        "只给计划",
++        "只需计划",
++        "只说计划",
++        "只要计划",
++        "先给计划",
++        "仅给计划",
++        "只说明思路",
++        "你的计划是什么",
++        "你打算怎么做",
++        "你的思路是什么",
++        "只说思路",
++        "不要回复",
++        "无需回复",
++        "不用回复",
++        "only a plan",
++        "plan only",
++        "no reply",
++        "do not reply",
++        "outline your approach",
++    ]
++    .iter()
++    .any(|part| request.contains(part))
++}
++
++// Conservative fallback for providers which omit phase. Every sentence must
++// be an intention/progress statement; facts, answers, code and lists pass.
++fn process_only(text: &str) -> bool {
++    if text.chars().count() > 360
++        || text.contains(['`', '#', '?', '？', ':', '：'])
++        || text.contains("http")
++        || text
++            .lines()
++            .any(|s| s.trim_start().starts_with(['-', '*', '|']))
++    {
++        return false;
++    }
++    let sentences: Vec<_> = text
++        .split(['。', '.', '！', '!', '\n'])
++        .map(str::trim)
++        .filter(|s| !s.is_empty())
++        .collect();
++    !sentences.is_empty()
++        && sentences.iter().all(|s| {
++            let s = s.to_lowercase();
++            let prefix = [
++                "我会",
++                "我将",
++                "我先",
++                "我正在",
++                "接下来我",
++                "让我",
++                "正在",
++                "先为你",
++                "先帮你",
++                "稍等",
++                "请稍等",
++                "i will ",
++                "i'll ",
++                "i’ll ",
++                "let me ",
++                "i am checking",
++                "i'm checking",
++                "i’m checking",
++            ]
++            .iter()
++            .any(|p| s.starts_with(p));
++            prefix
++                && [
++                    "查",
++                    "搜",
++                    "核",
++                    "整理",
++                    "分析",
++                    "处理",
++                    "检查",
++                    "阅读",
++                    "确认",
++                    "验证",
++                    "比较",
++                    "对比",
++                    "继续",
++                    "稍等",
++                    "check",
++                    "search",
++                    "look",
++                    "verify",
++                    "review",
++                    "analy",
++                    "inspect",
++                    "read",
++                    "gather",
++                    "investigate",
++                    "continue",
++                ]
++                .iter()
++                .any(|verb| s.contains(verb))
++        })
++}
++
++pub(crate) fn feedback() -> ResponseItem {
++    ResponseItem::Message {
++        id: None,
++        role: "developer".into(),
++        content: vec![ContentItem::InputText {
++            text: FEEDBACK.into(),
++        }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn answer_completion_recovers_unphased_promise_then_accepts_answer() {
++        let mut state = State {
++            request: "全面介绍一下这座寺院".into(),
++            ..State::default()
++        };
++        assert_eq!(
++            state.decide(
++                Some("我会把历史、建筑和游览信息分开核实，尤其注意近年门票与预约政策是否有变化。"),
++                false
++            ),
++            Decision::Continue
++        );
++        assert!(state.finalizing);
++        assert_eq!(
++            state.decide(Some("这座寺院位于杭州。以下是历史与游览介绍。"), false),
++            Decision::Accept
++        );
++    }
++    #[test]
++    fn answer_completion_is_bounded_even_if_model_keeps_requesting_tools() {
++        let mut state = State::default();
++        assert_eq!(state.decide(None, false), Decision::Continue);
++        assert_eq!(state.decide(None, true), Decision::Continue);
++        assert_eq!(state.decide(None, true), Decision::Failed);
++    }
++    #[test]
++    fn answer_completion_preserves_short_answers_plans_quotes_limits_and_media() {
++        for answer in [
++            "42",
++            "可以。",
++            "我会选择杭州。",
++            "我会先核实。杭州位于浙江。",
++            "当前无法联网，无法核验票价。",
++            "**答案**：杭州",
++            "```py\nprint(42)\n```",
++        ] {
++            assert_eq!(
++                State::default().decide(Some(answer), false),
++                Decision::Accept,
++                "{answer}"
++            );
++        }
++        for request in [
++            "先给计划，不要执行",
++            "请只回复：我会先查询。",
++            "Only a plan, do not execute",
++        ] {
++            assert_eq!(
++                State {
++                    request: request.into(),
++                    ..State::default()
++                }
++                .decide(Some("我会先查询。"), false),
++                Decision::Accept
++            );
++        }
++        assert_eq!(
++            State {
++                delivered_media: true,
++                ..State::default()
++            }
++            .decide(None, false),
++            Decision::Accept
++        );
++    }
++    #[test]
++    fn answer_completion_no_execution_constraint_still_requires_an_answer() {
++        let mut state = State {
++            request: "分析这段代码，但不要执行".into(),
++            ..State::default()
++        };
++        assert_eq!(
++            state.decide(Some("我会先分析这段代码。"), false),
++            Decision::Continue
++        );
++        assert_eq!(
++            state.decide(Some("代码计算 6 乘 7，输出为 42。"), false),
++            Decision::Accept
++        );
++    }
++
++    #[test]
++    fn answer_completion_honors_explicit_commentary_and_normal_final() {
++        let mut state = State {
++            phase: Some(MessagePhase::Commentary),
++            ..State::default()
++        };
++        assert_eq!(
++            state.decide(Some("Working on the requested comparison."), false),
++            Decision::Continue
++        );
++        state.phase = Some(MessagePhase::FinalAnswer);
++        assert_eq!(
++            state.decide(Some("The requested result is 42."), false),
++            Decision::Accept
++        );
++    }
++}
