@@ -1,5 +1,11 @@
 # Upstream
 
+2026-11-01 execution guard candidate retains the fixed upstream and complete r5
+patch chain, then appends `0012-web-retrieval-execution-guard.patch`. It reuses the
+tool dispatcher and per-turn ExtensionData for pre-execution checks. The canonical
+build is `scripts/build-web-retrieval-guard.sh`; original r5 artifacts are retained.
+See `docs/web-retrieval-execution-guard.md` for scope and validation limits.
+
 FEAT-164 r2 (2026-10-25) keeps the fixed upstream and original candidate patches intact. Its separate canonical build appends `chat-models/0008-feat-164-kimi-responses-include.patch` after 0007 to align K3.1 Pro's request include values with the official Responses enum. This is a semantic provider adaptation, not an app-server schema change. See `docs/kimi-k31-pro-candidate.md`; real G2V remains unqualified pending actual evidence.
 
 ## 固定版本

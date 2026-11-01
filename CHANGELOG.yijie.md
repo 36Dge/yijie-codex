@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add the user-requested execution guard candidate: refuse local webpage fetching
+  after retrieval and unchanged failed operations before tool execution, return
+  Chinese reasons through existing warning/tool-result channels, retain local
+  development operations and allow retries after relevant input changes. No new
+  public RPC/schema or enabled external hooks; see `docs/web-retrieval-execution-guard.md`.
+
 - FEAT-164 r2 adds a separate replayable 0008 patch to omit the OpenAI encrypted-content include only for Kimi K3.1 Pro, matching the official Responses include enum while preserving max reasoning, search sources, other models and response replay. The r1 artifacts remain intact; downstream repins and real qualification are required. See `docs/kimi-k31-pro-candidate.md`.
 
 - Harden the Owner-authorized FEAT-137 `0004-feat-137-deterministic-approval-producer.patch` after live RCA. Under the exact D4 gate, raw tool Added/argument delta/Done payloads are suppressed or fixed before client `items_added`, `LastResponse`, rollout trace, session telemetry/history/hooks/OTEL/dispatch; a Provider terminal without the exact admitted call and a turn without the completed handler lifecycle fail with stable errors. Duplicate/hidden/invalid calls drop queued, unpolled tool work before approval/execute, and admitted state keeps same-turn steer/follow-up tools closed. Hook/plugin startup and ambient configured/plugin/extension/Apps MCP contributions are disabled before contributors run, producing zero configured/runtime/effective MCP servers and connectors. Shell snapshot capture is disabled and the no-snapshot non-login wrapper plus direct/exec-server policies remove only reviewed private credential/gate/startup-file names. Gate-off behavior, permissions, approval decisions, public v6, and stable app-server wire shape remain unchanged (`contract-impact = semantic`).

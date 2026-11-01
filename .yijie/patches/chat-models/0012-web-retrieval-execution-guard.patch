@@ -1,0 +1,1278 @@
+diff --git a/core/src/session/mod.rs b/core/src/session/mod.rs
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -2857,6 +2857,7 @@
+         turn_context: &TurnContext,
+         items: &[ResponseItem],
+     ) {
++        crate::tools::web_retrieval_guard::observe(turn_context, items);
+         let items = self.prepare_conversation_items_for_history(turn_context, items);
+         let items = items.as_ref();
+         {
+diff --git a/core/src/tools/context.rs b/core/src/tools/context.rs
+--- a/core/src/tools/context.rs
++++ b/core/src/tools/context.rs
+@@ -323,6 +323,16 @@
+ }
+ 
+ impl ToolOutput for ExecCommandToolOutput {
++    fn execution_guard_result(&self, _payload: &ToolPayload) -> JsonValue {
++        // Observe the real captured output, independently of max_output_tokens.
++        // This value remains inside the current turn and is never persisted.
++        serde_json::json!({
++            "exit_code": self.exit_code,
++            "session_id": self.process_id,
++            "output": String::from_utf8_lossy(&self.raw_output),
++        })
++    }
++
+     fn log_preview(&self) -> String {
+         telemetry_preview(&self.response_text())
+     }
+diff --git a/core/src/tools/mod.rs b/core/src/tools/mod.rs
+--- a/core/src/tools/mod.rs
++++ b/core/src/tools/mod.rs
+@@ -14,6 +14,7 @@
+ pub(crate) mod sandboxing;
+ pub(crate) mod spec_plan;
+ pub(crate) mod tool_dispatch_trace;
++pub(crate) mod web_retrieval_guard;
+ 
+ use std::borrow::Cow;
+ 
+diff --git a/core/src/tools/registry.rs b/core/src/tools/registry.rs
+--- a/core/src/tools/registry.rs
++++ b/core/src/tools/registry.rs
+@@ -538,6 +538,30 @@
+             }
+         }
+ 
++        // Reuse the native pre-execution refusal path. No handler, approval
++        // escalation, process or connector request starts after a refusal.
++        if let Err(err) = crate::tools::web_retrieval_guard::before(&invocation) {
++            dispatch_trace.record_failed(&err);
++            if let FunctionCallError::RespondToModel(message) = &err {
++                invocation
++                    .session
++                    .send_event(
++                        &invocation.turn,
++                        EventMsg::Warning(codex_protocol::protocol::WarningEvent {
++                            message: message.clone(),
++                        }),
++                    )
++                    .await;
++            }
++            notify_tool_finish_if_unclaimed(
++                &invocation,
++                terminal_outcome_reached.as_deref(),
++                ToolCallOutcome::Blocked,
++            )
++            .await;
++            return Err(err);
++        }
++
+         let response_cell = tokio::sync::Mutex::new(None);
+         let invocation_for_tool = invocation.clone();
+         let log_payload = invocation.payload.log_payload();
+@@ -553,7 +577,13 @@
+                     let tool = tool.clone();
+                     let response_cell = &response_cell;
+                     async move {
+-                        match handle_any_tool(tool.as_ref(), invocation_for_tool).await {
++                        let observed = invocation_for_tool.clone();
++                        let result = handle_any_tool(tool.as_ref(), invocation_for_tool).await;
++                        crate::tools::web_retrieval_guard::after(
++                            &observed,
++                            result.as_ref().map(|result| result.result.as_ref()),
++                        );
++                        match result {
+                             Ok(result) => {
+                                 let preview = result.result.log_preview();
+                                 let success = result.result.success_for_logging();
+diff --git a/tools/src/tool_output.rs b/tools/src/tool_output.rs
+--- a/tools/src/tool_output.rs
++++ b/tools/src/tool_output.rs
+@@ -50,6 +50,12 @@
+     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
+         response_input_to_code_mode_result(self.to_response_item("", payload))
+     }
++
++    /// Private execution-policy observation. Display truncation must not hide
++    /// command exit status or a caught network error from the retry guard.
++    fn execution_guard_result(&self, payload: &ToolPayload) -> JsonValue {
++        self.code_mode_result(payload)
++    }
+ }
+ 
+ impl<T> ToolOutput for Box<T>
+@@ -86,6 +92,10 @@
+ 
+     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
+         (**self).code_mode_result(payload)
++    }
++
++    fn execution_guard_result(&self, payload: &ToolPayload) -> JsonValue {
++        (**self).execution_guard_result(payload)
+     }
+ }
+ 
+diff --git a/core/src/tools/web_retrieval_guard.rs b/core/src/tools/web_retrieval_guard.rs
+new file mode 100644
+--- /dev/null
++++ b/core/src/tools/web_retrieval_guard.rs
+@@ -0,0 +1,1155 @@
++//! Execution checks owned by the existing tool dispatcher, not model instructions.
++//! State lives only in the current turn's existing ExtensionData container.
++
++use std::collections::BTreeMap;
++use std::collections::HashMap;
++use std::fs;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::PoisonError;
++
++use codex_protocol::models::ResponseItem;
++use regex_lite::Regex;
++use serde_json::Value;
++use sha1::Digest;
++use sha1::Sha1;
++
++use crate::function_tool::FunctionCallError;
++use crate::session::turn_context::TurnContext;
++use crate::tools::context::ToolInvocation;
++use crate::tools::context::ToolOutput;
++use crate::tools::context::ToolPayload;
++use crate::tools::flat_tool_name;
++
++const MAX_RECORDS: usize = 128;
++const MAX_SCRIPT_BYTES: u64 = 256 * 1024;
++const WEB_BLOCK: &str = "YIJIE_WEB_RETRIEVAL_ONLY：已拦截。本轮已调用网页检索，不能再用本地命令抓取网页。请使用当前检索工具读取来源；无法读取时说明缺少的证据。本地计算、文件处理及本地开发服务请求仍可使用。";
++
++#[derive(Default)]
++struct State {
++    searched: bool,
++    pending: HashMap<String, Operation>,
++    failed: HashMap<String, Failure>,
++    processes: HashMap<i64, (String, String)>,
++}
++
++#[derive(Clone)]
++struct Operation {
++    key: String,
++    cwd: PathBuf,
++    command: Option<String>,
++    web: bool,
++    permission: String,
++}
++
++struct Failure {
++    reason: &'static str,
++    conditions: Conditions,
++    family: Option<String>,
++    cwd: PathBuf,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++struct Conditions {
++    digest: String,
++    complete: bool,
++}
++
++fn state(turn: &TurnContext) -> Arc<Mutex<State>> {
++    turn.extension_data
++        .get_or_init(|| Mutex::new(State::default()))
++}
++
++pub(crate) fn observe(turn: &TurnContext, items: &[ResponseItem]) {
++    if items.iter().any(|item| match item {
++        ResponseItem::WebSearchCall { .. } => true,
++        ResponseItem::FunctionCall { name, .. } => retrieval(name),
++        _ => false,
++    }) {
++        state(turn)
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .searched = true;
++    }
++}
++
++fn retrieval(name: &str) -> bool {
++    ["kimi_web_search", "kimi_web_search_pro", "kimi_web_fetch"]
++        .iter()
++        .any(|suffix| name.ends_with(suffix))
++}
++
++fn hash(bytes: impl AsRef<[u8]>) -> String {
++    format!("{:x}", Sha1::digest(bytes.as_ref()))
++}
++
++fn canonical(value: &Value) -> Value {
++    match value {
++        Value::Object(map) => {
++            let sorted: BTreeMap<_, _> = map.iter().map(|(k, v)| (k, canonical(v))).collect();
++            serde_json::to_value(sorted).unwrap_or(Value::Null)
++        }
++        Value::Array(values) => Value::Array(values.iter().map(canonical).collect()),
++        _ => value.clone(),
++    }
++}
++
++fn command_text(args: &Value) -> Option<String> {
++    let command = args.get("cmd").or_else(|| args.get("command"))?;
++    if let Some(text) = command.as_str() {
++        return Some(text.to_string());
++    }
++    let words = command
++        .as_array()?
++        .iter()
++        .map(Value::as_str)
++        .collect::<Option<Vec<_>>>()?;
++    shlex::try_join(words).ok()
++}
++
++fn normalize_command(command: &str) -> String {
++    let text = command.replace("\r\n", "\n");
++    // Preserve multiline/heredoc indentation and quoted source text exactly.
++    if text.contains('\n') || text.contains("<<") {
++        return text.trim().to_string();
++    }
++    let Some(mut words) = shlex::split(&text) else {
++        return text.trim().to_string();
++    };
++    if words.len() == 3
++        && matches!(base(&words[0]), "sh" | "bash" | "zsh")
++        && matches!(words[1].as_str(), "-c" | "-lc")
++    {
++        return normalize_command(&words[2]);
++    }
++    if let Some(first) = words.first_mut()
++        && matches!(base(first), "python" | "python3")
++    {
++        *first = "python".to_string();
++    }
++    serde_json::to_string(&words).unwrap_or(text)
++}
++
++fn base(word: &str) -> &str {
++    word.rsplit('/').next().unwrap_or(word)
++}
++
++fn operation(invocation: &ToolInvocation) -> Option<Operation> {
++    let ToolPayload::Function { arguments } = &invocation.payload else {
++        return None;
++    };
++    let name = flat_tool_name(&invocation.tool_name);
++    let shell = matches!(
++        invocation.tool_name.name.as_str(),
++        "exec_command" | "shell_command" | "shell" | "local_shell"
++    );
++    if !shell && !name.starts_with("mcp__") && !retrieval(&name) {
++        return None;
++    }
++    let mut args: Value = serde_json::from_str(arguments).ok()?;
++    let command = if shell {
++        Some(command_text(&args)?)
++    } else {
++        None
++    };
++    #[allow(deprecated)]
++    let task_cwd = invocation.turn.cwd.as_path();
++    let cwd = args
++        .get("workdir")
++        .or_else(|| args.get("cwd"))
++        .and_then(Value::as_str)
++        .map(|path| task_cwd.join(path))
++        .unwrap_or_else(|| task_cwd.to_path_buf());
++    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
++    if let Some(map) = args.as_object_mut() {
++        // Presentation/poll cadence cannot turn the same operation into a new one.
++        map.remove("max_output_tokens");
++        map.remove("yield_time_ms");
++        map.remove("workdir");
++        map.remove("cwd");
++        if let Some(command) = &command {
++            map.remove("cmd");
++            map.remove("command");
++            map.insert(
++                "command".to_string(),
++                Value::String(normalize_command(command)),
++            );
++        }
++    }
++    let permission = format!(
++        "{:?}|{:?}|{}",
++        invocation.turn.permission_profile,
++        invocation.turn.approval_policy,
++        invocation.turn.network.is_some()
++    );
++    let operation_name = if shell { "local_command" } else { &name };
++    let key = hash(format!(
++        "{operation_name}|{}|{}",
++        cwd.display(),
++        canonical(&args)
++    ));
++    let web = command
++        .as_ref()
++        .is_some_and(|cmd| web_command(cmd, &cwd, 0));
++    Some(Operation {
++        key,
++        cwd,
++        command,
++        web,
++        permission,
++    })
++}
++
++pub(crate) fn before(invocation: &ToolInvocation) -> Result<(), FunctionCallError> {
++    if invocation.tool_name.name == "write_stdin" {
++        return before_stdin(invocation);
++    }
++    let Some(operation) = operation(invocation) else {
++        return Ok(());
++    };
++    let shared = state(&invocation.turn);
++    let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
++    admit(
++        &mut state,
++        &invocation.call_id,
++        operation,
++        retrieval(&flat_tool_name(&invocation.tool_name)),
++    )
++}
++
++fn before_stdin(invocation: &ToolInvocation) -> Result<(), FunctionCallError> {
++    let ToolPayload::Function { arguments } = &invocation.payload else {
++        return Ok(());
++    };
++    let Ok(args) = serde_json::from_str::<Value>(arguments) else {
++        return Ok(());
++    };
++    let chars = args.get("chars").and_then(Value::as_str).unwrap_or("");
++    if chars.trim().is_empty() {
++        return Ok(());
++    }
++    let Some(pid) = args.get("session_id").and_then(Value::as_i64) else {
++        return Ok(());
++    };
++    let shared = state(&invocation.turn);
++    let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
++    let Some((id, previous)) = state.processes.get(&pid).cloned() else {
++        return Ok(());
++    };
++    let Some(operation) = state.pending.get(&id) else {
++        return Ok(());
++    };
++    let words = shlex::split(operation.command.as_deref().unwrap_or("")).unwrap_or_default();
++    // A cat/file-transfer process consumes data, not interpreter source.
++    let interpreter = words.first().is_some_and(|word| {
++        matches!(
++            base(word),
++            "python" | "python3" | "node" | "bash" | "sh" | "zsh"
++        )
++    }) && (words.len() == 1 || words.iter().any(|word| word == "-i"));
++    if !interpreter {
++        return Ok(());
++    }
++    let source = format!("{previous}\n{chars}");
++    if state.searched
++        && (web_command(chars, &operation.cwd, 0) || network_source(&source))
++        && !only_local_urls(&source)
++        && !artifact_urls(&source)
++    {
++        return Err(FunctionCallError::RespondToModel(WEB_BLOCK.to_string()));
++    }
++    if source.len() <= MAX_SCRIPT_BYTES as usize {
++        state.processes.insert(pid, (id, source));
++    }
++    Ok(())
++}
++
++fn admit(
++    state: &mut State,
++    call_id: &str,
++    operation: Operation,
++    is_retrieval: bool,
++) -> Result<(), FunctionCallError> {
++    let deny = |message: String| Err(FunctionCallError::RespondToModel(message));
++    if state.searched && operation.web {
++        return deny(WEB_BLOCK.to_string());
++    }
++    if state
++        .pending
++        .values()
++        .any(|pending| pending.key == operation.key)
++    {
++        return deny("YIJIE_OPERATION_PENDING：已拦截。相同操作尚未收尾，请等待原调用或使用 write_stdin 读取结果，不要重复启动。".to_string());
++    }
++    if let Some(failure) = state.failed.get(&operation.key)
++        && failure.conditions.complete
++        && failure.conditions == retry_conditions(&operation, failure.reason)
++    {
++        return deny(format!(
++            "YIJIE_UNCHANGED_FAILURE：已拦截。上次相同操作{}；工作目录、相关输入或权限条件未变化，未再次执行。请先修正原因，或说明限制并使用已有结果。",
++            failure.reason
++        ));
++    }
++    if state.failed.len() + state.pending.len() >= MAX_RECORDS {
++        return deny(
++            "YIJIE_GUARD_CAPACITY：本轮执行记录已达上限，未启动新的操作；请结束本轮后继续。"
++                .to_string(),
++        );
++    }
++    state.failed.remove(&operation.key);
++    if is_retrieval {
++        state.searched = true;
++    }
++    state.pending.insert(call_id.to_string(), operation);
++    Ok(())
++}
++
++pub(crate) fn after(
++    invocation: &ToolInvocation,
++    result: Result<&dyn ToolOutput, &FunctionCallError>,
++) {
++    let observed_id = match result {
++        Ok(output) => output.post_tool_use_id(&invocation.call_id),
++        Err(_) => invocation.call_id.clone(),
++    };
++    let shared = state(&invocation.turn);
++    if !shared
++        .lock()
++        .unwrap_or_else(PoisonError::into_inner)
++        .pending
++        .contains_key(&observed_id)
++    {
++        return;
++    }
++    let (id, value, success) = match result {
++        Ok(output) => (
++            output.post_tool_use_id(&invocation.call_id),
++            output.execution_guard_result(&invocation.payload),
++            output.success_for_logging(),
++        ),
++        Err(error) => (
++            invocation.call_id.clone(),
++            Value::String(error.to_string()),
++            false,
++        ),
++    };
++    if let Some(pid) = value.get("session_id").and_then(Value::as_i64) {
++        shared
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .processes
++            .entry(pid)
++            .or_insert((id, String::new()));
++        return;
++    }
++    let shared = state(&invocation.turn);
++    let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
++    let Some(operation) = state.pending.remove(&id) else {
++        return;
++    };
++    state.processes.retain(|_, (owner, _)| owner != &id);
++    let text = value
++        .get("output")
++        .and_then(Value::as_str)
++        .map(str::to_string)
++        .unwrap_or_else(|| value.to_string());
++    let exit = value.get("exit_code").and_then(Value::as_i64);
++    let explicit_error = value
++        .get("isError")
++        .or_else(|| value.get("is_error"))
++        .and_then(Value::as_bool)
++        .unwrap_or(false);
++    let reason = failure_reason(&operation, success && !explicit_error, exit, &text);
++    if let Some(reason) = reason {
++        let conditions = retry_conditions(&operation, reason);
++        let family = operation.command.as_deref().and_then(command_family);
++        state.failed.insert(
++            operation.key,
++            Failure {
++                reason,
++                conditions,
++                family,
++                cwd: operation.cwd,
++            },
++        );
++    } else if success
++        && exit == Some(0)
++        && let Some(family) = operation.command.as_deref().and_then(repair_family)
++    {
++        // A completed dependency/configuration repair is observable evidence of
++        // changed execution conditions, unlike a model claiming it fixed them.
++        state.failed.retain(|_, failure| {
++            failure.family.as_deref() != Some(family.as_str())
++                || (!failure.cwd.starts_with(&operation.cwd) && family != "python")
++        });
++    }
++}
++
++fn command_family(command: &str) -> Option<String> {
++    let words = shlex::split(command)?;
++    let first = base(words.first()?);
++    Some(
++        match first {
++            "python" | "python3" | "pip" | "pip3" | "uv" => "python",
++            "npm" | "pnpm" | "yarn" | "node" => "node",
++            other => other,
++        }
++        .to_string(),
++    )
++}
++
++fn repair_family(command: &str) -> Option<String> {
++    let words = shlex::split(command)?;
++    let first = base(words.first()?);
++    let second = words.get(1).map(String::as_str).unwrap_or("");
++    let repair = match first {
++        "npm" | "pnpm" | "yarn" => {
++            matches!(second, "install" | "ci" | "add" | "update" | "rebuild")
++        }
++        "cargo" => matches!(second, "fetch" | "update" | "clean"),
++        "pip" | "pip3" => second == "install",
++        "python" | "python3" => words
++            .get(1..4)
++            .is_some_and(|v| v == ["-m", "pip", "install"]),
++        "uv" => words.get(1..3).is_some_and(|v| v == ["pip", "install"]),
++        "git" => {
++            words.get(1..3).is_some_and(|v| v == ["remote", "set-url"])
++                || (second == "config"
++                    && words.len() >= 4
++                    && !words
++                        .iter()
++                        .any(|v| v.starts_with("--get") || matches!(v.as_str(), "--list" | "-l")))
++        }
++        _ => false,
++    };
++    repair.then(|| command_family(command)).flatten()
++}
++
++fn failure_reason(
++    operation: &Operation,
++    success: bool,
++    exit: Option<i64>,
++    text: &str,
++) -> Option<&'static str> {
++    let lowered = text.to_ascii_lowercase();
++    // Predicate/no-match/difference exit 1 is an ordinary result, not failure.
++    if exit == Some(1)
++        && operation.command.as_ref().is_some_and(|command| {
++            shlex::split(command)
++                .and_then(|v| v.first().cloned())
++                .is_some_and(|first| matches!(base(&first), "test" | "[" | "grep" | "rg" | "diff"))
++        })
++    {
++        return None;
++    }
++    let html = lowered.contains("<html") || lowered.contains("<!doctype html");
++    let caught = operation.web
++        && (!html || text.contains("STATUS ERROR"))
++        && text.lines().any(|line| {
++            let line = line.trim();
++            line.contains("STATUS ERROR")
++                || [
++                    "URLError(",
++                    "gaierror(",
++                    "Traceback (most recent call last)",
++                    "requests.exceptions.",
++                    "httpx.",
++                    "aiohttp.",
++                    "FetchError:",
++                    "TypeError: fetch failed",
++                    "Error: getaddrinfo",
++                ]
++                .iter()
++                .any(|prefix| line.starts_with(prefix))
++        });
++    let failed = !success || exit.is_some_and(|code| code != 0) || caught;
++    if failed {
++        if [
++            "gaierror",
++            "could not resolve host",
++            "nameresolutionerror",
++            "name or service not known",
++            "nodename nor servname",
++            "enotfound",
++        ]
++        .iter()
++        .any(|x| lowered.contains(x))
++        {
++            return Some("发生域名解析错误");
++        }
++        if [
++            "network is unreachable",
++            "connection refused",
++            "proxyerror",
++            "econnrefused",
++            "connection timed out",
++        ]
++        .iter()
++        .any(|x| lowered.contains(x))
++        {
++            return Some("发生网络连接错误");
++        }
++        if [
++            "permission denied",
++            "operation not permitted",
++            "sandbox denied",
++            "unauthorized",
++            "authentication failed",
++        ]
++        .iter()
++        .any(|x| lowered.contains(x))
++        {
++            return Some("返回权限或认证错误");
++        }
++        return Some("返回失败结果");
++    }
++    None
++}
++
++#[cfg(test)]
++fn conditions(operation: &Operation) -> Conditions {
++    retry_conditions(operation, "返回失败结果")
++}
++
++fn retry_conditions(operation: &Operation, reason: &str) -> Conditions {
++    let mut digest = Sha1::new();
++    digest.update(operation.permission.as_bytes());
++    // No network probes or extra commands. Only local input state is observed.
++    let mut remaining = 25_000usize;
++    let mut complete = true;
++    if !matches!(reason, "发生域名解析错误" | "发生网络连接错误") {
++        fingerprint_path(
++            &operation.cwd,
++            &mut digest,
++            &mut remaining,
++            0,
++            &mut complete,
++        );
++    }
++    for key in [
++        "HTTP_PROXY",
++        "HTTPS_PROXY",
++        "ALL_PROXY",
++        "NO_PROXY",
++        "http_proxy",
++        "https_proxy",
++        "all_proxy",
++        "no_proxy",
++    ] {
++        if let Some(value) = std::env::var_os(key) {
++            digest.update(value.as_encoded_bytes());
++        }
++    }
++    if let Some(command) = &operation.command {
++        for path in input_paths(command, &operation.cwd) {
++            fingerprint_path(&path, &mut digest, &mut remaining, 0, &mut complete);
++        }
++    }
++    for relative in [
++        ".git/config",
++        ".git/HEAD",
++        ".npmrc",
++        ".cargo/config.toml",
++        "pyproject.toml",
++    ] {
++        fingerprint_path(
++            &operation.cwd.join(relative),
++            &mut digest,
++            &mut remaining,
++            0,
++            &mut complete,
++        );
++    }
++    Conditions {
++        digest: format!("{:x}", digest.finalize()),
++        complete,
++    }
++}
++
++fn input_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
++    shlex::split(command)
++        .unwrap_or_default()
++        .iter()
++        .skip(1)
++        .filter(|word| {
++            !word.starts_with('-')
++                && !word.contains("://")
++                && !word.chars().any(char::is_whitespace)
++                && (word.contains('/') || word.contains('.'))
++        })
++        .take(64)
++        .map(|word| cwd.join(word))
++        .collect()
++}
++
++fn fingerprint_path(
++    path: &Path,
++    digest: &mut Sha1,
++    remaining: &mut usize,
++    depth: usize,
++    complete: &mut bool,
++) {
++    if *remaining == 0 || depth > 16 {
++        digest.update(b"bounded");
++        *complete = false;
++        return;
++    }
++    *remaining -= 1;
++    digest.update(path.as_os_str().as_encoded_bytes());
++    let metadata = match fs::symlink_metadata(path) {
++        Ok(metadata) => metadata,
++        Err(error) => {
++            digest.update(b"unavailable");
++            if error.kind() != std::io::ErrorKind::NotFound {
++                *complete = false;
++            }
++            return;
++        }
++    };
++    digest.update(metadata.len().to_le_bytes());
++    digest.update(format!("{:?}|{:?}", metadata.modified(), metadata.permissions()).as_bytes());
++    if metadata.is_symlink() {
++        if let Ok(target) = fs::canonicalize(path)
++            && target.is_file()
++        {
++            fingerprint_path(&target, digest, remaining, depth + 1, complete);
++        } else {
++            *complete = false;
++        }
++        return;
++    }
++    if metadata.is_file() {
++        if metadata.len() <= MAX_SCRIPT_BYTES
++            && let Ok(bytes) = fs::read(path)
++        {
++            digest.update(bytes);
++        }
++        return;
++    }
++    let Ok(entries) = fs::read_dir(path) else {
++        *complete = false;
++        return;
++    };
++    let mut paths = entries
++        .filter_map(|entry| match entry {
++            Ok(entry) => Some(entry),
++            Err(_) => {
++                *complete = false;
++                None
++            }
++        })
++        .map(|e| e.path())
++        .collect::<Vec<_>>();
++    paths.sort();
++    for child in paths {
++        let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
++        if matches!(
++            name,
++            ".git"
++                | "node_modules"
++                | "target"
++                | "dist"
++                | "build"
++                | ".venv"
++                | "__pycache__"
++                | ".pytest_cache"
++                | ".mypy_cache"
++                | ".next"
++        ) {
++            continue;
++        }
++        fingerprint_path(&child, digest, remaining, depth + 1, complete);
++    }
++}
++
++fn script_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
++    shlex::split(command.lines().next().unwrap_or(""))
++        .unwrap_or_default()
++        .iter()
++        .filter(|word| {
++            [".py", ".js", ".mjs", ".cjs", ".sh"]
++                .iter()
++                .any(|suffix| word.ends_with(suffix))
++        })
++        .map(|word| cwd.join(word))
++        .collect()
++}
++
++fn regex(pattern: &str, text: &str) -> bool {
++    Regex::new(pattern).is_ok_and(|re| re.is_match(text))
++}
++
++// Remove literal contents and comments before looking for executable network
++// calls. Printing a URL or a requests.get example must remain a local operation.
++fn code_without_literals(source: &str) -> String {
++    let mut result = String::with_capacity(source.len());
++    let mut quote = None;
++    let mut escaped = false;
++    let mut comment = false;
++    for c in source.chars() {
++        if comment {
++            if c == '\n' {
++                comment = false;
++                result.push(c);
++            } else {
++                result.push(' ');
++            }
++            continue;
++        }
++        if let Some(q) = quote {
++            if escaped {
++                escaped = false;
++            } else if c == '\\' {
++                escaped = true;
++            } else if c == q {
++                quote = None;
++            }
++            result.push(if c == '\n' { '\n' } else { ' ' });
++        } else if matches!(c, '\'' | '"' | '`') {
++            quote = Some(c);
++            result.push(' ');
++        } else if c == '#' {
++            comment = true;
++            result.push(' ');
++        } else {
++            result.push(c);
++        }
++    }
++    result
++}
++
++fn only_local_urls(source: &str) -> bool {
++    let Ok(re) = Regex::new(r#"https?://[^\s'\"`<>),;]+"#) else {
++        return false;
++    };
++    let urls = re.find_iter(source).map(|v| v.as_str()).collect::<Vec<_>>();
++    !urls.is_empty()
++        && urls.iter().all(|raw| {
++            url::Url::parse(raw)
++                .ok()
++                .and_then(|url| url.host_str().map(str::to_string))
++                .is_some_and(|host| {
++                    host == "localhost"
++                        || host.ends_with(".localhost")
++                        || host == "[::1]"
++                        || host == "::1"
++                        || host.starts_with("127.")
++                })
++        })
++}
++
++fn network_source(source: &str) -> bool {
++    let code = code_without_literals(source);
++    regex(r"\b(?:urlopen|urlretrieve|fetch)\s*\(", &code)
++        || (regex(r"\b(?:requests|httpx|aiohttp|urllib|http|https)\b", &code)
++            && regex(r"\.\s*(?:get|request|open|urlopen|urlretrieve)\s*\(", &code))
++        || regex(
++            r"\b(?:from\s+urllib\.request\s+import|from\s+requests\s+import)\b",
++            &code,
++        ) && regex(r"\b(?:get|request|urlopen|urlretrieve)\s*\(", &code)
++}
++
++fn web_command(command: &str, cwd: &Path, depth: usize) -> bool {
++    if depth > 4 {
++        return false;
++    }
++    if let Some(commands) = codex_shell_command::bash::parse_shell_script_into_commands(command)
++        && commands.len() > 1
++    {
++        return commands.iter().any(|words| {
++            shlex::try_join(words.iter().map(String::as_str))
++                .is_ok_and(|command| web_command(&command, cwd, depth + 1))
++        });
++    }
++    let header = command.lines().next().unwrap_or("");
++    let words = shlex::split(header).unwrap_or_default();
++    if words.is_empty() {
++        return false;
++    }
++    let executable = base(&words[0]);
++    if words[0].contains('=') && words.len() > 1 {
++        let header = shlex::try_join(words[1..].iter().map(String::as_str)).unwrap_or_default();
++        let nested = command
++            .split_once('\n')
++            .map(|(_, body)| format!("{header}\n{body}"))
++            .unwrap_or(header);
++        return web_command(&nested, cwd, depth + 1);
++    }
++    if matches!(executable, "echo" | "printf" | "cat" | "rg" | "grep")
++        && !regex(r"[|;&]\s*(?:curl|wget|python3?|node)\b", command)
++    {
++        return false;
++    }
++    if matches!(executable, "sh" | "bash" | "zsh")
++        && let Some(index) = words
++            .iter()
++            .position(|x| matches!(x.as_str(), "-c" | "-lc"))
++        && let Some(source) = words.get(index + 1)
++    {
++        return web_command(source, cwd, depth + 1);
++    }
++    if matches!(executable, "env" | "command" | "exec") && words.len() > 1 {
++        let nested = shlex::try_join(words[1..].iter().map(String::as_str)).unwrap_or_default();
++        return web_command(&nested, cwd, depth + 1);
++    }
++    if regex(r"(?:^|[;&|]\s*)(?:\S*/)?(?:curl|wget)\s", command) {
++        // Explicit API writes and package/data-file transfers are not webpage
++        // reading. Their normal executor and approval checks still apply.
++        let api_write = words.windows(2).any(|pair| {
++            matches!(pair[0].as_str(), "-X" | "--request")
++                && matches!(
++                    pair[1].to_ascii_uppercase().as_str(),
++                    "POST" | "PUT" | "PATCH" | "DELETE"
++                )
++        }) || words.iter().any(|word| {
++            matches!(
++                word.as_str(),
++                "-d" | "--data"
++                    | "--data-raw"
++                    | "--json"
++                    | "-F"
++                    | "--form"
++                    | "-T"
++                    | "--upload-file"
++            ) || word.starts_with("--post-data=")
++                || word.starts_with("--post-file=")
++        });
++        return !api_write && !only_local_urls(command) && !artifact_urls(command);
++    }
++    let interpreter = executable.starts_with("python")
++        || matches!(executable, "node" | "nodejs" | "deno" | "bun");
++    if interpreter {
++        if let Some(index) = words
++            .iter()
++            .position(|x| matches!(x.as_str(), "-c" | "-e" | "--eval"))
++            && let Some(source) = words.get(index + 1)
++        {
++            return network_source(source) && !only_local_urls(command) && !artifact_urls(command);
++        }
++        if command.contains("<<") {
++            let source = command
++                .split_once('\n')
++                .map(|(_, source)| source)
++                .unwrap_or("");
++            return network_source(source) && !only_local_urls(command) && !artifact_urls(command);
++        }
++    }
++    for path in script_paths(command, cwd) {
++        if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= MAX_SCRIPT_BYTES)
++            && let Ok(source) = fs::read_to_string(&path)
++        {
++            let web = if path.extension().is_some_and(|ext| ext == "sh") {
++                source.lines().any(|line| web_command(line, cwd, depth + 1))
++            } else {
++                network_source(&source)
++            };
++            let input = format!("{source}\n{command}");
++            if web && !only_local_urls(&input) && !artifact_urls(&input) {
++                return true;
++            }
++        }
++    }
++    // Ordinary shell sequences retain their individual interpreter arguments.
++    command
++        .split([';', '|', '&'])
++        .skip(1)
++        .any(|part| web_command(part.trim(), cwd, depth + 1))
++}
++
++fn artifact_urls(source: &str) -> bool {
++    let Ok(re) = Regex::new(r#"https?://[^\s'\"`<>),;]+"#) else {
++        return false;
++    };
++    let urls = re.find_iter(source).map(|v| v.as_str()).collect::<Vec<_>>();
++    !urls.is_empty()
++        && urls.iter().all(|raw| {
++            url::Url::parse(raw).is_ok_and(|url| {
++                let path = url.path().to_ascii_lowercase();
++                [
++                    ".tar.gz", ".tgz", ".zip", ".whl", ".crate", ".deb", ".rpm", ".dmg", ".pkg",
++                    ".jar", ".csv", ".parquet",
++                ]
++                .iter()
++                .any(|extension| path.ends_with(extension))
++            })
++        })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn retrieval_guard_classifies_web_and_preserves_local_work() {
++        let cwd = Path::new("/tmp");
++        for command in [
++            "curl https://example.com/news",
++            "wget -q https://example.com/page",
++            "python3 -c 'import requests; requests.get(\"https://example.com\")'",
++            "python3 - <<'PY'\nimport urllib.request\nurllib.request.urlopen('https://example.com')\nPY",
++            "node -e 'fetch(\"https://example.com\")'",
++            "bash -lc 'curl https://example.com'",
++            "curl -X POST https://api.example.com/jobs -d '{}' && curl https://example.com/news",
++        ] {
++            assert!(web_command(command, cwd, 0), "{command}");
++        }
++        for command in [
++            "python3 -c 'print(2 + 2)'",
++            "python3 -c 'print(\"requests.get(https://example.com)\")'",
++            "printf '%s' https://example.com",
++            "cat document.html",
++            "rg requests.get .",
++            "curl http://localhost:3000/health",
++            "curl http://127.0.0.1:8080/",
++            "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:3000\")'",
++            "git status",
++            "git fetch origin",
++            "curl -X POST https://api.example.com/jobs -d '{}'",
++            "curl -O https://example.com/package.tar.gz",
++            "cargo test",
++            "pnpm build",
++            "python3 -c 'open(\"report.txt\",\"w\").write(\"done\")'",
++        ] {
++            assert!(!web_command(command, cwd, 0), "{command}");
++        }
++    }
++
++    #[test]
++    fn retrieval_guard_reads_scripts_and_detects_changed_inputs() {
++        let temp = tempfile::tempdir().unwrap();
++        let script = temp.path().join("read.py");
++        fs::write(
++            &script,
++            "import urllib.request\nurllib.request.urlopen('https://example.com')",
++        )
++        .unwrap();
++        assert!(web_command("python3 read.py", temp.path(), 0));
++        let operation = Operation {
++            key: "local".into(),
++            cwd: temp.path().into(),
++            command: Some("python3 read.py".into()),
++            web: true,
++            permission: "workspace-write".into(),
++        };
++        let before = conditions(&operation);
++        assert_eq!(before, conditions(&operation));
++        fs::write(&script, "print(2 + 2)").unwrap();
++        assert_ne!(before, conditions(&operation));
++        assert!(!web_command("python3 read.py", temp.path(), 0));
++    }
++
++    #[test]
++    fn retrieval_guard_failure_is_not_just_process_success() {
++        let mut operation = Operation {
++            key: "ordinary".into(),
++            cwd: PathBuf::from("/tmp"),
++            command: Some("python3 read.py".into()),
++            web: true,
++            permission: "workspace-write".into(),
++        };
++        assert_eq!(
++            failure_reason(
++                &operation,
++                true,
++                Some(0),
++                "URLError(gaierror(8, 'nodename nor servname provided'))"
++            ),
++            Some("发生域名解析错误")
++        );
++        operation.web = false;
++        assert_eq!(
++            failure_reason(&operation, true, Some(0), "DNS example: gaierror"),
++            None
++        );
++        operation.command = Some("rg ordinary file.txt".into());
++        assert_eq!(failure_reason(&operation, true, Some(1), ""), None);
++        assert_eq!(
++            failure_reason(&operation, true, Some(2), "error"),
++            Some("返回失败结果")
++        );
++        assert_eq!(
++            normalize_command("python3  -c 'print(1)'"),
++            normalize_command("python -c 'print(1)'")
++        );
++        assert_ne!(
++            normalize_command("python3 -c 'print(1)'"),
++            normalize_command("python3 -c 'print(2)'")
++        );
++    }
++
++    #[test]
++    fn retrieval_guard_blocks_before_execution_and_allows_changed_conditions() {
++        let temp = tempfile::tempdir().unwrap();
++        let input = temp.path().join("input.txt");
++        fs::write(&input, "old input").unwrap();
++        let mut operation = Operation {
++            key: "ordinary".into(),
++            cwd: temp.path().into(),
++            command: Some("cat input.txt".into()),
++            web: false,
++            permission: "workspace-write".into(),
++        };
++        let mut state = State::default();
++        admit(&mut state, "first", operation.clone(), false).unwrap();
++        assert!(
++            admit(&mut state, "duplicate", operation.clone(), false)
++                .unwrap_err()
++                .to_string()
++                .contains("YIJIE_OPERATION_PENDING")
++        );
++        state.pending.remove("first");
++        state.failed.insert(
++            operation.key.clone(),
++            Failure {
++                reason: "返回失败结果",
++                conditions: conditions(&operation),
++                family: Some("cat".into()),
++                cwd: operation.cwd.clone(),
++            },
++        );
++        assert!(
++            admit(&mut state, "retry", operation.clone(), false)
++                .unwrap_err()
++                .to_string()
++                .contains("YIJIE_UNCHANGED_FAILURE")
++        );
++        assert!(state.pending.is_empty());
++        fs::write(&input, "corrected input").unwrap();
++        admit(&mut state, "corrected", operation.clone(), false).unwrap();
++        state.pending.remove("corrected");
++        state.searched = true;
++        operation.web = true;
++        assert!(
++            admit(&mut state, "fetch", operation.clone(), false)
++                .unwrap_err()
++                .to_string()
++                .contains("YIJIE_WEB_RETRIEVAL_ONLY")
++        );
++        assert!(state.pending.is_empty());
++        operation.web = false;
++        admit(&mut state, "local", operation.clone(), false).unwrap();
++        let mut next_turn = State::default();
++        admit(&mut next_turn, "new-turn", operation, false).unwrap();
++    }
++
++    #[test]
++    fn retrieval_guard_network_retry_needs_relevant_change() {
++        let temp = tempfile::tempdir().unwrap();
++        fs::write(temp.path().join("read.py"), "original source").unwrap();
++        let mut operation = Operation {
++            key: "network".into(),
++            cwd: temp.path().into(),
++            command: Some("python3 read.py".into()),
++            web: true,
++            permission: "workspace-write".into(),
++        };
++        let before = retry_conditions(&operation, "发生域名解析错误");
++        fs::write(temp.path().join("unrelated.txt"), "unrelated local output").unwrap();
++        assert_eq!(before, retry_conditions(&operation, "发生域名解析错误"));
++        fs::write(temp.path().join("read.py"), "corrected source").unwrap();
++        assert_ne!(before, retry_conditions(&operation, "发生域名解析错误"));
++        let corrected = retry_conditions(&operation, "发生域名解析错误");
++        operation.permission = "different approved permissions".into();
++        assert_ne!(corrected, retry_conditions(&operation, "发生域名解析错误"));
++    }
++
++    #[test]
++    fn retrieval_guard_observes_errors_despite_display_truncation() {
++        let output = crate::tools::context::ExecCommandToolOutput {
++            event_call_id: "ordinary-call".into(),
++            chunk_id: "ordinary-chunk".into(),
++            wall_time: std::time::Duration::ZERO,
++            raw_output: b"URLError(gaierror(8, 'nodename nor servname provided'))".to_vec(),
++            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1),
++            max_output_tokens: Some(0),
++            process_id: None,
++            exit_code: Some(0),
++            original_token_count: None,
++            hook_command: Some("python3 read.py".into()),
++        };
++        let value = output.execution_guard_result(&ToolPayload::Function {
++            arguments: "{}".into(),
++        });
++        assert_eq!(value["exit_code"], 0);
++        assert!(value["output"].as_str().unwrap().contains("gaierror"));
++    }
++
++    #[test]
++    fn retrieval_guard_does_not_treat_successful_error_articles_as_failures() {
++        let mut operation = Operation {
++            key: "ordinary".into(),
++            cwd: PathBuf::from("/tmp"),
++            command: None,
++            web: false,
++            permission: "workspace-write".into(),
++        };
++        assert_eq!(
++            failure_reason(
++                &operation,
++                true,
++                None,
++                "Search result: Python gaierror and permission denied explained"
++            ),
++            None
++        );
++        operation.command = Some("python3 read.py".into());
++        operation.web = true;
++        assert_eq!(
++            failure_reason(
++                &operation,
++                true,
++                Some(0),
++                "<html><pre>\nURLError(gaierror(8))\n</pre></html>"
++            ),
++            None
++        );
++        assert_eq!(
++            failure_reason(
++                &operation,
++                true,
++                Some(0),
++                "STATUS ERROR\nURLError(gaierror(8))"
++            ),
++            Some("发生域名解析错误")
++        );
++    }
++
++    #[test]
++    fn retrieval_guard_recognizes_real_development_repairs() {
++        for (command, family) in [
++            ("pnpm install", "node"),
++            ("npm ci", "node"),
++            ("cargo fetch", "cargo"),
++            ("python3 -m pip install ordinary-package", "python"),
++            (
++                "git remote set-url origin https://example.com/repo.git",
++                "git",
++            ),
++        ] {
++            assert_eq!(repair_family(command).as_deref(), Some(family));
++        }
++        for command in [
++            "echo ready",
++            "git status",
++            "git config --get remote.origin.url",
++            "pnpm run lint",
++            "python3 -c 'print(1)'",
++        ] {
++            assert_eq!(repair_family(command), None);
++        }
++        let mut complete = true;
++        fingerprint_path(
++            Path::new("/tmp"),
++            &mut Sha1::new(),
++            &mut 0,
++            0,
++            &mut complete,
++        );
++        assert!(
++            !complete,
++            "bounded observations cannot prove unchanged inputs"
++        );
++    }
++}
