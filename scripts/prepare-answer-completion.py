@@ -11,11 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / ".local/web-retrieval-guard/workspace"
 
 
-def main():
+def main(manifest_script="write-answer-completion-runtime-manifest.py"):
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    spec = importlib.util.spec_from_file_location("guard_manifest", ROOT / "scripts/write-answer-completion-runtime-manifest.py")
+    spec = importlib.util.spec_from_file_location("guard_manifest", ROOT / "scripts" / manifest_script)
     manifest = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(manifest)
     metadata = dict(line.split("=", 1) for line in (ROOT / ".yijie/upstream.env").read_text().splitlines() if "=" in line)

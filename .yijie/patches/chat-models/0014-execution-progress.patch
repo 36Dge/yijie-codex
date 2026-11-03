@@ -1,0 +1,210 @@
+diff --git a/core/src/session/answer_completion.rs b/core/src/session/answer_completion.rs
+--- a/core/src/session/answer_completion.rs
++++ b/core/src/session/answer_completion.rs
+@@ -5,14 +5,18 @@
+ 
+ use codex_protocol::models::MessagePhase;
+ use codex_protocol::models::{ContentItem, ResponseItem};
++use codex_protocol::plan_tool::UpdatePlanArgs;
+ 
+ use super::turn_context::TurnContext;
+ use crate::function_tool::FunctionCallError;
+ 
+ pub(crate) const MARKER: &str = "[yijie-answer-completion-v1]";
+-pub(crate) const FAILED: &str = "YIJIE_ANSWER_INCOMPLETE：模型仍只返回过程说明，未生成可交付的回答。本轮已停止，已取得的内容保留。";
++pub(crate) const FAILED: &str =
++    "YIJIE_ANSWER_INCOMPLETE：模型未生成可交付的回答。本轮已停止，已取得的内容保留。";
+ const FEEDBACK: &str = "The previous response ended without a deliverable answer. Continue this SAME user turn using the results already obtained. Do not repeat completed actions or call tools: this is a bounded, answer-only finalization. Give the requested answer now, or clearly explain what could not be completed and provide the supported partial result. Do not end with a promise, progress update, or statement that you will continue. Respect an explicit user request for only a plan, quotation, or no reply. Use final_answer phase when supported.";
+ const MAX_RECOVERIES: usize = 2;
++const MAX_UNCHANGED_PLAN_UPDATES: usize = 3;
++const PLAN_FEEDBACK: &str = "The same plan was successfully updated repeatedly without advancing its steps. These updates did not perform the research or other work named in the plan. Continue this SAME user turn using the results already obtained: this is a bounded, answer-only finalization. Do not repeat tools or start another search. Give a supported answer now, or clearly explain the missing evidence and provide a supported partial result. Never treat source URLs alone as retrieved page content.";
+ 
+ #[derive(Default)]
+ struct State {
+@@ -21,6 +25,8 @@
+     attempts: usize,
+     finalizing: bool,
+     delivered_media: bool,
++    last_plan: Option<String>,
++    unchanged_plan_updates: usize,
+ }
+ 
+ #[derive(Debug, PartialEq)]
+@@ -74,8 +80,28 @@
+             {
+                 state.delivered_media = true
+             }
++            // A different requested operation may perform substantive work. Do
++            // not turn this narrow repeated-plan check into a generic tool ban.
++            // Native rollout_budget owns the broader shared usage boundary.
++            ResponseItem::FunctionCall { name, .. } if name != "update_plan" => {
++                state.clear_plan_progress();
++            }
++            ResponseItem::CustomToolCall { .. } | ResponseItem::LocalShellCall { .. } => {
++                state.clear_plan_progress();
++            }
+             _ => {}
+         }
++    }
++}
++
++/// Called by the existing plan handler only after it accepts the native args.
++/// No second planner, tool result cache, usage counter, or execution loop.
++pub(crate) fn observe_plan(turn: &TurnContext, args: &UpdatePlanArgs) {
++    if enabled(turn) {
++        state(turn)
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .record_plan(args);
+     }
+ }
+ 
+@@ -101,14 +127,36 @@
+     }
+     let shared = state(turn);
+     let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+-    if needs_follow_up && !state.finalizing {
+-        return Decision::Accept;
+-    }
+     state.decide(answer, needs_follow_up)
+ }
+ 
+ impl State {
++    fn record_plan(&mut self, args: &UpdatePlanArgs) {
++        let Ok(plan) = serde_json::to_string(&args.plan) else {
++            return;
++        };
++        self.unchanged_plan_updates = if self.last_plan.as_ref() == Some(&plan) {
++            (self.unchanged_plan_updates + 1).min(MAX_UNCHANGED_PLAN_UPDATES)
++        } else {
++            1
++        };
++        self.last_plan = Some(plan);
++    }
++
++    fn clear_plan_progress(&mut self) {
++        if !self.finalizing {
++            self.last_plan = None;
++            self.unchanged_plan_updates = 0;
++        }
++    }
++
+     fn decide(&mut self, answer: Option<&str>, needs_follow_up: bool) -> Decision {
++        if needs_follow_up
++            && !self.finalizing
++            && self.unchanged_plan_updates < MAX_UNCHANGED_PLAN_UPDATES
++        {
++            return Decision::Accept;
++        }
+         let text = answer.unwrap_or_default().trim();
+         let requested_form = requested_process_only(&self.request)
+             || (!text.is_empty()
+@@ -234,12 +282,22 @@
+         })
+ }
+ 
+-pub(crate) fn feedback() -> ResponseItem {
++pub(crate) fn feedback(turn: &TurnContext) -> ResponseItem {
++    let repeated_plan = state(turn)
++        .lock()
++        .unwrap_or_else(PoisonError::into_inner)
++        .unchanged_plan_updates
++        >= MAX_UNCHANGED_PLAN_UPDATES;
+     ResponseItem::Message {
+         id: None,
+         role: "developer".into(),
+         content: vec![ContentItem::InputText {
+-            text: FEEDBACK.into(),
++            text: if repeated_plan {
++                PLAN_FEEDBACK
++            } else {
++                FEEDBACK
++            }
++            .into(),
+         }],
+         phase: None,
+         internal_chat_message_metadata_passthrough: None,
+@@ -249,6 +307,43 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    fn plan(status: &str, explanation: &str) -> UpdatePlanArgs {
++        serde_json::from_value(serde_json::json!({
++            "explanation": explanation,
++            "plan": [{"step": "ordinary reference", "status": status}]
++        }))
++        .unwrap()
++    }
++
++    #[test]
++    fn answer_completion_repeated_successful_plans_enter_existing_finalization() {
++        let mut state = State::default();
++        for explanation in ["first", "different explanation"] {
++            state.record_plan(&plan("in_progress", explanation));
++            assert_eq!(state.decide(None, true), Decision::Accept);
++        }
++        state.record_plan(&plan("in_progress", "third explanation"));
++        assert_eq!(state.decide(None, true), Decision::Continue);
++        assert!(state.finalizing);
++        // Reuse the existing bounded recovery count, including ignored tools.
++        assert_eq!(state.decide(None, true), Decision::Continue);
++        assert_eq!(state.decide(None, true), Decision::Failed);
++    }
++
++    #[test]
++    fn answer_completion_changed_plan_and_other_work_preserve_continuation() {
++        let mut state = State::default();
++        for status in ["pending", "in_progress", "completed"] {
++            state.record_plan(&plan(status, "ordinary update"));
++            assert_eq!(state.decide(None, true), Decision::Accept);
++        }
++        for _ in 0..5 {
++            state.clear_plan_progress();
++            state.record_plan(&plan("in_progress", "after other work"));
++            assert_eq!(state.decide(None, true), Decision::Accept);
++        }
++    }
++
+     #[test]
+     fn answer_completion_recovers_unphased_promise_then_accepts_answer() {
+         let mut state = State {
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -375,12 +375,17 @@
+                     needs_follow_up,
+                 ) {
+                     super::answer_completion::Decision::Continue => {
+-                        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent {
+-                            message: "YIJIE_ANSWER_CONTINUATION：当前只有过程说明，正在根据已有结果补全回答。".into(),
+-                        })).await;
++                        sess.send_event(
++                            &turn_context,
++                            EventMsg::Warning(WarningEvent {
++                                message: "YIJIE_ANSWER_CONTINUATION：正在根据已有结果补全回答。"
++                                    .into(),
++                            }),
++                        )
++                        .await;
+                         sess.record_conversation_items(
+                             &turn_context,
+-                            &[super::answer_completion::feedback()],
++                            &[super::answer_completion::feedback(&turn_context)],
+                         )
+                         .await;
+                         continue;
+diff --git a/core/src/tools/handlers/plan.rs b/core/src/tools/handlers/plan.rs
+--- a/core/src/tools/handlers/plan.rs
++++ b/core/src/tools/handlers/plan.rs
+@@ -89,8 +89,10 @@
+ 
+         let args = parse_update_plan_arguments(&arguments)?;
+         session
+-            .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))
++            .send_event(turn.as_ref(), EventMsg::PlanUpdate(args.clone()))
+             .await;
++
++        crate::session::answer_completion::observe_plan(turn.as_ref(), &args);
+ 
+         Ok(boxed_tool_output(PlanToolOutput))
+     }

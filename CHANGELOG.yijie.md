@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add the Owner-authorized execution-progress candidate: accepted unchanged native plans enter the existing bounded answer finalizer. Reuse native rollout accounting, token/context reminders and explicit Goal budgets. No Host accounting engine or second execution loop; fixed upstream and previous Runtime artifacts remain intact. See `docs/execution-progress.md` for scope and pending qualification.
+
 - Add the user-requested execution guard candidate: refuse local webpage fetching
   after retrieval and unchanged failed operations before tool execution, return
   Chinese reasons through existing warning/tool-result channels, retain local

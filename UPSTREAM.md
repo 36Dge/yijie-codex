@@ -80,6 +80,10 @@ FEAT-136 双 patch candidate 当前已通过：
 尚未完成 Contracts 新 immutable candidate、Host/Desktop 精确 repin 及 Runtime→Host→Desktop conformance。旧 Contracts commit `3c3000a6fbe2f08ab2131a463a1691e867d661b1` 仍记录此前 Runtime provenance；必须由新的 Contracts candidate 精确 repin 新 Runtime immutable commit 和已确认 Schema digest。Tool D4 保持 `BLOCKED/NOT RUN`。
 # FEAT-155 input-only candidate supplement
 
+## 2026-11-03 execution-progress local candidate
+
+Owner authorized implementation after the native-reuse audit. The upstream pin and canonical subtree remain unchanged. New `chat-models/0014-execution-progress.patch` observes accepted native plan updates and routes repeated unchanged plans through the existing bounded answer finalizer. Native `rollout_budget`, context compaction, token reminders and explicit Goal budgets are reused rather than reimplemented. The canonical build writes only the new `execution-progress-v1` artifact and retains earlier binaries. See [reuse matrix and lifecycle boundaries](docs/execution-progress.md); activation requires verified schema and exact consumer provenance.
+
 2026-09-19: the upstream pin and canonical `codex-rs/` subtree remain unchanged. The separately built input-only candidate applies the two active patches followed by `.yijie/patches/input-only/0003-input-only-execution.patch`. Its schema and binary live in dedicated candidate directories and must be projected through Contracts before Host activation. See [native restriction](docs/input-only-execution.md). Existing historical baseline statements below retain their original meaning.
 
 ## FEAT-156 Kimi compatibility candidate (2026-10-02)
