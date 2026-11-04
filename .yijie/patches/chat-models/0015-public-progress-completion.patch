@@ -1,0 +1,70 @@
+--- a/core/src/session/answer_completion.rs
++++ b/core/src/session/answer_completion.rs
+@@ -262,6 +262,12 @@
+                     "确认",
+                     "验证",
+                     "比较",
++                    "写一版",
++                    "写一份",
++                    "起草",
++                    "撰写",
++                    "draft",
++                    "write a",
+                     "对比",
+                     "继续",
+                     "稍等",
+@@ -442,4 +448,53 @@
+             Decision::Accept
+         );
+     }
+-}
++
++    #[test]
++    fn answer_completion_writing_preambles_require_deliverable() {
++        for preamble in [
++            "我会按 copywriting 技能直接写一版友好、简短的落地页文案，只使用你给出的合成事实。",
++            "我将写一份介绍。",
++            "我先起草这段文字。",
++            "我会撰写这份说明。",
++            "I will draft a short introduction.",
++            "I'll write a short introduction.",
++        ] {
++            let mut state = State::default();
++            assert_eq!(state.decide(Some(preamble), false), Decision::Continue);
++            assert!(state.finalizing);
++            assert_eq!(
++                state.decide(Some("收纳袋用于日常物品分类携带。"), false),
++                Decision::Accept
++            );
++        }
++    }
++
++    #[test]
++    fn answer_completion_writing_results_and_requested_form_stay_deliverable() {
++        for answer in [
++            "收纳袋用于日常物品分类携带。",
++            "我会起草。收纳袋用于日常物品分类携带。",
++            "成稿：轻松整理随身物品。",
++            "Here is a draft for the supplied product.",
++            "我会写一版，成稿如下：轻松整理随身物品。",
++        ] {
++            assert_eq!(
++                State::default().decide(Some(answer), false),
++                Decision::Accept
++            );
++        }
++        for request in [
++            "只给计划，不要开始撰写正文。",
++            "请只回复：我会起草这段文字。",
++        ] {
++            let mut state = State {
++                request: request.into(),
++                ..State::default()
++            };
++            assert_eq!(
++                state.decide(Some("我会起草这段文字。"), false),
++                Decision::Accept
++            );
++        }
++    }
++}

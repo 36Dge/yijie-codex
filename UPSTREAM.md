@@ -1,5 +1,11 @@
 # Upstream
 
+2026-11-04 public-progress-completion candidate appends only the Owner-approved
+`0015-public-progress-completion.patch` after 0014. It extends the existing bounded
+completion classifier for unphased writing preambles; native message/response/turn
+and `end_turn=false` continuation remain unchanged. The separate canonical build
+is `scripts/build-public-progress-completion.sh`; see `docs/public-progress-completion.md`.
+
 2026-11-01 execution guard candidate retains the fixed upstream and complete r5
 patch chain, then appends `0012-web-retrieval-execution-guard.patch`. It reuses the
 tool dispatcher and per-turn ExtensionData for pre-execution checks. The canonical
