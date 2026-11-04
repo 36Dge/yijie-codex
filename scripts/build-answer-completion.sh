@@ -17,6 +17,10 @@ elif [[ "$#" == 1 && "$1" == "--public-progress-completion" ]]; then
   artifact="$repo_root/.yijie/build/public-progress-completion-v1/aarch64-apple-darwin"
   prepare_script="prepare-public-progress-completion.py"
   manifest_script="write-public-progress-completion-runtime-manifest.py"
+elif [[ "$#" == 1 && "$1" == "--native-public-messages" ]]; then
+  artifact="$repo_root/.yijie/build/native-public-messages-v1/aarch64-apple-darwin"
+  prepare_script="prepare-native-public-messages.py"
+  manifest_script="write-native-public-messages-runtime-manifest.py"
 elif [[ "$#" != 0 ]]; then
   echo "Unsupported canonical build arguments" >&2
   exit 2
@@ -39,11 +43,15 @@ root = Path(sys.argv[1])
 names = list((root / ".yijie/patches").rglob("*.patch")) + [root / "scripts" / name for name in (
     "build-answer-completion.sh", "prepare-answer-completion.py", "write-answer-completion-runtime-manifest.py",
     "build-execution-progress.sh", "prepare-execution-progress.py", "write-execution-progress-runtime-manifest.py",
-    "build-public-progress-completion.sh", "prepare-public-progress-completion.py", "write-public-progress-completion-runtime-manifest.py")]
+    "build-public-progress-completion.sh", "prepare-public-progress-completion.py", "write-public-progress-completion-runtime-manifest.py",
+    "build-native-public-messages.sh", "prepare-native-public-messages.py", "write-native-public-messages-runtime-manifest.py")]
 record = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in names}
 (root / ".local/web-retrieval-guard/build-inputs.json").write_text(json.dumps(record))
 PY
 cargo test --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-core --lib answer_completion_ -- --test-threads=1
+if [[ "$prepare_script" == prepare-native-public-messages.py ]]; then
+  cargo test --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-core --lib public_messages_ -- --test-threads=1
+fi
 cargo clippy --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-core --lib --no-deps -- -D warnings
 cargo build --offline --locked --manifest-path "$workspace/Cargo.toml" --release --package codex-cli --bin codex --target aarch64-apple-darwin
 python3 "$repo_root/scripts/$prepare_script" --check

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add the Owner-approved 0016 native public-message candidate. Project an
+  explicit model-authored declaration through native Item/delta events while
+  retaining original Provider messages in model history. Reuse the same turn
+  loop, budget, cancellation and finalizer; very simple tasks may answer directly.
+  Also close the observed unphased "我按…来写" completion fallback gap. No native
+  phase/end_turn is fabricated in raw records. Qualification remains separate
+  from implementation; see `docs/native-public-messages.md`.
+
 - Extend the existing bounded answer finalizer for observed unphased writing
   preambles through the Owner-approved 0015 overlay. Preserve normal native
   continuation, tool/permission boundaries, two-recovery limit and history.

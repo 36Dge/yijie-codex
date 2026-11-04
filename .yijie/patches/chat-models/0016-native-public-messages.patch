@@ -1,0 +1,577 @@
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod answer_completion;
++pub(crate) mod public_messages;
+ 
+ use std::borrow::Cow;
+ use std::collections::BTreeMap;
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -2037,6 +2037,8 @@
+     let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
+     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
+     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
++    let mut public_message_stream =
++        super::public_messages::StreamAdapter::new(super::public_messages::enabled(&turn_context));
+     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+     let defer_streamed_turn_items_for_contributors =
+         !sess.services.extensions.turn_item_contributors().is_empty();
+@@ -2057,25 +2059,37 @@
+             codex.usage.total_tokens = field::Empty,
+         );
+ 
+-        let event = match stream
+-            .next()
+-            .instrument(trace_span!(parent: &handle_responses, "receiving"))
+-            .or_cancel(&cancellation_token)
+-            .await
+-        {
+-            Ok(event) => event,
+-            Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
+-        };
+-
+-        let event = match event {
+-            Some(Ok(event)) => event,
+-            Some(Err(err)) => break Err(err),
+-            None => {
+-                break Err(CodexErr::Stream(
+-                    "stream closed before response.completed".into(),
+-                    None,
+-                ));
+-            }
++        if cancellation_token.is_cancelled() {
++            break Err(CodexErr::TurnAborted);
++        }
++        let event = if let Some(event) = public_message_stream.pop() {
++            event
++        } else {
++            let event = match stream
++                .next()
++                .instrument(trace_span!(parent: &handle_responses, "receiving"))
++                .or_cancel(&cancellation_token)
++                .await
++            {
++                Ok(event) => event,
++                Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
++            };
++
++            let event = match event {
++                Some(Ok(event)) => event,
++                Some(Err(err)) => break Err(err),
++                None => {
++                    break Err(CodexErr::Stream(
++                        "stream closed before response.completed".into(),
++                        None,
++                    ));
++                }
++            };
++            public_message_stream.push(event);
++            let Some(event) = public_message_stream.pop() else {
++                continue;
++            };
++            event
+         };
+ 
+         if turn_context.config.input_only && !input_only_response_event_allowed(&event) {
+@@ -2348,6 +2362,13 @@
+                 if let Some(false) = end_turn {
+                     needs_follow_up = true;
+                 }
++                if !super::answer_completion::finalizing(&turn_context)
++                    && public_message_stream.requests_continuation(end_turn)
++                {
++                    // This is a model-declared continuation in the SAME native
++                    // turn, not a forged provider end_turn or recovery schedule.
++                    needs_follow_up = true;
++                }
+                 break Ok(SamplingRequestResult {
+                     needs_follow_up,
+                     last_agent_message,
+--- a/core/src/session/answer_completion.rs
++++ b/core/src/session/answer_completion.rs
+@@ -72,8 +72,8 @@
+                     ..State::default()
+                 };
+             }
+-            ResponseItem::Message { role, phase, .. } if role == "assistant" => {
+-                state.phase = phase.clone()
++            ResponseItem::Message { role, .. } if role == "assistant" => {
++                state.phase = super::public_messages::effective_phase(turn, item)
+             }
+             ResponseItem::ImageGenerationCall { status, result, .. }
+                 if status == "completed" && !result.is_empty() =>
+@@ -249,7 +249,13 @@
+             ]
+             .iter()
+             .any(|p| s.starts_with(p));
+-            prefix
++            // Observed unphased writing previews begin with "我按…来写".
++            // Require that whole first clause, not any occurrence of "我按".
++            let writing_preview = s.starts_with("我按")
++                && s.split(['，', ','])
++                    .next()
++                    .is_some_and(|lead| lead.ends_with("来写"));
++            (prefix || writing_preview)
+                 && [
+                     "查",
+                     "搜",
+@@ -264,6 +270,7 @@
+                     "比较",
+                     "写一版",
+                     "写一份",
++                    "来写",
+                     "起草",
+                     "撰写",
+                     "draft",
+@@ -497,4 +504,27 @@
+             );
+         }
+     }
+-}
++
++    #[test]
++    fn answer_completion_observed_outline_writing_preview_is_bounded() {
++        for preview in [
++            "我按\"历史—产业—生活\"三条线来写，并让山水意象贯穿其中，避免把杭州写成标签的罗列。",
++            "我按\"区别 → 各自适用场景 → 两者如何组合\"三段来写，重点落在可执行的组合办法上，避免停留在概念对比。",
++        ] {
++            let mut state = State::default();
++            assert_eq!(state.decide(Some(preview), false), Decision::Continue);
++            assert_eq!(state.decide(Some(preview), false), Decision::Continue);
++            assert_eq!(state.decide(Some(preview), false), Decision::Failed);
++        }
++        for result in [
++            "我按时完成了说明。",
++            "我按照要求来写，成稿如下：同步协作适合及时协调。",
++            "我按三个方面来写。同步协作适合及时协调。",
++        ] {
++            assert_eq!(
++                State::default().decide(Some(result), false),
++                Decision::Accept
++            );
++        }
++    }
++}
+--- a/core/src/stream_events_utils.rs
++++ b/core/src/stream_events_utils.rs
+@@ -357,10 +357,14 @@
+         }
+         // No tool call: convert messages/reasoning into turn items and mark them as complete.
+         Ok(None) => {
++            // Keep the provider Item untouched for native history and the next
++            // request. Normalize only its public AgentMessage projection.
++            let public_item =
++                crate::session::public_messages::project_for_turn(ctx.turn_context.as_ref(), &item);
+             let finalized_turn_item = finalize_non_tool_response_item(
+                 ctx.sess.as_ref(),
+                 TurnItemContributorPolicy::Run(ctx.turn_store.as_ref()),
+-                &item,
++                &public_item,
+                 plan_mode,
+             )
+             .await;
+--- /dev/null
++++ b/core/src/session/public_messages.rs
+@@ -0,0 +1,401 @@
++//! Model-declared public message projection for explicitly opted-in providers.
++//! The original ResponseItem is always recorded and returned to the model.
++//! Only the public Item/delta projection consumes the transport declaration.
++//! This adapter supplies an explicit continuation fact to the existing turn
++//! loop; it owns no requests, tools, timers, budgets or recovery loop.
++use std::collections::VecDeque;
++
++use codex_protocol::config_types::ModeKind;
++use codex_protocol::models::{ContentItem, MessagePhase, ResponseItem};
++
++use super::turn_context::TurnContext;
++use crate::client_common::ResponseEvent;
++
++pub(crate) const MARKER: &str = "[yijie-public-message-v1]";
++const PREFIX: &str = "[[yijie.public-message.v1:";
++const COMMENTARY: &str = "[[yijie.public-message.v1:commentary]]";
++const FINAL: &str = "[[yijie.public-message.v1:final_answer]]";
++const MAX_HEADER_BYTES: usize = 128;
++
++pub(crate) fn enabled(turn: &TurnContext) -> bool {
++    !turn.config.input_only
++        && turn.final_output_json_schema.is_none()
++        && turn.collaboration_mode.mode == ModeKind::Default
++        && matches!(
++            turn.model_info.slug.as_str(),
++            "kimi-k3.1-pro" | "MiniMax-M3"
++        )
++        && turn
++            .developer_instructions
++            .as_deref()
++            .is_some_and(|text| text.contains(MARKER))
++}
++
++enum PrefixResult<'a> {
++    Pending,
++    Plain(&'a str),
++    Envelope {
++        phase: Option<MessagePhase>,
++        body: &'a str,
++    },
++}
++
++fn prefix(text: &str, finished: bool) -> PrefixResult<'_> {
++    if text.starts_with(PREFIX) {
++        let (line, body) = match text.split_once('\n') {
++            Some((line, body)) => (line.trim_end_matches('\r'), body),
++            None if !finished && text.len() <= MAX_HEADER_BYTES => return PrefixResult::Pending,
++            None => (text, ""),
++        };
++        // Do not retain an unbounded tentative header, or strip arbitrary prose.
++        if line.len() > MAX_HEADER_BYTES {
++            return PrefixResult::Plain(text);
++        }
++        let phase = match line {
++            COMMENTARY => Some(MessagePhase::Commentary),
++            FINAL => Some(MessagePhase::FinalAnswer),
++            _ => None,
++        };
++        // A malformed declaration in our exact namespace has no authority to
++        // continue. Preserve its body as unclassified; an empty body reaches
++        // the existing bounded answer-only finalizer, never a fake success.
++        return PrefixResult::Envelope { phase, body };
++    }
++    if !finished && PREFIX.starts_with(text) {
++        return PrefixResult::Pending;
++    }
++    PrefixResult::Plain(text)
++}
++
++fn assistant_text(item: &ResponseItem) -> Option<String> {
++    let ResponseItem::Message { role, content, .. } = item else {
++        return None;
++    };
++    if role != "assistant"
++        || content
++            .iter()
++            .any(|part| !matches!(part, ContentItem::OutputText { .. }))
++    {
++        return None;
++    }
++    Some(
++        content
++            .iter()
++            .filter_map(|part| match part {
++                ContentItem::OutputText { text } => Some(text.as_str()),
++                _ => None,
++            })
++            .collect(),
++    )
++}
++
++fn with_public_text(
++    original: &ResponseItem,
++    declared: Option<MessagePhase>,
++    text: &str,
++) -> ResponseItem {
++    let mut projected = original.clone();
++    if let ResponseItem::Message { phase, content, .. } = &mut projected {
++        // An actual provider phase takes precedence. Never change the raw Item.
++        if phase.is_none() {
++            *phase = declared;
++        }
++        *content = vec![ContentItem::OutputText { text: text.into() }];
++    }
++    projected
++}
++
++pub(crate) fn project_item(is_enabled: bool, original: &ResponseItem) -> ResponseItem {
++    if is_enabled
++        && let Some(text) = assistant_text(original)
++        && let PrefixResult::Envelope { phase, body } = prefix(&text, true)
++    {
++        return with_public_text(original, phase, body);
++    }
++    original.clone()
++}
++
++pub(crate) fn project_for_turn(turn: &TurnContext, original: &ResponseItem) -> ResponseItem {
++    project_item(enabled(turn), original)
++}
++
++pub(crate) fn effective_phase(turn: &TurnContext, original: &ResponseItem) -> Option<MessagePhase> {
++    match project_for_turn(turn, original) {
++        ResponseItem::Message { phase, .. } => phase,
++        _ => None,
++    }
++}
++
++struct PendingMessage {
++    added: ResponseItem,
++    prefix: String,
++}
++
++/// A bounded projection of the existing event stream, not an execution loop.
++pub(crate) struct StreamAdapter {
++    enabled: bool,
++    pending: Option<PendingMessage>,
++    ready: VecDeque<ResponseEvent>,
++    last_declared_commentary: bool,
++}
++
++impl StreamAdapter {
++    pub(crate) fn new(enabled: bool) -> Self {
++        Self {
++            enabled,
++            pending: None,
++            ready: VecDeque::new(),
++            last_declared_commentary: false,
++        }
++    }
++
++    pub(crate) fn pop(&mut self) -> Option<ResponseEvent> {
++        self.ready.pop_front()
++    }
++
++    pub(crate) fn requests_continuation(&self, end_turn: Option<bool>) -> bool {
++        self.enabled && end_turn.is_none() && self.last_declared_commentary
++    }
++
++    fn flush_prefix(&mut self, finished: bool) {
++        let Some(pending) = self.pending.as_ref() else {
++            return;
++        };
++        let (phase, body) = match prefix(&pending.prefix, finished) {
++            PrefixResult::Pending => return,
++            PrefixResult::Plain(text) => (None, text.to_owned()),
++            PrefixResult::Envelope { phase, body } => (phase, body.to_owned()),
++        };
++        let Some(pending) = self.pending.take() else {
++            return;
++        };
++        // Start once the header is known. All visible text continues through the
++        // pre-existing assistant text parser and native delta notification.
++        self.ready
++            .push_back(ResponseEvent::OutputItemAdded(with_public_text(
++                &pending.added,
++                phase,
++                "",
++            )));
++        if !body.is_empty() {
++            self.ready.push_back(ResponseEvent::OutputTextDelta(body));
++        }
++    }
++
++    pub(crate) fn push(&mut self, event: ResponseEvent) {
++        if !self.enabled {
++            self.ready.push_back(event);
++            return;
++        }
++        match event {
++            ResponseEvent::OutputItemAdded(item) => {
++                self.flush_prefix(true);
++                if let Some(text) = assistant_text(&item) {
++                    self.pending = Some(PendingMessage {
++                        added: item,
++                        prefix: text,
++                    });
++                    self.flush_prefix(false);
++                } else {
++                    self.ready.push_back(ResponseEvent::OutputItemAdded(item));
++                }
++            }
++            ResponseEvent::OutputTextDelta(delta) => {
++                if let Some(pending) = self.pending.as_mut() {
++                    pending.prefix.push_str(&delta);
++                    self.flush_prefix(false);
++                } else {
++                    self.ready.push_back(ResponseEvent::OutputTextDelta(delta));
++                }
++            }
++            ResponseEvent::OutputItemDone(item) => {
++                if let Some(text) = assistant_text(&item) {
++                    if let Some(pending) = self.pending.as_mut() {
++                        // Some ordinary streams deliver their text only in done.
++                        pending.prefix = text.clone();
++                    }
++                    self.last_declared_commentary = matches!(
++                        (&item, prefix(&text, true)),
++                        (
++                            ResponseItem::Message { phase: None, .. },
++                            PrefixResult::Envelope {
++                                phase: Some(MessagePhase::Commentary),
++                                body,
++                            }
++                        ) if !body.trim().is_empty()
++                    );
++                }
++                self.flush_prefix(true);
++                // IMPORTANT: done stays raw for native history and next input.
++                // Only handle_output_item_done's public projection is normalized.
++                self.ready.push_back(ResponseEvent::OutputItemDone(item));
++            }
++            event @ ResponseEvent::Completed { .. } => {
++                self.flush_prefix(true);
++                self.ready.push_back(event);
++            }
++            other => self.ready.push_back(other),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
++        ResponseItem::Message {
++            id: Some("actual-provider-item".into()),
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText { text: text.into() }],
++            phase,
++            internal_chat_message_metadata_passthrough: None,
++        }
++    }
++
++    fn collect(adapter: &mut StreamAdapter) -> (Vec<ResponseItem>, String, Vec<ResponseItem>) {
++        let mut starts = Vec::new();
++        let mut deltas = String::new();
++        let mut ends = Vec::new();
++        while let Some(event) = adapter.pop() {
++            match event {
++                ResponseEvent::OutputItemAdded(item) => starts.push(item),
++                ResponseEvent::OutputTextDelta(delta) => deltas.push_str(&delta),
++                ResponseEvent::OutputItemDone(item) => ends.push(item),
++                _ => {}
++            }
++        }
++        (starts, deltas, ends)
++    }
++
++    #[test]
++    fn public_messages_stream_every_utf8_boundary_and_preserve_raw_done() {
++        for (header, expected) in [
++            (COMMENTARY, MessagePhase::Commentary),
++            (FINAL, MessagePhase::FinalAnswer),
++        ] {
++            let raw = format!(
++                "{header}\n已区分短期体验与长期生活。\n\n下一段仍属于同一个消息。后文 {FINAL} 保持字面内容。"
++            );
++            let original = message(&raw, None);
++            for index in 0..=raw.len() {
++                if !raw.is_char_boundary(index) {
++                    continue;
++                }
++                let mut adapter = StreamAdapter::new(true);
++                adapter.push(ResponseEvent::OutputItemAdded(message("", None)));
++                adapter.push(ResponseEvent::OutputTextDelta(raw[..index].into()));
++                adapter.push(ResponseEvent::OutputTextDelta(raw[index..].into()));
++                let (starts, visible, ends) = collect(&mut adapter);
++                assert_eq!(starts.len(), 1);
++                assert!(ends.is_empty());
++                assert_eq!(visible, raw.split_once('\n').unwrap().1);
++                assert!(
++                    matches!(&starts[0], ResponseItem::Message { id: Some(id), phase: Some(p), .. } if id == "actual-provider-item" && p == &expected)
++                );
++                adapter.push(ResponseEvent::OutputItemDone(original.clone()));
++                let (extra_starts, extra_text, ends) = collect(&mut adapter);
++                assert!(extra_starts.is_empty());
++                assert!(extra_text.is_empty());
++                assert_eq!(
++                    serde_json::to_value(&ends[0]).unwrap(),
++                    serde_json::to_value(&original).unwrap()
++                );
++                let projected = project_item(true, &original);
++                assert_eq!(assistant_text(&projected).unwrap(), visible);
++                assert_eq!(
++                    adapter.requests_continuation(None),
++                    expected == MessagePhase::Commentary
++                );
++                assert!(!adapter.requests_continuation(Some(true)));
++                assert!(!adapter.requests_continuation(Some(false)));
++            }
++        }
++    }
++
++    #[test]
++    fn public_messages_seed_and_done_only_use_the_same_projection() {
++        let text = format!("{COMMENTARY}\r\n这次已确定比较范围。");
++        for seed in ["", text.as_str()] {
++            let mut adapter = StreamAdapter::new(true);
++            adapter.push(ResponseEvent::OutputItemAdded(message(seed, None)));
++            adapter.push(ResponseEvent::OutputItemDone(message(&text, None)));
++            let (starts, body, ends) = collect(&mut adapter);
++            assert_eq!(starts.len(), 1);
++            assert_eq!(body, "这次已确定比较范围。");
++            assert_eq!(ends.len(), 1);
++            assert!(adapter.requests_continuation(None));
++        }
++    }
++
++    #[test]
++    fn public_messages_plain_unknown_and_empty_do_not_request_progress() {
++        for (raw, body) in [
++            ("普通直接回答。", "普通直接回答。"),
++            (
++                "[[yijie.public-message.v1:unknown]]\n保留已有答案。",
++                "保留已有答案。",
++            ),
++            (COMMENTARY, ""),
++            ("[[yijie.public-message.v1:comm", ""),
++        ] {
++            let original = message(raw, None);
++            let mut adapter = StreamAdapter::new(true);
++            adapter.push(ResponseEvent::OutputItemAdded(message("", None)));
++            adapter.push(ResponseEvent::OutputTextDelta(raw.into()));
++            adapter.push(ResponseEvent::OutputItemDone(original.clone()));
++            let (_, visible, _) = collect(&mut adapter);
++            assert_eq!(visible, body);
++            assert_eq!(
++                assistant_text(&project_item(true, &original)).unwrap(),
++                body
++            );
++            assert!(!adapter.requests_continuation(None));
++        }
++    }
++
++    #[test]
++    fn public_messages_final_or_unclassified_last_message_clears_continuation() {
++        for last in [
++            format!("{FINAL}\n完整结果。"),
++            "未标阶段的完整结果。".into(),
++        ] {
++            let mut adapter = StreamAdapter::new(true);
++            adapter.push(ResponseEvent::OutputItemDone(message(
++                &format!("{COMMENTARY}\n已明确范围。"),
++                None,
++            )));
++            assert!(adapter.requests_continuation(None));
++            adapter.push(ResponseEvent::OutputItemDone(message(&last, None)));
++            assert!(!adapter.requests_continuation(None));
++        }
++    }
++
++    #[test]
++    fn public_messages_native_phase_and_opt_out_keep_their_authority() {
++        let original = message(
++            &format!("{COMMENTARY}\n实际正文。"),
++            Some(MessagePhase::FinalAnswer),
++        );
++        let projected = project_item(true, &original);
++        assert!(matches!(
++            projected,
++            ResponseItem::Message {
++                phase: Some(MessagePhase::FinalAnswer),
++                ..
++            }
++        ));
++        let mut adapter = StreamAdapter::new(true);
++        adapter.push(ResponseEvent::OutputItemDone(original.clone()));
++        assert!(!adapter.requests_continuation(None));
++        assert_eq!(
++            serde_json::to_value(project_item(false, &original)).unwrap(),
++            serde_json::to_value(&original).unwrap()
++        );
++        let mut disabled = StreamAdapter::new(false);
++        disabled.push(ResponseEvent::OutputTextDelta(COMMENTARY.into()));
++        assert!(
++            matches!(disabled.pop(), Some(ResponseEvent::OutputTextDelta(text)) if text == COMMENTARY)
++        );
++    }
++}

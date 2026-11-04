@@ -1,5 +1,13 @@
 # Upstream
 
+2026-11-05 native-public-messages candidate appends the Owner-approved 0016
+after 0015. A model-authored, bounded first-line declaration can supply public
+message phase and same-turn continuation to the existing native loop. Raw
+Provider Items and native phase/end_turn facts are retained; no Host loop,
+permissions change, external hook activation or data migration is introduced.
+See `docs/native-public-messages.md`; canonical entry is
+`scripts/build-native-public-messages.sh`, with a separate retained artifact.
+
 2026-11-04 public-progress-completion candidate appends only the Owner-approved
 `0015-public-progress-completion.patch` after 0014. It extends the existing bounded
 completion classifier for unphased writing preambles; native message/response/turn
