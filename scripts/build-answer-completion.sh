@@ -21,6 +21,10 @@ elif [[ "$#" == 1 && "$1" == "--native-public-messages" ]]; then
   artifact="$repo_root/.yijie/build/native-public-messages-v1/aarch64-apple-darwin"
   prepare_script="prepare-native-public-messages.py"
   manifest_script="write-native-public-messages-runtime-manifest.py"
+elif [[ "$#" == 1 && "$1" == "--native-public-messages-r2" ]]; then
+  artifact="$repo_root/.yijie/build/native-public-messages-r2/aarch64-apple-darwin"
+  prepare_script="prepare-native-public-messages-r2.py"
+  manifest_script="write-native-public-messages-r2-runtime-manifest.py"
 elif [[ "$#" != 0 ]]; then
   echo "Unsupported canonical build arguments" >&2
   exit 2
@@ -44,13 +48,18 @@ names = list((root / ".yijie/patches").rglob("*.patch")) + [root / "scripts" / n
     "build-answer-completion.sh", "prepare-answer-completion.py", "write-answer-completion-runtime-manifest.py",
     "build-execution-progress.sh", "prepare-execution-progress.py", "write-execution-progress-runtime-manifest.py",
     "build-public-progress-completion.sh", "prepare-public-progress-completion.py", "write-public-progress-completion-runtime-manifest.py",
-    "build-native-public-messages.sh", "prepare-native-public-messages.py", "write-native-public-messages-runtime-manifest.py")]
+    "build-native-public-messages.sh", "prepare-native-public-messages.py", "write-native-public-messages-runtime-manifest.py",
+    "build-native-public-messages-r2.sh", "prepare-native-public-messages-r2.py", "write-native-public-messages-r2-runtime-manifest.py")]
 record = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in names}
 (root / ".local/web-retrieval-guard/build-inputs.json").write_text(json.dumps(record))
 PY
 cargo test --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-core --lib answer_completion_ -- --test-threads=1
-if [[ "$prepare_script" == prepare-native-public-messages.py ]]; then
+if [[ "$prepare_script" == prepare-native-public-messages.py || "$prepare_script" == prepare-native-public-messages-r2.py ]]; then
   cargo test --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-core --lib public_messages_ -- --test-threads=1
+fi
+if [[ "$prepare_script" == prepare-native-public-messages-r2.py ]]; then
+  cargo test --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-utils-stream-parser
+  cargo clippy --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-utils-stream-parser --lib --no-deps -- -D warnings
 fi
 cargo clippy --offline --locked --manifest-path "$workspace/Cargo.toml" --package codex-core --lib --no-deps -- -D warnings
 cargo build --offline --locked --manifest-path "$workspace/Cargo.toml" --release --package codex-cli --bin codex --target aarch64-apple-darwin

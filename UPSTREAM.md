@@ -1,5 +1,13 @@
 # Upstream
 
+2026-11-05 native-public-messages r2 appends 0017 after the retained 0016 candidate.
+It validates the existing one-declaration-per-Item contract after a real provider
+returned a scripted opening/final transcript inside one Item. Reuse the native
+tagged-line parser for bounded streaming cleanup; keep raw Items, quoted/code
+examples and native phase authority. Multiple unquoted declarations cannot drive
+normal continuation. Canonical entry: `scripts/build-native-public-messages-r2.sh`.
+See `docs/native-public-messages-r2.md`; no new wire shape, loop or permissions.
+
 2026-11-05 native-public-messages candidate appends the Owner-approved 0016
 after 0015. A model-authored, bounded first-line declaration can supply public
 message phase and same-turn continuation to the existing native loop. Raw

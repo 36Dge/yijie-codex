@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Validate public-message declarations through the 0017 r2 overlay: one actual
+  Item remains one public Item; additional unquoted control lines are removed
+  from its public stream, ambiguous declared phase becomes unknown at completion,
+  and it cannot request normal continuation. Raw provider data and quoted/code
+  examples remain intact. Reuse the existing tagged-line parser and native
+  snapshot replacement. See `docs/native-public-messages-r2.md`.
+
 - Add the Owner-approved 0016 native public-message candidate. Project an
   explicit model-authored declaration through native Item/delta events while
   retaining original Provider messages in model history. Reuse the same turn

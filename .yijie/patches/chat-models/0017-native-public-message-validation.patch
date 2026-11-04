@@ -1,0 +1,539 @@
+--- a/core/src/session/public_messages.rs
++++ b/core/src/session/public_messages.rs
+@@ -7,6 +7,7 @@
+ 
+ use codex_protocol::config_types::ModeKind;
+ use codex_protocol::models::{ContentItem, MessagePhase, ResponseItem};
++use codex_utils_stream_parser::{StandaloneMarkerParser, StreamTextParser};
+ 
+ use super::turn_context::TurnContext;
+ use crate::client_common::ResponseEvent;
+@@ -105,12 +106,25 @@
+     projected
+ }
+ 
++fn body_projection(body: &str) -> (String, bool) {
++    let mut parser = StandaloneMarkerParser::new(&[COMMENTARY, FINAL]);
++    let mut parsed = parser.push_str(body);
++    let tail = parser.finish();
++    parsed.visible_text.push_str(&tail.visible_text);
++    let conflicting = !parsed.extracted.is_empty() || !tail.extracted.is_empty();
++    (parsed.visible_text, conflicting)
++}
++
+ pub(crate) fn project_item(is_enabled: bool, original: &ResponseItem) -> ResponseItem {
+     if is_enabled
+         && let Some(text) = assistant_text(original)
+         && let PrefixResult::Envelope { phase, body } = prefix(&text, true)
+     {
+-        return with_public_text(original, phase, body);
++        let (visible, conflicting) = body_projection(body);
++        // Multiple unquoted declarations in one actual Item are not multiple
++        // messages and cannot establish one reliable declared phase. A real
++        // provider phase, if any, still retains its independent authority.
++        return with_public_text(original, if conflicting { None } else { phase }, &visible);
+     }
+     original.clone()
+ }
+@@ -137,6 +151,7 @@
+     pending: Option<PendingMessage>,
+     ready: VecDeque<ResponseEvent>,
+     last_declared_commentary: bool,
++    body_parser: Option<StandaloneMarkerParser>,
+ }
+ 
+ impl StreamAdapter {
+@@ -146,6 +161,7 @@
+             pending: None,
+             ready: VecDeque::new(),
+             last_declared_commentary: false,
++            body_parser: None,
+         }
+     }
+ 
+@@ -161,11 +177,12 @@
+         let Some(pending) = self.pending.as_ref() else {
+             return;
+         };
+-        let (phase, body) = match prefix(&pending.prefix, finished) {
++        let (phase, body, framed) = match prefix(&pending.prefix, finished) {
+             PrefixResult::Pending => return,
+-            PrefixResult::Plain(text) => (None, text.to_owned()),
+-            PrefixResult::Envelope { phase, body } => (phase, body.to_owned()),
++            PrefixResult::Plain(text) => (None, text.to_owned(), false),
++            PrefixResult::Envelope { phase, body } => (phase, body.to_owned(), true),
+         };
++        self.body_parser = framed.then(|| StandaloneMarkerParser::new(&[COMMENTARY, FINAL]));
+         let Some(pending) = self.pending.take() else {
+             return;
+         };
+@@ -177,8 +194,25 @@
+                 phase,
+                 "",
+             )));
+-        if !body.is_empty() {
+-            self.ready.push_back(ResponseEvent::OutputTextDelta(body));
++        self.push_body(body);
++    }
++
++    fn push_body(&mut self, text: String) {
++        let text = self.body_parser.as_mut().map_or_else(
++            || text.clone(),
++            |parser| parser.push_str(&text).visible_text,
++        );
++        if !text.is_empty() {
++            self.ready.push_back(ResponseEvent::OutputTextDelta(text));
++        }
++    }
++
++    fn finish_body(&mut self) {
++        if let Some(mut parser) = self.body_parser.take() {
++            let tail = parser.finish().visible_text;
++            if !tail.is_empty() {
++                self.ready.push_back(ResponseEvent::OutputTextDelta(tail));
++            }
+         }
+     }
+ 
+@@ -190,6 +224,7 @@
+         match event {
+             ResponseEvent::OutputItemAdded(item) => {
+                 self.flush_prefix(true);
++                self.finish_body();
+                 if let Some(text) = assistant_text(&item) {
+                     self.pending = Some(PendingMessage {
+                         added: item,
+@@ -205,7 +240,7 @@
+                     pending.prefix.push_str(&delta);
+                     self.flush_prefix(false);
+                 } else {
+-                    self.ready.push_back(ResponseEvent::OutputTextDelta(delta));
++                    self.push_body(delta);
+                 }
+             }
+             ResponseEvent::OutputItemDone(item) => {
+@@ -222,16 +257,18 @@
+                                 phase: Some(MessagePhase::Commentary),
+                                 body,
+                             }
+-                        ) if !body.trim().is_empty()
++                        ) if !body.trim().is_empty() && !body_projection(body).1
+                     );
+                 }
+                 self.flush_prefix(true);
++                self.finish_body();
+                 // IMPORTANT: done stays raw for native history and next input.
+                 // Only handle_output_item_done's public projection is normalized.
+                 self.ready.push_back(ResponseEvent::OutputItemDone(item));
+             }
+             event @ ResponseEvent::Completed { .. } => {
+                 self.flush_prefix(true);
++                self.finish_body();
+                 self.ready.push_back(event);
+             }
+             other => self.ready.push_back(other),
+@@ -398,4 +435,77 @@
+             matches!(disabled.pop(), Some(ResponseEvent::OutputTextDelta(text)) if text == COMMENTARY)
+         );
+     }
+-}
++
++    #[test]
++    fn public_messages_mixed_declarations_are_one_unclassified_item_without_continuation() {
++        let raw = format!(
++            "{COMMENTARY}\n我会按两个角度说明。\n\n{FINAL}\n结果：这是一份完整且可读的说明。"
++        );
++        let visible = "我会按两个角度说明。\n\n结果：这是一份完整且可读的说明。";
++        let original = message(&raw, None);
++        for index in 0..=raw.len() {
++            if !raw.is_char_boundary(index) {
++                continue;
++            }
++            let mut adapter = StreamAdapter::new(true);
++            adapter.push(ResponseEvent::OutputItemAdded(message("", None)));
++            adapter.push(ResponseEvent::OutputTextDelta(raw[..index].into()));
++            adapter.push(ResponseEvent::OutputTextDelta(raw[index..].into()));
++            adapter.push(ResponseEvent::OutputItemDone(original.clone()));
++            let (starts, text, ends) = collect(&mut adapter);
++            assert_eq!(starts.len(), 1);
++            assert_eq!(ends.len(), 1);
++            assert_eq!(text, visible);
++            assert!(!adapter.requests_continuation(None));
++            assert_eq!(
++                serde_json::to_value(&ends[0]).unwrap(),
++                serde_json::to_value(&original).unwrap()
++            );
++            let projected = project_item(true, &original);
++            assert!(matches!(
++                &projected,
++                ResponseItem::Message { phase: None, .. }
++            ));
++            assert_eq!(assistant_text(&projected).unwrap(), visible);
++        }
++    }
++
++    #[test]
++    fn public_messages_quoted_declarations_remain_literal_and_native_phase_still_wins() {
++        let body = format!(
++            "此处是代码示例。\n```text\n{FINAL}\n```\n> {COMMENTARY}\n    {FINAL}\ninline {FINAL} example"
++        );
++        let raw = format!("{COMMENTARY}\n{body}");
++        let original = message(&raw, None);
++        let mut adapter = StreamAdapter::new(true);
++        adapter.push(ResponseEvent::OutputItemAdded(message("", None)));
++        for ch in raw.chars() {
++            adapter.push(ResponseEvent::OutputTextDelta(ch.to_string()));
++        }
++        adapter.push(ResponseEvent::OutputItemDone(original.clone()));
++        let (_, visible, _) = collect(&mut adapter);
++        assert_eq!(visible, body);
++        assert!(adapter.requests_continuation(None));
++        let projected = project_item(true, &original);
++        assert_eq!(assistant_text(&projected).unwrap(), body);
++        assert!(matches!(
++            projected,
++            ResponseItem::Message {
++                phase: Some(MessagePhase::Commentary),
++                ..
++            }
++        ));
++
++        let conflicting = message(
++            &format!("{COMMENTARY}\n说明。\n{FINAL}\n正文。"),
++            Some(MessagePhase::FinalAnswer),
++        );
++        assert!(matches!(
++            project_item(true, &conflicting),
++            ResponseItem::Message {
++                phase: Some(MessagePhase::FinalAnswer),
++                ..
++            }
++        ));
++    }
++}
+--- a/utils/stream-parser/src/tagged_line_parser.rs
++++ b/utils/stream-parser/src/tagged_line_parser.rs
+@@ -28,6 +28,55 @@
+     active_tag: Option<T>,
+     detect_tag: bool,
+     line_buffer: String,
++    standalone: bool,
++    fence: Option<(char, usize)>,
++    fence_line: FenceLine,
++}
++
++/// A bounded, allocation-free fence observation. Only standalone marker mode
++/// uses it; the established tag-block parser retains its original behavior.
++#[derive(Debug, Default)]
++struct FenceLine {
++    indent: usize,
++    marker: Option<char>,
++    run: usize,
++    in_run: bool,
++    invalid: bool,
++    clean_tail: bool,
++    valid_open: bool,
++}
++
++impl FenceLine {
++    fn push(&mut self, ch: char) {
++        if ch == '\n' {
++            return;
++        }
++        if self.invalid {
++            return;
++        }
++        if self.marker.is_none() {
++            if ch == ' ' {
++                self.indent += 1;
++                self.invalid = self.indent >= 4;
++            } else if ch == '`' || ch == '~' {
++                self.marker = Some(ch);
++                self.run = 1;
++                self.in_run = true;
++                self.clean_tail = true;
++                self.valid_open = true;
++            } else {
++                self.invalid = true;
++            }
++        } else if self.in_run && self.marker == Some(ch) {
++            self.run = self.run.saturating_add(1);
++        } else {
++            self.in_run = false;
++            self.clean_tail &= ch.is_whitespace();
++            if self.marker == Some('`') && ch == '`' {
++                self.valid_open = false;
++            }
++        }
++    }
+ }
+ 
+ impl<T> TaggedLineParser<T>
+@@ -40,6 +89,37 @@
+             active_tag: None,
+             detect_tag: true,
+             line_buffer: String::new(),
++            standalone: false,
++            fence: None,
++            fence_line: FenceLine::default(),
++        }
++    }
++
++    pub(crate) fn new_standalone(specs: Vec<TagSpec<T>>) -> Self {
++        Self {
++            standalone: true,
++            ..Self::new(specs)
++        }
++    }
++
++    fn finish_fence_line(&mut self) {
++        if !self.standalone {
++            return;
++        }
++        let line = std::mem::take(&mut self.fence_line);
++        if line.invalid || line.run < 3 {
++            return;
++        }
++        if let Some(marker) = line.marker {
++            match self.fence {
++                None if line.valid_open => self.fence = Some((marker, line.run)),
++                Some((current, count))
++                    if marker == current && line.run >= count && line.clean_tail =>
++                {
++                    self.fence = None
++                }
++                _ => {}
++            }
+         }
+     }
+ 
+@@ -48,6 +128,12 @@
+         let mut run = String::new();
+ 
+         for ch in delta.chars() {
++            if self.standalone {
++                self.fence_line.push(ch);
++                if self.fence.is_some() {
++                    self.detect_tag = false;
++                }
++            }
+             if self.detect_tag {
+                 if !run.is_empty() {
+                     self.push_text(std::mem::take(&mut run), &mut segments);
+@@ -55,10 +141,19 @@
+                 self.line_buffer.push(ch);
+                 if ch == '\n' {
+                     self.finish_line(&mut segments);
++                    self.finish_fence_line();
+                     continue;
+                 }
+-                let slug = self.line_buffer.trim_start();
+-                if slug.is_empty() || self.is_tag_prefix(slug) {
++                let slug = if self.standalone {
++                    self.line_buffer.trim_start_matches(' ')
++                } else {
++                    self.line_buffer.trim_start()
++                };
++                let quoted_indent = self.standalone
++                    && (self.line_buffer.starts_with("    ")
++                        || self.line_buffer.trim_start_matches(' ').starts_with('\t'));
++                let bounded = !self.standalone || self.line_buffer.len() <= 128;
++                if !quoted_indent && bounded && (slug.is_empty() || self.is_tag_prefix(slug)) {
+                     continue;
+                 }
+                 let buffered = std::mem::take(&mut self.line_buffer);
+@@ -71,6 +166,7 @@
+             if ch == '\n' {
+                 self.push_text(std::mem::take(&mut run), &mut segments);
+                 self.detect_tag = true;
++                self.finish_fence_line();
+             }
+         }
+ 
+@@ -86,9 +182,20 @@
+         if !self.line_buffer.is_empty() {
+             let buffered = std::mem::take(&mut self.line_buffer);
+             let without_newline = buffered.strip_suffix('\n').unwrap_or(&buffered);
+-            let slug = without_newline.trim_start().trim_end();
+-
+-            if let Some(tag) = self.match_open(slug)
++            let slug = if self.standalone {
++                without_newline.trim_matches([' ', '\t', '\r'])
++            } else {
++                without_newline.trim_start().trim_end()
++            };
++
++            if self.standalone {
++                if let Some(tag) = self.match_open(slug) {
++                    push_segment(&mut segments, TaggedLineSegment::TagStart(tag));
++                    push_segment(&mut segments, TaggedLineSegment::TagEnd(tag));
++                } else {
++                    self.push_text(buffered, &mut segments);
++                }
++            } else if let Some(tag) = self.match_open(slug)
+                 && self.active_tag.is_none()
+             {
+                 push_segment(&mut segments, TaggedLineSegment::TagStart(tag));
+@@ -106,14 +213,30 @@
+             push_segment(&mut segments, TaggedLineSegment::TagEnd(tag));
+         }
+         self.detect_tag = true;
++        self.fence = None;
++        self.fence_line = FenceLine::default();
+         segments
+     }
+ 
+     fn finish_line(&mut self, segments: &mut Vec<TaggedLineSegment<T>>) {
+         let line = std::mem::take(&mut self.line_buffer);
+         let without_newline = line.strip_suffix('\n').unwrap_or(&line);
+-        let slug = without_newline.trim_start().trim_end();
+-
++        let slug = if self.standalone {
++            without_newline.trim_matches([' ', '\t', '\r'])
++        } else {
++            without_newline.trim_start().trim_end()
++        };
++
++        if self.standalone {
++            if let Some(tag) = self.match_open(slug) {
++                push_segment(segments, TaggedLineSegment::TagStart(tag));
++                push_segment(segments, TaggedLineSegment::TagEnd(tag));
++            } else {
++                self.push_text(line, segments);
++            }
++            self.detect_tag = true;
++            return;
++        }
+         if let Some(tag) = self.match_open(slug)
+             && self.active_tag.is_none()
+         {
+@@ -145,7 +268,11 @@
+     }
+ 
+     fn is_tag_prefix(&self, slug: &str) -> bool {
+-        let slug = slug.trim_end();
++        let slug = if self.standalone {
++            slug.trim_end_matches([' ', '\t', '\r'])
++        } else {
++            slug.trim_end()
++        };
+         self.specs
+             .iter()
+             .any(|spec| spec.open.starts_with(slug) || spec.close.starts_with(slug))
+--- a/utils/stream-parser/src/lib.rs
++++ b/utils/stream-parser/src/lib.rs
+@@ -2,6 +2,7 @@
+ mod citation;
+ mod inline_hidden_tag;
+ mod proposed_plan;
++mod standalone_markers;
+ mod stream_text;
+ mod tagged_line_parser;
+ mod utf8_stream;
+@@ -17,6 +18,7 @@
+ pub use proposed_plan::ProposedPlanSegment;
+ pub use proposed_plan::extract_proposed_plan_text;
+ pub use proposed_plan::strip_proposed_plan_blocks;
++pub use standalone_markers::StandaloneMarkerParser;
+ pub use stream_text::StreamTextChunk;
+ pub use stream_text::StreamTextParser;
+ pub use utf8_stream::Utf8StreamParser;
+--- /dev/null
++++ b/utils/stream-parser/src/standalone_markers.rs
+@@ -0,0 +1,96 @@
++//! Standalone control-line projection using the existing incremental line parser.
++//! Inline text, blockquotes, indented code and fenced code remain literal.
++use crate::StreamTextChunk;
++use crate::StreamTextParser;
++use crate::tagged_line_parser::{TagSpec, TaggedLineParser, TaggedLineSegment};
++
++#[derive(Debug)]
++pub struct StandaloneMarkerParser {
++    parser: TaggedLineParser<usize>,
++}
++
++impl StandaloneMarkerParser {
++    pub fn new(markers: &[&'static str]) -> Self {
++        Self {
++            parser: TaggedLineParser::new_standalone(
++                markers
++                    .iter()
++                    .enumerate()
++                    .map(|(tag, marker)| TagSpec {
++                        open: marker,
++                        close: marker,
++                        tag,
++                    })
++                    .collect(),
++            ),
++        }
++    }
++}
++
++fn mapped(segments: Vec<TaggedLineSegment<usize>>) -> StreamTextChunk<usize> {
++    let mut chunk = StreamTextChunk::default();
++    for segment in segments {
++        match segment {
++            TaggedLineSegment::Normal(text) | TaggedLineSegment::TagDelta(_, text) => {
++                chunk.visible_text.push_str(&text)
++            }
++            TaggedLineSegment::TagStart(index) => chunk.extracted.push(index),
++            TaggedLineSegment::TagEnd(_) => {}
++        }
++    }
++    chunk
++}
++
++impl StreamTextParser for StandaloneMarkerParser {
++    type Extracted = usize;
++
++    fn push_str(&mut self, text: &str) -> StreamTextChunk<usize> {
++        mapped(self.parser.parse(text))
++    }
++
++    fn finish(&mut self) -> StreamTextChunk<usize> {
++        mapped(self.parser.finish())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn standalone_markers_preserve_prose_and_quoted_examples_at_each_boundary() {
++        let input = "说明。\n<first>\n正文。\ninline <second> text\n> <second>\n    <second>\n```text\n<second>\n```\n~~~\n<first>\n~~~\n  <second>  \r\n最后。";
++        let expected = "说明。\n正文。\ninline <second> text\n> <second>\n    <second>\n```text\n<second>\n```\n~~~\n<first>\n~~~\n最后。";
++        for split in 0..=input.len() {
++            if !input.is_char_boundary(split) {
++                continue;
++            }
++            let mut parser = StandaloneMarkerParser::new(&["<first>", "<second>"]);
++            let mut text = String::new();
++            let mut found = Vec::new();
++            for part in [
++                parser.push_str(&input[..split]),
++                parser.push_str(&input[split..]),
++                parser.finish(),
++            ] {
++                text.push_str(&part.visible_text);
++                found.extend(part.extracted);
++            }
++            assert_eq!(text, expected);
++            assert_eq!(found, [0, 1]);
++        }
++    }
++
++    #[test]
++    fn standalone_markers_require_a_whole_unquoted_line_and_matching_fence() {
++        let input = "````\n<first>\n```\n<second>\n````\n<first> extra\n<second>";
++        let mut parser = StandaloneMarkerParser::new(&["<first>", "<second>"]);
++        let first = parser.push_str(input);
++        let last = parser.finish();
++        assert_eq!(
++            first.visible_text + &last.visible_text,
++            "````\n<first>\n```\n<second>\n````\n<first> extra\n"
++        );
++        assert_eq!(last.extracted, [1]);
++    }
++}
