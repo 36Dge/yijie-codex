@@ -152,3 +152,15 @@ Owner approved the minimal six-existing-file shutdown repair after report41 nece
 ## 2026-11-01 普通回答完成检查候选
 
 用户授权修复只有过程说明就结束的问题。新增可重放 `chat-models/0013-answer-completion.patch`，接在完整网页检索约束链之后；上游 codex-rs 子树保持原样。Host 指令显式启用的普通轮次在原 turn loop 内最多补答两次，补答不允许新工具操作，仍缺结果则走既有失败终态。结构化输出和其他消费者默认不启用，无新增权限或协议形状。构建复用既有源码/缓存，产物为 `.yijie/build/answer-completion-v1/aarch64-apple-darwin`，旧 Runtime 不覆盖。验证与兼容范围见 `docs/answer-completion.md`。
+
+## 2026-11-05 原生公开消息 r3 声明拼写修复
+
+Owner 批准的限定适配候选继续复用相同上游和执行机制。真实 MiniMax 用启用标记的
+连字符命名声明 commentary，r2 仅识别点号命名，导致第二条消息 unknown 并提前结束；
+已在原 r2 二进制上用普通回环复现。0018 只扩展既有声明解析为两种明确的 v1 拼写，
+不做模糊阶段猜测，流式与完成态共用来源，跨拼写的多声明仍不触发续行。原始记录、
+权限、模型设置和两个补答上限不改。详见 `docs/native-public-messages-r3.md`。
+
+canonical r3 继续复用 `.local/web-retrieval-guard/workspace` 和 `codex-rs/target`，
+不另建大型 target；r1/r2 制品保留。构建和消费者同源验证需完成后才能正常接入，
+不得把单个真实 Kimi 三阶段样本或离线通过记为两家生成覆盖率达标。

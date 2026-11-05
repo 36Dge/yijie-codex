@@ -1,0 +1,166 @@
+--- a/core/src/session/public_messages.rs
++++ b/core/src/session/public_messages.rs
+@@ -16,6 +16,13 @@
+ const PREFIX: &str = "[[yijie.public-message.v1:";
+ const COMMENTARY: &str = "[[yijie.public-message.v1:commentary]]";
+ const FINAL: &str = "[[yijie.public-message.v1:final_answer]]";
++// A model used the activation namespace's spelling in a real v1 message.
++// Accept only these two exact spellings, never fuzzy stage or prose inference.
++const HYPHEN_PREFIX: &str = "[[yijie-public-message-v1:";
++const HYPHEN_COMMENTARY: &str = "[[yijie-public-message-v1:commentary]]";
++const HYPHEN_FINAL: &str = "[[yijie-public-message-v1:final_answer]]";
++const PREFIXES: [&str; 2] = [PREFIX, HYPHEN_PREFIX];
++const DECLARATIONS: [&str; 4] = [COMMENTARY, FINAL, HYPHEN_COMMENTARY, HYPHEN_FINAL];
+ const MAX_HEADER_BYTES: usize = 128;
+ 
+ pub(crate) fn enabled(turn: &TurnContext) -> bool {
+@@ -42,7 +49,7 @@
+ }
+ 
+ fn prefix(text: &str, finished: bool) -> PrefixResult<'_> {
+-    if text.starts_with(PREFIX) {
++    if PREFIXES.iter().any(|prefix| text.starts_with(*prefix)) {
+         let (line, body) = match text.split_once('\n') {
+             Some((line, body)) => (line.trim_end_matches('\r'), body),
+             None if !finished && text.len() <= MAX_HEADER_BYTES => return PrefixResult::Pending,
+@@ -53,8 +60,8 @@
+             return PrefixResult::Plain(text);
+         }
+         let phase = match line {
+-            COMMENTARY => Some(MessagePhase::Commentary),
+-            FINAL => Some(MessagePhase::FinalAnswer),
++            COMMENTARY | HYPHEN_COMMENTARY => Some(MessagePhase::Commentary),
++            FINAL | HYPHEN_FINAL => Some(MessagePhase::FinalAnswer),
+             _ => None,
+         };
+         // A malformed declaration in our exact namespace has no authority to
+@@ -62,7 +69,7 @@
+         // the existing bounded answer-only finalizer, never a fake success.
+         return PrefixResult::Envelope { phase, body };
+     }
+-    if !finished && PREFIX.starts_with(text) {
++    if !finished && PREFIXES.iter().any(|prefix| prefix.starts_with(text)) {
+         return PrefixResult::Pending;
+     }
+     PrefixResult::Plain(text)
+@@ -107,7 +114,7 @@
+ }
+ 
+ fn body_projection(body: &str) -> (String, bool) {
+-    let mut parser = StandaloneMarkerParser::new(&[COMMENTARY, FINAL]);
++    let mut parser = StandaloneMarkerParser::new(&DECLARATIONS);
+     let mut parsed = parser.push_str(body);
+     let tail = parser.finish();
+     parsed.visible_text.push_str(&tail.visible_text);
+@@ -182,7 +189,7 @@
+             PrefixResult::Plain(text) => (None, text.to_owned(), false),
+             PrefixResult::Envelope { phase, body } => (phase, body.to_owned(), true),
+         };
+-        self.body_parser = framed.then(|| StandaloneMarkerParser::new(&[COMMENTARY, FINAL]));
++        self.body_parser = framed.then(|| StandaloneMarkerParser::new(&DECLARATIONS));
+         let Some(pending) = self.pending.take() else {
+             return;
+         };
+@@ -310,6 +317,8 @@
+         for (header, expected) in [
+             (COMMENTARY, MessagePhase::Commentary),
+             (FINAL, MessagePhase::FinalAnswer),
++            (HYPHEN_COMMENTARY, MessagePhase::Commentary),
++            (HYPHEN_FINAL, MessagePhase::FinalAnswer),
+         ] {
+             let raw = format!(
+                 "{header}\n已区分短期体验与长期生活。\n\n下一段仍属于同一个消息。后文 {FINAL} 保持字面内容。"
+@@ -375,6 +384,14 @@
+             ),
+             (COMMENTARY, ""),
+             ("[[yijie.public-message.v1:comm", ""),
++            (
++                "[[yijie-public-message-v1:unknown]]\n保留已有答案。",
++                "保留已有答案。",
++            ),
++            (
++                "[[yijie-public-message-v2:commentary]]\n普通字面内容。",
++                "[[yijie-public-message-v2:commentary]]\n普通字面内容。",
++            ),
+         ] {
+             let original = message(raw, None);
+             let mut adapter = StreamAdapter::new(true);
+@@ -438,42 +455,49 @@
+ 
+     #[test]
+     fn public_messages_mixed_declarations_are_one_unclassified_item_without_continuation() {
+-        let raw = format!(
+-            "{COMMENTARY}\n我会按两个角度说明。\n\n{FINAL}\n结果：这是一份完整且可读的说明。"
+-        );
+-        let visible = "我会按两个角度说明。\n\n结果：这是一份完整且可读的说明。";
+-        let original = message(&raw, None);
+-        for index in 0..=raw.len() {
+-            if !raw.is_char_boundary(index) {
+-                continue;
+-            }
+-            let mut adapter = StreamAdapter::new(true);
+-            adapter.push(ResponseEvent::OutputItemAdded(message("", None)));
+-            adapter.push(ResponseEvent::OutputTextDelta(raw[..index].into()));
+-            adapter.push(ResponseEvent::OutputTextDelta(raw[index..].into()));
+-            adapter.push(ResponseEvent::OutputItemDone(original.clone()));
+-            let (starts, text, ends) = collect(&mut adapter);
+-            assert_eq!(starts.len(), 1);
+-            assert_eq!(ends.len(), 1);
+-            assert_eq!(text, visible);
+-            assert!(!adapter.requests_continuation(None));
+-            assert_eq!(
+-                serde_json::to_value(&ends[0]).unwrap(),
+-                serde_json::to_value(&original).unwrap()
++        for (header, extra) in [
++            (COMMENTARY, FINAL),
++            (COMMENTARY, HYPHEN_FINAL),
++            (HYPHEN_COMMENTARY, FINAL),
++            (HYPHEN_COMMENTARY, HYPHEN_FINAL),
++        ] {
++            let raw = format!(
++                "{header}\n我会按两个角度说明。\n\n{extra}\n结果：这是一份完整且可读的说明。"
+             );
+-            let projected = project_item(true, &original);
+-            assert!(matches!(
+-                &projected,
+-                ResponseItem::Message { phase: None, .. }
+-            ));
+-            assert_eq!(assistant_text(&projected).unwrap(), visible);
++            let visible = "我会按两个角度说明。\n\n结果：这是一份完整且可读的说明。";
++            let original = message(&raw, None);
++            for index in 0..=raw.len() {
++                if !raw.is_char_boundary(index) {
++                    continue;
++                }
++                let mut adapter = StreamAdapter::new(true);
++                adapter.push(ResponseEvent::OutputItemAdded(message("", None)));
++                adapter.push(ResponseEvent::OutputTextDelta(raw[..index].into()));
++                adapter.push(ResponseEvent::OutputTextDelta(raw[index..].into()));
++                adapter.push(ResponseEvent::OutputItemDone(original.clone()));
++                let (starts, text, ends) = collect(&mut adapter);
++                assert_eq!(starts.len(), 1);
++                assert_eq!(ends.len(), 1);
++                assert_eq!(text, visible);
++                assert!(!adapter.requests_continuation(None));
++                assert_eq!(
++                    serde_json::to_value(&ends[0]).unwrap(),
++                    serde_json::to_value(&original).unwrap()
++                );
++                let projected = project_item(true, &original);
++                assert!(matches!(
++                    &projected,
++                    ResponseItem::Message { phase: None, .. }
++                ));
++                assert_eq!(assistant_text(&projected).unwrap(), visible);
++            }
+         }
+     }
+ 
+     #[test]
+     fn public_messages_quoted_declarations_remain_literal_and_native_phase_still_wins() {
+         let body = format!(
+-            "此处是代码示例。\n```text\n{FINAL}\n```\n> {COMMENTARY}\n    {FINAL}\ninline {FINAL} example"
++            "此处是代码示例。\n```text\n{FINAL}\n{HYPHEN_FINAL}\n```\n> {COMMENTARY}\n> {HYPHEN_COMMENTARY}\n    {FINAL}\n    {HYPHEN_FINAL}\ninline {FINAL} example"
+         );
+         let raw = format!("{COMMENTARY}\n{body}");
+         let original = message(&raw, None);

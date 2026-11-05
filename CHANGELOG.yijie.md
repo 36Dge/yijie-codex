@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Accept both exact v1 public-message namespace spellings through 0018. The
+  observed hyphen spelling now supplies the explicit model-declared phase,
+  while unknown stages/versions remain unknown. Streaming, completed messages
+  and mixed-declaration validation share the same constants; raw provider data,
+  native phase/end_turn priority and existing bounded completion remain intact.
+  Reuse the current build workspace and target cache. See
+  `docs/native-public-messages-r3.md` for the reproduced failure and scope.
+
 - Validate public-message declarations through the 0017 r2 overlay: one actual
   Item remains one public Item; additional unquoted control lines are removed
   from its public stream, ambiguous declared phase becomes unknown at completion,
