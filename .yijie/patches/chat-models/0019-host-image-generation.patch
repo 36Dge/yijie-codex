@@ -1,0 +1,531 @@
+--- a/app-server-protocol/src/protocol/common.rs
++++ b/app-server-protocol/src/protocol/common.rs
+@@ -1495,6 +1495,10 @@
+     },
+ 
+     /// Execute a dynamic tool call on the client.
++    HostImageGenerate => "item/imageGeneration/generate" {
++        params: v2::HostImageGenerateParams,
++        response: v2::HostImageGenerateResponse,
++    },
+     DynamicToolCall => "item/tool/call" {
+         params: v2::DynamicToolCallParams,
+         response: v2::DynamicToolCallResponse,
+--- /dev/null
++++ b/app-server-protocol/src/protocol/v2/host_image.rs
+@@ -0,0 +1,21 @@
++use schemars::JsonSchema;
++use serde::{Deserialize, Serialize};
++use ts_rs::TS;
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct HostImageGenerateParams {
++    pub thread_id: String,
++    pub turn_id: String,
++    pub call_id: String,
++    pub prompt: String,
++    pub use_current_reference: bool,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++#[ts(export_to = "v2/")]
++pub struct HostImageGenerateResponse {
++    pub success: bool,
++}
+--- a/app-server-protocol/src/protocol/v2/mod.rs
++++ b/app-server-protocol/src/protocol/v2/mod.rs
+@@ -12,6 +12,7 @@
+ mod feedback;
+ mod fs;
+ mod hook;
++mod host_image;
+ mod item;
+ mod mcp;
+ mod model;
+@@ -39,6 +40,7 @@
+ pub use feedback::*;
+ pub use fs::*;
+ pub use hook::*;
++pub use host_image::*;
+ pub use item::*;
+ pub use mcp::*;
+ pub use model::*;
+--- a/app-server/src/extensions.rs
++++ b/app-server/src/extensions.rs
+@@ -30,6 +30,7 @@
+ 
+ pub(crate) struct ThreadExtensionDependencies {
+     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
++    pub(crate) image_backend: Option<codex_image_generation_extension::HostImageBackend>,
+     pub(crate) auth_manager: Arc<AuthManager>,
+     pub(crate) state_db: Option<StateDbHandle>,
+     pub(crate) analytics_events_client: AnalyticsEventsClient,
+@@ -50,6 +51,7 @@
+ {
+     let ThreadExtensionDependencies {
+         event_sink,
++        image_backend,
+         auth_manager,
+         state_db,
+         analytics_events_client,
+@@ -76,9 +78,12 @@
+     codex_mcp_extension::install(&mut builder);
+     codex_mcp_extension::install_executor_plugins(&mut builder, environment_manager);
+     codex_web_search_extension::install(&mut builder, auth_manager.clone());
+-    codex_image_generation_extension::install(&mut builder, auth_manager, |config: &Config| {
+-        Some(config.codex_home.clone())
+-    });
++    codex_image_generation_extension::install_with_host_backend(
++        &mut builder,
++        auth_manager,
++        |config: &Config| Some(config.codex_home.clone()),
++        image_backend,
++    );
+     let skill_providers = codex_skills_extension::SkillProviders::new()
+         .with_executor_provider(executor_skill_provider)
+         .with_orchestrator_provider(Arc::new(
+@@ -94,6 +99,54 @@
+         },
+     );
+     Arc::new(builder.build())
++}
++
++pub(crate) fn host_image_backend(
++    outgoing: Arc<OutgoingMessageSender>,
++    state: ThreadStateManager,
++) -> codex_image_generation_extension::HostImageBackend {
++    let outgoing = Arc::downgrade(&outgoing);
++    Arc::new(move |call| {
++        let outgoing = outgoing.clone();
++        let state = state.clone();
++        Box::pin(async move {
++            let (Some(outgoing), Ok(thread)) =
++                (outgoing.upgrade(), ThreadId::from_string(&call.thread_id))
++            else {
++                return false;
++            };
++            let subscribers = state.subscribed_connection_ids(thread).await;
++            if subscribers.len() != 1 {
++                return false;
++            }
++            let (id, rx) = outgoing
++                .send_request_to_connections(
++                    Some(&subscribers),
++                    codex_app_server_protocol::ServerRequestPayload::HostImageGenerate(
++                        codex_app_server_protocol::HostImageGenerateParams {
++                            thread_id: call.thread_id,
++                            turn_id: call.turn_id,
++                            call_id: call.call_id,
++                            prompt: call.prompt,
++                            use_current_reference: call.use_current_reference,
++                        },
++                    ),
++                    Some(thread),
++                )
++                .await;
++            match tokio::time::timeout(std::time::Duration::from_secs(240), rx).await {
++                Ok(Ok(Ok(value))) => serde_json::from_value::<
++                    codex_app_server_protocol::HostImageGenerateResponse,
++                >(value)
++                .is_ok_and(|response| response.success),
++                Err(_) => {
++                    outgoing.cancel_request(&id).await;
++                    false
++                }
++                _ => false,
++            }
++        })
++    })
+ }
+ 
+ pub(crate) fn app_server_extension_event_sink(
+--- a/app-server/src/mcp_refresh.rs
++++ b/app-server/src/mcp_refresh.rs
+@@ -231,6 +231,7 @@
+                 thread_extensions(
+                     guardian_agent_spawner(thread_manager.clone()),
+                     ThreadExtensionDependencies {
++                        image_backend: None,
+                         event_sink: Arc::new(NoopExtensionEventSink),
+                         auth_manager: auth_manager.clone(),
+                         state_db: Some(state_db.clone()),
+--- a/app-server/src/message_processor.rs
++++ b/app-server/src/message_processor.rs
+@@ -267,6 +267,10 @@
+                 thread_extensions(
+                     guardian_agent_spawner(thread_manager.clone()),
+                     ThreadExtensionDependencies {
++                        image_backend: Some(crate::extensions::host_image_backend(
++                            outgoing.clone(),
++                            thread_state_manager.clone(),
++                        )),
+                         event_sink: app_server_extension_event_sink(
+                             outgoing.clone(),
+                             thread_state_manager.clone(),
+--- a/config/src/config_toml.rs
++++ b/config/src/config_toml.rs
+@@ -155,6 +155,8 @@
+     /// Restrict this thread to explicit text input and model text output.
+     /// Disables tools, external instructions and extension initialization.
+     pub input_only: Option<bool>,
++    /// Scoped image backend supplied by the local app-server client.
++    pub yijie_host_images: Option<bool>,
+     /// Optional override of model selection.
+     pub model: Option<String>,
+     /// Review model override used by the `/review` feature.
+--- a/core/src/config/mod.rs
++++ b/core/src/config/mod.rs
+@@ -615,6 +615,8 @@
+ pub struct Config {
+     /// Native input-only execution restriction; never a model instruction.
+     pub input_only: bool,
++    /// Use the authenticated desktop Host for image generation in this thread.
++    pub yijie_host_images: bool,
+     /// Provenance for how this [`Config`] was derived (merged layers + enforced
+     /// requirements).
+     pub config_layer_stack: ConfigLayerStack,
+@@ -1409,6 +1411,13 @@
+ }
+ 
+ impl Config {
++    pub fn host_images_enabled(&self) -> bool {
++        self.yijie_host_images
++            && !self.input_only
++            && matches!(self.model_provider_id.as_str(), "kimi" | "minimax")
++            && self.features.enabled(Feature::ImageGeneration)
++    }
++
+     pub(crate) fn multi_agent_version_from_features(&self) -> MultiAgentVersion {
+         if self.features.enabled(Feature::MultiAgentV2) {
+             MultiAgentVersion::V2
+@@ -3827,6 +3836,7 @@
+             service_tier,
+             review_model,
+             input_only: cfg.input_only.unwrap_or(false),
++            yijie_host_images: cfg.yijie_host_images.unwrap_or(false) && !cfg.input_only.unwrap_or(false),
+             model_context_window: cfg.model_context_window,
+             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
+             model_auto_compact_token_limit_scope: cfg
+--- a/core/src/tools/spec_plan.rs
++++ b/core/src/tools/spec_plan.rs
+@@ -1006,6 +1006,12 @@
+         {
+             continue;
+         }
++        if tool_name == ToolName::plain("generate_image")
++            && (!turn_context.config.host_images_enabled()
++                || matches!(&turn_context.session_source, SessionSource::SubAgent(_)))
++        {
++            continue;
++        }
+         if tool_name == ToolName::namespaced(IMAGE_GEN_NAMESPACE, IMAGEGEN_TOOL_NAME)
+             && !standalone_image_generation_model_visible(turn_context)
+         {
+--- a/exec/src/lib.rs
++++ b/exec/src/lib.rs
+@@ -1742,6 +1742,15 @@
+             )
+             .await
+         }
++        ServerRequest::HostImageGenerate { request_id, .. } => {
++            reject_server_request(
++                client,
++                request_id,
++                &method,
++                "Host image generation is unavailable in exec mode.".into(),
++            )
++            .await
++        }
+         ServerRequest::CurrentTimeRead { request_id, .. } => {
+             reject_server_request(
+                 client,
+--- a/ext/image-generation/src/backend.rs
++++ b/ext/image-generation/src/backend.rs
+@@ -6,6 +6,20 @@
+ use codex_login::default_client::build_reqwest_client;
+ use codex_model_provider::SharedModelProvider;
+ use http::HeaderMap;
++
++pub struct HostImageCall {
++    pub thread_id: String,
++    pub turn_id: String,
++    pub call_id: String,
++    pub prompt: String,
++    pub use_current_reference: bool,
++}
++
++pub type HostImageBackend = std::sync::Arc<
++    dyn Fn(HostImageCall) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
++        + Send
++        + Sync,
++>;
+ 
+ #[derive(Clone)]
+ pub(crate) struct CodexImagesBackend {
+--- a/ext/image-generation/src/extension.rs
++++ b/ext/image-generation/src/extension.rs
+@@ -20,6 +20,7 @@
+ 
+ #[derive(Clone)]
+ struct ImageGenerationExtension {
++    host_backend: Option<crate::HostImageBackend>,
+     auth_manager: Arc<AuthManager>,
+     resolve_save_root: Arc<SaveRootResolver>,
+ }
+@@ -28,6 +29,7 @@
+ 
+ #[derive(Clone)]
+ struct ImageGenerationExtensionConfig {
++    host_images: bool,
+     available: bool,
+     provider: ModelProviderInfo,
+     save_root: Option<AbsolutePathBuf>,
+@@ -37,6 +39,7 @@
+     /// Resolves the image provider and save root for a thread.
+     fn from_config(config: &Config, resolve_save_root: &SaveRootResolver) -> Self {
+         Self {
++            host_images: config.host_images_enabled(),
+             available: config.model_provider.is_openai()
+                 || config.model_provider.requires_openai_auth
+                 || config.model_provider.uses_openai_actor_authorization(),
+@@ -89,7 +92,12 @@
+         let Some(config) = thread_store.get::<ImageGenerationExtensionConfig>() else {
+             return Vec::new();
+         };
+-        if !config.available {
++        let host_backend = self
++            .host_backend
++            .as_ref()
++            .filter(|_| config.host_images)
++            .cloned();
++        if !config.available && host_backend.is_none() {
+             return Vec::new();
+         }
+ 
+@@ -98,6 +106,7 @@
+                 config.provider.clone(),
+                 Some(self.auth_manager.clone()),
+             )),
++            host_backend,
+             config.save_root.clone(),
+             thread_store.level_id().to_string(),
+         ))]
+@@ -110,7 +119,17 @@
+     auth_manager: Arc<AuthManager>,
+     resolve_save_root: impl Fn(&Config) -> Option<AbsolutePathBuf> + Send + Sync + 'static,
+ ) {
++    install_with_host_backend(registry, auth_manager, resolve_save_root, None);
++}
++
++pub fn install_with_host_backend(
++    registry: &mut ExtensionRegistryBuilder<Config>,
++    auth_manager: Arc<AuthManager>,
++    resolve_save_root: impl Fn(&Config) -> Option<AbsolutePathBuf> + Send + Sync + 'static,
++    host_backend: Option<crate::HostImageBackend>,
++) {
+     let extension = Arc::new(ImageGenerationExtension {
++        host_backend,
+         auth_manager,
+         resolve_save_root: Arc::new(resolve_save_root),
+     });
+--- a/ext/image-generation/src/lib.rs
++++ b/ext/image-generation/src/lib.rs
+@@ -2,7 +2,8 @@
+ mod extension;
+ mod tool;
+ 
+-pub use extension::install;
++pub use backend::{HostImageBackend, HostImageCall};
++pub use extension::{install, install_with_host_backend};
+ 
+ pub(crate) const IMAGE_GEN_NAMESPACE: &str = "image_gen";
+ pub(crate) const IMAGEGEN_TOOL_NAME: &str = "imagegen";
+--- a/ext/image-generation/src/tool.rs
++++ b/ext/image-generation/src/tool.rs
+@@ -61,6 +61,7 @@
+ #[derive(Clone)]
+ pub(crate) struct ImageGenerationTool {
+     backend: CodexImagesBackend,
++    host_backend: Option<crate::HostImageBackend>,
+     save_root: Option<AbsolutePathBuf>,
+     thread_id: String,
+ }
+@@ -69,11 +70,13 @@
+     /// Creates an image-generation tool backed by an image API executor.
+     pub(crate) fn new(
+         backend: CodexImagesBackend,
++        host_backend: Option<crate::HostImageBackend>,
+         save_root: Option<AbsolutePathBuf>,
+         thread_id: String,
+     ) -> Self {
+         Self {
+             backend,
++            host_backend,
+             save_root,
+             thread_id,
+         }
+@@ -110,11 +113,17 @@
+ impl ToolExecutor<ToolCall> for ImageGenerationTool {
+     /// Keeps the tool in the existing image-generation Responses namespace.
+     fn tool_name(&self) -> ToolName {
++        if self.host_backend.is_some() {
++            return ToolName::plain("generate_image");
++        }
+         ToolName::namespaced(IMAGE_GEN_NAMESPACE, IMAGEGEN_TOOL_NAME)
+     }
+ 
+     /// Advertises the model contract: a rewritten prompt and optional edit references.
+     fn spec(&self) -> ToolSpec {
++        if self.host_backend.is_some() {
++            return host_image_spec();
++        }
+         imagegen_tool_spec()
+     }
+ 
+@@ -130,7 +139,56 @@
+ }
+ 
+ impl ImageGenerationTool {
++    async fn handle_host_image(
++        &self,
++        call: ToolCall,
++        host: &crate::HostImageBackend,
++    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
++        // The Host resolves original attachment bytes from the authorized turn.
++        // Never run the upstream local-file/history resolver for this backend.
++        let args: HostImageArgs = serde_json::from_str(call.function_arguments()?)
++            .map_err(|_| FunctionCallError::RespondToModel("Invalid image arguments.".into()))?;
++        if args.prompt.trim().is_empty() || args.prompt.chars().count() > 1500 {
++            return Err(FunctionCallError::RespondToModel(
++                "Invalid image prompt.".into(),
++            ));
++        }
++        let mut item = ImageGenerationItem {
++            id: call.call_id.clone(),
++            status: "in_progress".into(),
++            revised_prompt: None,
++            result: String::new(),
++            saved_path: None,
++        };
++        let begin = EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
++            call_id: item.id.clone(),
++        });
++        call.turn_item_emitter
++            .emit_started(extension_turn_item(item.clone(), begin))
++            .await;
++        let success = host(crate::HostImageCall {
++            thread_id: self.thread_id.clone(),
++            turn_id: call.turn_id,
++            call_id: call.call_id,
++            prompt: args.prompt,
++            use_current_reference: args.use_current_reference,
++        })
++        .await;
++        item.status = if success { "completed" } else { "failed" }.into();
++        let end = legacy_end_event(&item);
++        call.turn_item_emitter
++            .emit_completed(extension_turn_item(item, end))
++            .await;
++        Ok(Box::new(codex_tools::JsonToolOutput::with_success(
++            serde_json::json!({ "image_published": success }),
++            Some(success),
++        )))
++    }
++
+     async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
++        if let Some(host) = &self.host_backend {
++            return self.handle_host_image(call, host).await;
++        }
+         let args = parse_args(&call)?;
+         let request =
+             request_for_call_args(&args, call.conversation_history.items(), &call.environments)
+@@ -456,6 +514,31 @@
+         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))
+ }
+ 
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct HostImageArgs {
++    prompt: String,
++    use_current_reference: bool,
++}
++
++fn host_image_spec() -> ToolSpec {
++    ToolSpec::Function(ResponsesApiTool {
++        name: "generate_image".into(),
++        description: "Generate one image when requested. Send a prompt and set use_current_reference only for the user's single attached reference in this turn. The desktop presents the result. Do not call for analysis, descriptions or an earlier image.".into(),
++        strict: false,
++        parameters: parse_tool_input_schema(&serde_json::json!({
++            "type": "object",
++            "properties": {
++                "prompt": {"type":"string","minLength":1,"maxLength":1500},
++                "use_current_reference":{"type":"boolean"}
++            },
++            "required":["prompt","use_current_reference"],
++            "additionalProperties":false
++        })).expect("valid Host image tool schema"),
++        output_schema: None, defer_loading: None
++    })
++}
++
+ /// Builds the namespace function schema exposed to the model.
+ fn imagegen_tool_spec() -> ToolSpec {
+     let mut schema_value = serde_json::to_value(
+--- a/tui/src/app/app_server_event_targets.rs
++++ b/tui/src/app/app_server_event_targets.rs
+@@ -22,6 +22,9 @@
+             ThreadId::from_string(&params.thread_id).ok()
+         }
+         ServerRequest::DynamicToolCall { params, .. } => {
++            ThreadId::from_string(&params.thread_id).ok()
++        }
++        ServerRequest::HostImageGenerate { params, .. } => {
+             ThreadId::from_string(&params.thread_id).ok()
+         }
+         ServerRequest::CurrentTimeRead { params, .. } => {
+--- a/tui/src/app/app_server_requests.rs
++++ b/tui/src/app/app_server_requests.rs
+@@ -151,6 +151,12 @@
+                 Some(UnsupportedAppServerRequest {
+                     request_id: request_id.clone(),
+                     message: "Attestation generation is not available in TUI.".to_string(),
++                })
++            }
++            ServerRequest::HostImageGenerate { request_id, .. } => {
++                Some(UnsupportedAppServerRequest {
++                    request_id: request_id.clone(),
++                    message: "Host image generation is unavailable in TUI.".into(),
+                 })
+             }
+             ServerRequest::CurrentTimeRead { request_id, .. } => {
+@@ -358,6 +364,7 @@
+             ServerRequest::DynamicToolCall { .. }
+             | ServerRequest::ChatgptAuthTokensRefresh { .. }
+             | ServerRequest::AttestationGenerate { .. }
++            | ServerRequest::HostImageGenerate { .. }
+             | ServerRequest::CurrentTimeRead { .. }
+             | ServerRequest::ApplyPatchApproval { .. }
+             | ServerRequest::ExecCommandApproval { .. } => true,
+--- a/tui/src/app/side.rs
++++ b/tui/src/app/side.rs
+@@ -97,6 +97,7 @@
+             | ServerRequest::ExecCommandApproval { .. } => Some(SideParentStatus::NeedsApproval),
+             ServerRequest::DynamicToolCall { .. }
+             | ServerRequest::AttestationGenerate { .. }
++            | ServerRequest::HostImageGenerate { .. }
+             | ServerRequest::CurrentTimeRead { .. }
+             | ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
+         }
+--- a/tui/src/chatwidget/protocol_requests.rs
++++ b/tui/src/chatwidget/protocol_requests.rs
+@@ -46,6 +46,7 @@
+             }
+             ServerRequest::DynamicToolCall { .. }
+             | ServerRequest::AttestationGenerate { .. }
++            | ServerRequest::HostImageGenerate { .. }
+             | ServerRequest::CurrentTimeRead { .. }
+             | ServerRequest::ChatgptAuthTokensRefresh { .. }
+             | ServerRequest::ApplyPatchApproval { .. }

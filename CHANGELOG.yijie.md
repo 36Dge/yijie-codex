@@ -109,3 +109,7 @@ Owner approved the minimal six-existing-file shutdown repair after report41 nece
 ## 2026-11-01 普通回答完成检查候选
 
 用户授权修复只有过程说明就结束的问题。新增可重放 `chat-models/0013-answer-completion.patch`，接在完整网页检索约束链之后；上游 codex-rs 子树保持原样。Host 指令显式启用的普通轮次在原 turn loop 内最多补答两次，补答不允许新工具操作，仍缺结果则走既有失败终态。结构化输出和其他消费者默认不启用，无新增权限或协议形状。构建复用既有源码/缓存，产物为 `.yijie/build/answer-completion-v1/aarch64-apple-darwin`，旧 Runtime 不覆盖。验证与兼容范围见 `docs/answer-completion.md`。
+
+## FEAT-168 local image candidate
+
+The native image executor can request one Host-managed generation on the existing app-server transport. See [Host image qualification](docs/host-images.md).

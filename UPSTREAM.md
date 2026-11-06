@@ -164,3 +164,5 @@ Owner 批准的限定适配候选继续复用相同上游和执行机制。真�
 canonical r3 继续复用 `.local/web-retrieval-guard/workspace` 和 `codex-rs/target`，
 不另建大型 target；r1/r2 制品保留。构建和消费者同源验证需完成后才能正常接入，
 不得把单个真实 Kimi 三阶段样本或离线通过记为两家生成覆盖率达标。
+
+FEAT-168 adds an independently opt-in local Host image candidate on the native-public-messages-r3 patch chain. The upstream commit remains fixed. Build with `bash scripts/build-host-images.sh`; candidate provenance and scopes are recorded in `docs/host-images.md`.
