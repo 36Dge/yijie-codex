@@ -1,0 +1,13 @@
+# FEAT-170 原生工具搜索接入
+
+用户在方案复审后授权实施，限定普通Kimi聊天及现有有效MCP工具。固定上游0.144.6不变，0023追加于0022之后；只修改独立构建workspace，原始codex-rs不改。最高contract-impact=breaking（模型发现/传输与历史语义），stable app-server 271个schema树不变。
+
+复用ToolSearchHandler/BM25、search_infos缓存、MCP暴露与CodeMode执行。新增可选ModelInfo.tool_search_transport（native/function_code_mode），省略保持原生。function分支由原生工具声明生成参数，结果由typed LoadableToolSpec→原生exec说明→JsonToolOutput产生；搜索保持DirectModelOnly，缓存包含transport，不满足exec资格的工具保留直接路径，Hidden不恢复。
+
+生产ModelsManager此前忽略线程目录的搜索字段（测试辅助函数会应用），现仅补supports_search_tool/transport的线程覆盖，其余模型元数据不改。Host默认目录不开，普通根线程用原生config覆盖；非根不暴露新兼容搜索，input-only保持空注册表。
+
+原生历史保留精确call_id对应的plain tool_search函数完整结果，避免通用文本截断损坏定义JSON；其他函数截断保持。保留外部上下文记忆保护和诊断脱敏。原native ToolSearchCall/Output路径不改，函数提供方遇到不支持的旧专用历史会在发送前明确报错且保留历史。
+
+标准入口：bash scripts/build-tool-search.sh。同时从原生ModelsResponse的JsonSchema派生生成model-catalog.schema.json；所有输出在独立tool-search-v1源摘要目录，不覆盖原制品。当前最终源fac52ad79cc7e0a379fc597a7ecfcee573205d38a60c9d0ed3a2e96871ab0f45，先前03ab候选未启用并保留。
+
+原生模型作用域1项+搜索相关18项通过；真实Runtime/Host本地回环、真实Kimi5次HTTP通过。完整证据、失败历史和GUI边界见元仓FEAT-170/03与04。当前仅本机候选，非发布；Kimi实际启用，MiniMax不启用搜索。停用发现保留新reader，不降数据库、不改写rollout。

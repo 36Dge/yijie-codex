@@ -1,0 +1,579 @@
+--- a/core/src/config/config_tests.rs
++++ b/core/src/config/config_tests.rs
+@@ -480,6 +480,13 @@
+             TokenBudgetConfig::default(),
+         ),
+         (
++            "[features.token_budget]\nenabled = true\nreset_on_compact = false\n",
++            TokenBudgetConfig {
++                reset_on_compact: false,
++                ..TokenBudgetConfig::default()
++            },
++        ),
++        (
+             r#"
+ [features.token_budget]
+ enabled = true
+@@ -488,6 +495,7 @@
+ guidance_message = "Preserve important state before compaction."
+ "#,
+             TokenBudgetConfig {
++                reset_on_compact: true,
+                 reminder_threshold_tokens: Some(16_000),
+                 reminder_message_template: "Custom reminder: {n_remaining} tokens.".to_string(),
+                 guidance_message: Some("Preserve important state before compaction.".to_string()),
+--- a/core/src/config/mod.rs
++++ b/core/src/config/mod.rs
+@@ -1104,6 +1104,7 @@
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+ pub struct TokenBudgetConfig {
++    pub reset_on_compact: bool,
+     pub reminder_threshold_tokens: Option<i64>,
+     pub reminder_message_template: String,
+     pub guidance_message: Option<String>,
+@@ -1112,6 +1113,7 @@
+ impl Default for TokenBudgetConfig {
+     fn default() -> Self {
+         Self {
++            reset_on_compact: true,
+             reminder_threshold_tokens: None,
+             reminder_message_template: DEFAULT_TOKEN_BUDGET_REMINDER_MESSAGE_TEMPLATE.to_string(),
+             guidance_message: None,
+@@ -2650,6 +2652,9 @@
+     }
+ 
+     Ok(Some(TokenBudgetConfig {
++        reset_on_compact: token_budget_config
++            .and_then(|config| config.reset_on_compact)
++            .unwrap_or(true),
+         reminder_threshold_tokens,
+         reminder_message_template,
+         guidance_message,
+--- a/core/src/session/config_lock.rs
++++ b/core/src/session/config_lock.rs
+@@ -246,6 +246,7 @@
+         let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
+         let mut config = (*sc.original_config_do_not_use).clone();
+         config.token_budget = Some(crate::config::TokenBudgetConfig {
++            reset_on_compact: false,
+             reminder_threshold_tokens: Some(16_000),
+             reminder_message_template: "Locked reminder: {n_remaining} tokens.".to_string(),
+             guidance_message: Some("Locked context-window guidance.".to_string()),
+@@ -337,6 +338,7 @@
+             features.token_budget,
+             Some(FeatureToml::Config(TokenBudgetConfigToml {
+                 enabled: Some(true),
++                reset_on_compact: Some(false),
+                 reminder_threshold_tokens: Some(16_000),
+                 reminder_message_template: Some(
+                     "Locked reminder: {n_remaining} tokens.".to_string()
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -343,20 +343,33 @@
+                 .await;
+ 
+                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
+-                if needs_follow_up
+-                    && (sess.take_new_context_window_request().await || token_limit_reached)
+-                {
+-                    if let Err(err) = run_auto_compact(
+-                        &sess,
+-                        Arc::clone(&step_context),
+-                        /*fallback_step_context*/ None,
+-                        &mut client_session,
+-                        InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state)),
+-                        CompactionReason::ContextLimit,
+-                        CompactionPhase::MidTurn,
+-                    )
+-                    .await
+-                    {
++                let explicit_new_window =
++                    needs_follow_up && sess.take_new_context_window_request().await;
++                if needs_follow_up && (explicit_new_window || token_limit_reached) {
++                    let result = if explicit_new_window {
++                        crate::compact_token_budget::run_inline_auto_compact_task(
++                            Arc::clone(&sess),
++                            Arc::clone(&step_context),
++                            InitialContextInjection::BeforeLastUserMessage(Arc::clone(
++                                &world_state,
++                            )),
++                        )
++                        .await
++                    } else {
++                        run_auto_compact(
++                            &sess,
++                            Arc::clone(&step_context),
++                            None,
++                            &mut client_session,
++                            InitialContextInjection::BeforeLastUserMessage(Arc::clone(
++                                &world_state,
++                            )),
++                            CompactionReason::ContextLimit,
++                            CompactionPhase::MidTurn,
++                        )
++                        .await
++                    };
++                    if let Err(err) = result {
+                         if matches!(err, CodexErr::TurnAborted) {
+                             return Err(err);
+                         }
+@@ -998,7 +1011,13 @@
+     phase: CompactionPhase,
+ ) -> CodexResult<()> {
+     let turn_context = &step_context.turn;
+-    if turn_context.config.features.enabled(Feature::TokenBudget) {
++    if turn_context.config.features.enabled(Feature::TokenBudget)
++        && turn_context
++            .config
++            .token_budget
++            .as_ref()
++            .is_none_or(|budget| budget.reset_on_compact)
++    {
+         // Compaction is the reset request, so force a new context window
+         // instead of consuming a pending `new_context` tool request.
+         crate::compact_token_budget::run_inline_auto_compact_task(
+--- a/core/src/tasks/compact.rs
++++ b/core/src/tasks/compact.rs
+@@ -32,7 +32,13 @@
+         _cancellation_token: CancellationToken,
+     ) -> SessionTaskResult {
+         let session = session.clone_session();
+-        if ctx.config.features.enabled(Feature::TokenBudget) {
++        if ctx.config.features.enabled(Feature::TokenBudget)
++            && ctx
++                .config
++                .token_budget
++                .as_ref()
++                .is_none_or(|budget| budget.reset_on_compact)
++        {
+             crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
+             return Ok(None);
+         }
+--- a/core/src/tasks/mod.rs
++++ b/core/src/tasks/mod.rs
+@@ -328,6 +328,9 @@
+         input: Vec<TurnInput>,
+         task: T,
+     ) {
++        // A new task can also start through direct user injection or a V2
++        // mailbox after the prior task ended. Never inherit its deferred reset.
++        let _ = self.take_new_context_window_request().await;
+         let task: Arc<dyn AnySessionTask> = Arc::new(task);
+         let task_kind = task.kind();
+         let span_name = task.span_name();
+@@ -514,6 +517,9 @@
+             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
+             self.input_queue.clear_pending(&active_turn).await;
+         }
++        // Deferred new_context belongs to the aborted/replaced turn, never
++        // to a future user's request. Reuse the native consume-and-clear flag.
++        let _ = self.take_new_context_window_request().await;
+         if reason == TurnAbortReason::Interrupted && aborted_turn {
+             self.maybe_start_turn_for_pending_work().await;
+         }
+@@ -552,6 +558,7 @@
+         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
+         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
+         self.input_queue.clear_pending(&active_turn).await;
++        let _ = self.take_new_context_window_request().await;
+ 
+         if reason == TurnAbortReason::Interrupted {
+             self.maybe_start_turn_for_pending_work().await;
+@@ -911,3 +918,62 @@
+ #[cfg(test)]
+ #[path = "mod_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++mod interaction_tools_tests {
++    use super::*;
++    use crate::session::tests::make_session_and_context;
++    #[tokio::test]
++    async fn interaction_tools_cancel_clears_deferred_window_request() {
++        let (session, _turn) = make_session_and_context().await;
++        let session = Arc::new(session);
++        session.request_new_context_window().await;
++        session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++        assert!(!session.take_new_context_window_request().await);
++    }
++    struct InspectFreshTask {
++        observed: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
++    }
++    impl SessionTask for InspectFreshTask {
++        fn kind(&self) -> TaskKind {
++            TaskKind::Regular
++        }
++        fn span_name(&self) -> &'static str {
++            "interaction_tools_fresh_task"
++        }
++        async fn run(
++            self: Arc<Self>,
++            session: Arc<SessionTaskContext>,
++            _ctx: Arc<TurnContext>,
++            _input: Vec<TurnInput>,
++            _cancel: CancellationToken,
++        ) -> SessionTaskResult {
++            let pending = session
++                .clone_session()
++                .take_new_context_window_request()
++                .await;
++            if let Some(sender) = self.observed.lock().unwrap().take() {
++                let _ = sender.send(pending);
++            }
++            Ok(None)
++        }
++    }
++    #[tokio::test]
++    async fn interaction_tools_direct_task_start_clears_previous_window_request() {
++        let (session, turn) = make_session_and_context().await;
++        let session = Arc::new(session);
++        session.request_new_context_window().await;
++        let (sender, receiver) = tokio::sync::oneshot::channel();
++        session
++            .start_task(
++                Arc::new(turn),
++                Vec::new(),
++                InspectFreshTask {
++                    observed: std::sync::Mutex::new(Some(sender)),
++                },
++            )
++            .await;
++        assert!(!receiver.await.unwrap());
++        session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++    }
++}
+--- a/core/src/tools/handlers/new_context_window_spec.rs
++++ b/core/src/tools/handlers/new_context_window_spec.rs
+@@ -8,7 +8,7 @@
+ pub fn create_new_context_window_tool() -> ToolSpec {
+     ToolSpec::Function(ResponsesApiTool {
+         name: NEW_CONTEXT_WINDOW_TOOL_NAME.to_string(),
+-        description: "Start a new context window. Does not clear, reset, or otherwise affect environment state.".to_string(),
++        description: "Start a fresh context window without summarizing prior messages. Prior task messages and tool results are removed from active context; do not use this as ordinary compression for an unfinished task. Does not clear, reset, or otherwise affect environment state.".to_string(),
+         strict: false,
+         defer_loading: None,
+         parameters: JsonSchema::object(BTreeMap::new(), /*required*/ None, Some(false.into())),
+--- a/core/src/tools/handlers/request_user_input.rs
++++ b/core/src/tools/handlers/request_user_input.rs
+@@ -1,6 +1,7 @@
+ use crate::function_tool::FunctionCallError;
+ use crate::tools::context::FunctionToolOutput;
+ use crate::tools::context::ToolInvocation;
++use crate::tools::context::ToolOutput;
+ use crate::tools::context::ToolPayload;
+ use crate::tools::context::boxed_tool_output;
+ use crate::tools::handlers::parse_arguments;
+@@ -12,6 +13,7 @@
+ use crate::tools::registry::CoreToolRuntime;
+ use crate::tools::registry::ToolExecutor;
+ use codex_protocol::config_types::ModeKind;
++use codex_protocol::models::ResponseInputItem;
+ use codex_protocol::request_user_input::RequestUserInputArgs;
+ use codex_tools::ToolName;
+ use codex_tools::ToolSpec;
+@@ -85,9 +87,8 @@
+             ))
+         })?;
+ 
+-        Ok(boxed_tool_output(FunctionToolOutput::from_text(
+-            content,
+-            Some(true),
++        Ok(boxed_tool_output(UserInputOutput(
++            FunctionToolOutput::from_text(content, Some(true)),
+         )))
+     }
+ }
+@@ -97,3 +98,21 @@
+ #[cfg(test)]
+ #[path = "request_user_input_tests.rs"]
+ mod tests;
++
++// Keep transport and native conversation behavior unchanged. Answer values are
++// not appropriate diagnostic/telemetry previews, even for non-secret fields.
++struct UserInputOutput(FunctionToolOutput);
++impl ToolOutput for UserInputOutput {
++    fn log_preview(&self) -> String {
++        "User input response received".to_string()
++    }
++    fn success_for_logging(&self) -> bool {
++        self.0.success_for_logging()
++    }
++    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
++        self.0.to_response_item(call_id, payload)
++    }
++    fn code_mode_result(&self, payload: &ToolPayload) -> serde_json::Value {
++        self.0.code_mode_result(payload)
++    }
++}
+--- a/core/src/tools/handlers/request_user_input_spec.rs
++++ b/core/src/tools/handlers/request_user_input_spec.rs
+@@ -3,7 +3,7 @@
+ use codex_tools::JsonSchema;
+ use codex_tools::ResponsesApiTool;
+ use codex_tools::ToolSpec;
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, HashSet};
+ 
+ pub const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
+ pub const MIN_AUTO_RESOLUTION_MS: u64 = 60_000;
+@@ -28,7 +28,7 @@
+             Some(vec!["label".to_string(), "description".to_string()]),
+             Some(false.into()),
+         ), Some(
+-            "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
++            "Optional; omit for a free-form answer. Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+                 .to_string(),
+         ));
+ 
+@@ -51,6 +51,7 @@
+                 "Single-sentence prompt shown to the user.".to_string(),
+             )),
+         ),
++        ("isSecret".to_string(), JsonSchema::boolean(Some("Mask a sensitive free-form response in the client. The answer is still model input; this is not a credential storage tool.".to_string()))),
+         ("options".to_string(), options_schema),
+     ]);
+ 
+@@ -61,7 +62,6 @@
+                 "id".to_string(),
+                 "header".to_string(),
+                 "question".to_string(),
+-                "options".to_string(),
+             ]),
+             Some(false.into()),
+         ),
+@@ -108,15 +108,46 @@
+ pub fn normalize_request_user_input_args(
+     mut args: RequestUserInputArgs,
+ ) -> Result<RequestUserInputArgs, String> {
+-    let missing_options = args
+-        .questions
+-        .iter()
+-        .any(|question| question.options.as_ref().is_none_or(Vec::is_empty));
+-    if missing_options {
+-        return Err("request_user_input requires non-empty options for every question".to_string());
++    if args.questions.is_empty() || args.questions.len() > 3 {
++        return Err("request_user_input requires one to three questions".to_string());
+     }
+-
++    let mut ids = HashSet::new();
+     for question in &mut args.questions {
++        if question.id.trim().is_empty()
++            || question.id.len() > 128
++            || !ids.insert(question.id.clone())
++        {
++            return Err(
++                "Question ids must be non-empty, unique, and at most 128 bytes".to_string(),
++            );
++        }
++        if question.header.trim().is_empty()
++            || question.header.chars().count() > 12
++            || question.question.trim().is_empty()
++            || question.question.chars().count() > 8192
++        {
++            return Err(
++                "Questions require a short header and a non-empty bounded prompt".to_string(),
++            );
++        }
++        if question.options.as_ref().is_some_and(Vec::is_empty) {
++            question.options = None;
++        }
++        if let Some(options) = &question.options {
++            let mut labels = HashSet::new();
++            if options.len() > 32
++                || options.iter().any(|option| {
++                    option.label.trim().is_empty()
++                        || option.label.chars().count() > 128
++                        || option.description.chars().count() > 1024
++                        || !labels.insert(option.label.clone())
++                })
++            {
++                return Err(
++                    "Question options must have unique bounded labels and descriptions".to_string(),
++                );
++            }
++        }
+         question.is_other = true;
+     }
+ 
+--- a/core/src/tools/handlers/request_user_input_spec_tests.rs
++++ b/core/src/tools/handlers/request_user_input_spec_tests.rs
+@@ -55,6 +55,7 @@
+                                             .to_string(),
+                                     )),
+                                 ),
++                                ("isSecret".to_string(), JsonSchema::boolean(Some("Mask a sensitive free-form response in the client. The answer is still model input; this is not a credential storage tool.".to_string()))),
+                                 (
+                                     "options".to_string(),
+                                     JsonSchema::array(
+@@ -82,7 +83,7 @@
+                                             Some(false.into()),
+                                         ),
+                                         Some(
+-                                            "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
++                                            "Optional; omit for a free-form answer. Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+                                                 .to_string(),
+                                         ),
+                                     ),
+@@ -98,7 +99,6 @@
+                                 "id".to_string(),
+                                 "header".to_string(),
+                                 "question".to_string(),
+-                                "options".to_string(),
+                             ]),
+                             Some(false.into()),
+                         ),
+@@ -238,3 +238,26 @@
+         "Request user input for one to three short questions and wait for the response. Set autoResolutionMs, from 60000 to 240000 milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. This tool is only available in Default or Plan mode.".to_string()
+     );
+ }
++
++#[test]
++fn interaction_tools_freeform_and_secret_reuse_native_question() {
++    let input = RequestUserInputArgs {
++        questions: vec![RequestUserInputQuestion {
++            id: "ordinary".into(),
++            header: "输入".into(),
++            question: "输入普通合成内容".into(),
++            is_other: false,
++            is_secret: true,
++            options: None,
++        }],
++        auto_resolution_ms: None,
++    };
++    let normalized = normalize_request_user_input_args(input.clone()).unwrap();
++    assert!(normalized.questions[0].is_secret && normalized.questions[0].is_other);
++    assert!(normalized.questions[0].options.is_none());
++    let duplicate = RequestUserInputArgs {
++        questions: vec![input.questions[0].clone(), input.questions[0].clone()],
++        auto_resolution_ms: None,
++    };
++    assert!(normalize_request_user_input_args(duplicate).is_err());
++}
+--- a/core/src/tools/spec_plan.rs
++++ b/core/src/tools/spec_plan.rs
+@@ -728,7 +728,9 @@
+         planned_tools.add(WaitForEnvironmentHandler);
+     }
+ 
+-    if turn_context.config.experimental_request_user_input_enabled {
++    if turn_context.config.experimental_request_user_input_enabled
++        && !turn_context.session_source.is_non_root_agent()
++    {
+         planned_tools.add_with_exposure(
+             RequestUserInputHandler {
+                 available_modes: request_user_input_available_modes(features),
+--- a/core/tests/suite/token_budget.rs
++++ b/core/tests/suite/token_budget.rs
+@@ -952,3 +952,98 @@
+ 
+     Ok(())
+ }
++
++// Both routes use the upstream implementations. The local profile changes only
++// which route ordinary compaction selects; explicit new_context still resets.
++async fn interaction_tools_compaction_policy_case(mode: &str) -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = start_mock_server().await;
++    let first = match mode {
++        "explicit" => sse(vec![
++            ev_response_created("policy-1"),
++            ev_function_call("window", "new_context", "{}"),
++            ev_completed("policy-1"),
++        ]),
++        "automatic" => sse(vec![
++            ev_response_created("policy-1"),
++            ev_function_call("remaining", "get_context_remaining", "{}"),
++            ev_completed_with_tokens("policy-1", 9_500),
++        ]),
++        _ => sse(vec![
++            ev_response_created("policy-1"),
++            ev_assistant_message("before", "ordinary response"),
++            ev_completed("policy-1"),
++        ]),
++    };
++    let mut sequence = vec![first];
++    if mode != "explicit" {
++        sequence.push(sse(vec![
++            ev_response_created("policy-summary"),
++            ev_assistant_message("summary", "SYNTHETIC_NATIVE_POLICY_SUMMARY"),
++            ev_completed("policy-summary"),
++        ]));
++    }
++    sequence.push(sse(vec![
++        ev_response_created("policy-2"),
++        ev_assistant_message("after", "done"),
++        ev_completed("policy-2"),
++    ]));
++    let responses = mount_sse_sequence(&server, sequence).await;
++    let mut provider = built_in_model_providers(None)["openai"].clone();
++    provider.name = "YiJie ordinary policy test".into();
++    provider.base_url = Some(format!("{}/v1", server.uri()));
++    provider.supports_websockets = false;
++    let automatic = mode == "automatic";
++    let test = test_codex()
++        .with_config(move |config| {
++            config.model_provider = provider;
++            config.model_context_window = Some(if automatic {
++                10_000
++            } else {
++                CONFIGURED_CONTEXT_WINDOW
++            });
++            config.features.enable(Feature::TokenBudget).unwrap();
++            config.token_budget = Some(TokenBudgetConfig {
++                reset_on_compact: false,
++                ..TokenBudgetConfig::default()
++            });
++        })
++        .build(&server)
++        .await?;
++    test.submit_turn("ordinary policy task").await?;
++    if mode == "manual" {
++        test.codex.submit(Op::Compact).await?;
++        assert_context_compaction_item_lifecycle(&test.codex).await;
++        test.submit_turn("continue after manual compact").await?;
++    }
++    let requests = responses.requests();
++    assert_eq!(requests.len(), if mode == "explicit" { 2 } else { 3 });
++    if mode != "explicit" {
++        assert!(requests[2].body_contains_text("SYNTHETIC_NATIVE_POLICY_SUMMARY"));
++    }
++    if mode == "explicit" {
++        assert!(!requests[1].body_contains_text("ordinary policy task"));
++        let thread = test.session_configured.thread_id;
++        let before = token_budget_contexts(&requests[0]);
++        let after = token_budget_contexts(&requests[1]);
++        assert_eq!(before.len(), 1);
++        assert_eq!(after.len(), 1);
++        assert_ne!(
++            token_budget_window_ids(&before[0], thread).2,
++            token_budget_window_ids(&after[0], thread).2
++        );
++    }
++    Ok(())
++}
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn interaction_tools_explicit_new_context_still_resets() -> Result<()> {
++    interaction_tools_compaction_policy_case("explicit").await
++}
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn interaction_tools_automatic_compaction_keeps_summary_path() -> Result<()> {
++    interaction_tools_compaction_policy_case("automatic").await
++}
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn interaction_tools_manual_compaction_keeps_summary_path() -> Result<()> {
++    interaction_tools_compaction_policy_case("manual").await
++}
+--- a/features/src/feature_configs.rs
++++ b/features/src/feature_configs.rs
+@@ -94,6 +94,10 @@
+ #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+ #[serde(deny_unknown_fields)]
+ pub struct TokenBudgetConfigToml {
++    /// Use fresh windows for ordinary compaction. Defaults to true. Explicit
++    /// new_context requests always use the native fresh-window path.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub reset_on_compact: Option<bool>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub enabled: Option<bool>,
+     /// Number of tokens remaining before auto-compaction when the wrap-up reminder is emitted.

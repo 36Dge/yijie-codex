@@ -113,3 +113,15 @@ Owner approved the minimal six-existing-file shutdown repair after report41 nece
 ## FEAT-168 local image candidate
 
 The native image executor can request one Host-managed generation on the existing app-server transport. See [Host image qualification](docs/host-images.md).
+
+## 2026-11-08：原生问答与上下文工具本地候选
+
+0022 补齐已有问答协议的自由输入与敏感标记，诊断预览不带答案，非根代理不声明问答工具。
+复用原等待/响应/取消，不新增执行引擎。新增可选 reset_on_compact（默认 true）保留原默认；
+易界 profile=false 保持普通摘要，显式 new_context 仍使用原生 fresh-window。
+清理取消/新任务入口的待切换标记，防止跨轮遗留。见对应文档及元仓 FEAT-169 阶段记录。
+
+
+## FEAT-170 原生 tool_search（2026-11-08）
+
+0023 在0022之后新增受管Kimi function传输与既有CodeMode调用适配，检索/缓存/目录/执行仍复用原生。补齐线程搜索字段、完整定义历史和外部上下文保护；默认native路径及固定上游不变。独立候选fac52ad79cc7e0a379fc597a7ecfcee573205d38a60c9d0ed3a2e96871ab0f45，stable schema树不变；见[实现与验证边界](docs/tool-search.md)。未提交/发布，不覆盖原制品。

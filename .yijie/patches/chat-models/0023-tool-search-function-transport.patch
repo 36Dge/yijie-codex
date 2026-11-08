@@ -1,0 +1,904 @@
+--- a/app-server/tests/common/models_cache.rs
++++ b/app-server/tests/common/models_cache.rs
+@@ -54,6 +54,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- a/codex-api/tests/models_integration.rs
++++ b/codex-api/tests/models_integration.rs
+@@ -100,6 +100,7 @@
+             input_modalities: default_input_modalities(),
+             used_fallback_model_metadata: false,
+             supports_search_tool: false,
++            tool_search_transport: None,
+             use_responses_lite: false,
+             auto_review_model_override: None,
+             tool_mode: None,
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -845,6 +845,17 @@
+             ));
+         }
+         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
++        if model_info.tool_search_transport
++            == Some(codex_protocol::openai_models::ToolSearchTransport::FunctionCodeMode)
++            && input.iter().any(|item| {
++                matches!(
++                    item,
++                    ResponseItem::ToolSearchCall { .. } | ResponseItem::ToolSearchOutput { .. }
++                )
++            })
++        {
++            return Err(CodexErr::InvalidRequest("This model transport cannot replay native tool-search history. History was preserved; no request was sent.".to_string()));
++        }
+         let is_openai = self.state.provider.info().is_openai();
+         if !is_openai {
+             input
+--- a/core/src/context_manager/history.rs
++++ b/core/src/context_manager/history.rs
+@@ -370,6 +370,29 @@
+     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
+         let policy_with_serialization_budget = policy * 1.2;
+         match item {
++            // Native ToolSearchOutput already preserves complete tool definitions.
++            // The function transport must do the same, matched to the original
++            // native call rather than to an untrusted shape in a result string.
++            ResponseItem::FunctionCallOutput { call_id, .. }
++                if self
++                    .items
++                    .iter()
++                    .rev()
++                    .find_map(|previous| match previous {
++                        ResponseItem::FunctionCall {
++                            call_id: original,
++                            name,
++                            namespace,
++                            ..
++                        } if original == call_id => {
++                            Some(namespace.is_none() && name == codex_tools::TOOL_SEARCH_TOOL_NAME)
++                        }
++                        _ => None,
++                    })
++                    .unwrap_or(false) =>
++            {
++                item.clone()
++            }
+             ResponseItem::FunctionCallOutput {
+                 id,
+                 call_id,
+--- a/core/src/context_manager/history_tests.rs
++++ b/core/src/context_manager/history_tests.rs
+@@ -2257,3 +2257,45 @@
+ 
+     assert_eq!(estimated, raw_len);
+ }
++
++#[test]
++fn tool_search_function_transport_preserves_complete_definitions_in_history() {
++    let text = serde_json::json!({"tools":[{"type":"function","name":"ordinary_lookup","description":"Ordinary tool documentation. ".repeat(800),"parameters":{"type":"object","properties":{}}}]}).to_string();
++    for (name, namespace, preserve) in [
++        ("tool_search", None, true),
++        ("ordinary_lookup", None, false),
++        ("tool_search", Some("external".to_string()), false),
++    ] {
++        let call = ResponseItem::FunctionCall {
++            id: None,
++            name: name.to_string(),
++            namespace,
++            arguments: "{}".to_string(),
++            call_id: "history-search".into(),
++            internal_chat_message_metadata_passthrough: None,
++        };
++        let output = ResponseItem::FunctionCallOutput {
++            id: None,
++            call_id: "history-search".into(),
++            output: FunctionCallOutputPayload::from_text(text.clone()),
++            internal_chat_message_metadata_passthrough: None,
++        };
++        let mut history = ContextManager::new();
++        history.record_items([&call, &output], TruncationPolicy::Bytes(128));
++        let ResponseItem::FunctionCallOutput { output, .. } = &history.raw_items()[1] else {
++            panic!("expected function result")
++        };
++        let FunctionCallOutputBody::Text(actual) = &output.body else {
++            panic!("expected text")
++        };
++        if preserve {
++            assert_eq!(actual, &text);
++            assert!(serde_json::from_str::<serde_json::Value>(actual).is_ok());
++            let mut resumed = ContextManager::new();
++            resumed.record_items(history.raw_items(), TruncationPolicy::Bytes(128));
++            assert_eq!(resumed.raw_items(), history.raw_items());
++        } else {
++            assert!(actual.len() < text.len());
++        }
++    }
++}
+--- a/core/src/stream_events_utils.rs
++++ b/core/src/stream_events_utils.rs
+@@ -160,6 +160,10 @@
+ }
+ 
+ fn response_item_may_include_external_context(item: &ResponseItem) -> bool {
++    if matches!(item, ResponseItem::FunctionCall { name, namespace: None, .. } if name == codex_tools::TOOL_SEARCH_TOOL_NAME)
++    {
++        return true;
++    }
+     matches!(
+         item,
+         ResponseItem::ToolSearchCall { .. }
+--- a/core/src/tools/handlers/tool_search.rs
++++ b/core/src/tools/handlers/tool_search.rs
+@@ -1,5 +1,6 @@
+ use crate::function_tool::FunctionCallError;
+ use crate::tools::context::ToolInvocation;
++use crate::tools::context::ToolOutput;
+ use crate::tools::context::ToolPayload;
+ use crate::tools::context::ToolSearchOutput;
+ use crate::tools::context::boxed_tool_output;
+@@ -10,6 +11,8 @@
+ use bm25::Language;
+ use bm25::SearchEngine;
+ use bm25::SearchEngineBuilder;
++use codex_protocol::models::{ResponseInputItem, SearchToolCallParams};
++use codex_protocol::openai_models::ToolSearchTransport;
+ use codex_tools::LoadableToolSpec;
+ use codex_tools::TOOL_SEARCH_DEFAULT_LIMIT;
+ use codex_tools::TOOL_SEARCH_TOOL_NAME;
+@@ -18,6 +21,9 @@
+ use codex_tools::ToolSearchInfo;
+ use codex_tools::ToolSpec;
+ use codex_tools::coalesce_loadable_tool_specs;
++use codex_tools::{
++    JsonToolOutput, ResponsesApiTool, ToolExposure, augment_tool_spec_for_code_mode,
++};
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ use tracing::instrument;
+@@ -25,6 +31,7 @@
+ pub struct ToolSearchHandler {
+     search_infos: Vec<ToolSearchInfo>,
+     spec: ToolSpec,
++    transport: ToolSearchTransport,
+     search_engine: SearchEngine<usize>,
+ }
+ 
+@@ -35,20 +42,29 @@
+ 
+ impl ToolSearchHandlerCache {
+     #[instrument(level = "trace", skip_all, fields(search_info_count = search_infos.len()))]
+-    pub(crate) fn get_or_build(&self, search_infos: Vec<ToolSearchInfo>) -> Arc<ToolSearchHandler> {
++    pub(crate) fn get_or_build(
++        &self,
++        search_infos: Vec<ToolSearchInfo>,
++        transport: ToolSearchTransport,
++    ) -> Arc<ToolSearchHandler> {
+         {
+             let cached = self.cached();
+             if let Some(cached) = cached.as_ref()
+                 && cached.search_infos == search_infos
++                && cached.transport == transport
+             {
+                 return Arc::clone(cached);
+             }
+         }
+ 
+-        let handler = Arc::new(ToolSearchHandler::new(search_infos));
++        let handler = Arc::new(ToolSearchHandler::new_with_transport(
++            search_infos,
++            transport,
++        ));
+         let mut cached = self.cached();
+         if let Some(cached) = cached.as_ref()
+             && cached.search_infos == handler.search_infos
++            && cached.transport == handler.transport
+         {
+             return Arc::clone(cached);
+         }
+@@ -71,12 +87,35 @@
+         skip_all,
+         fields(search_info_count = search_infos.len())
+     )]
+-    pub(crate) fn new(search_infos: Vec<ToolSearchInfo>) -> Self {
++    pub(crate) fn new_with_transport(
++        search_infos: Vec<ToolSearchInfo>,
++        transport: ToolSearchTransport,
++    ) -> Self {
+         let search_source_infos = search_infos
+             .iter()
+             .filter_map(|search_info| search_info.source_info.clone())
+             .collect::<Vec<_>>();
+         let spec = create_tool_search_tool(&search_source_infos, TOOL_SEARCH_DEFAULT_LIMIT);
++        let spec = match (transport, spec) {
++            (
++                ToolSearchTransport::FunctionCodeMode,
++                ToolSpec::ToolSearch {
++                    description,
++                    parameters,
++                    ..
++                },
++            ) => ToolSpec::Function(ResponsesApiTool {
++                name: TOOL_SEARCH_TOOL_NAME.to_string(),
++                description: format!(
++                    "{description}\n\nThis deployment returns tool definitions as a function result. Call discovered tools through the native exec tool using the examples in their descriptions; searching does not execute or authorize them."
++                ),
++                parameters,
++                strict: false,
++                defer_loading: None,
++                output_schema: None,
++            }),
++            (_, spec) => spec,
++        };
+         let documents: Vec<Document<usize>> = search_infos
+             .iter()
+             .map(|search_info| search_info.entry.search_text.clone())
+@@ -90,6 +129,7 @@
+             search_infos,
+             spec,
+             search_engine,
++            transport,
+         }
+     }
+ }
+@@ -101,6 +141,13 @@
+ 
+     fn spec(&self) -> ToolSpec {
+         self.spec.clone()
++    }
++
++    fn exposure(&self) -> ToolExposure {
++        match self.transport {
++            ToolSearchTransport::Native => ToolExposure::Direct,
++            ToolSearchTransport::FunctionCodeMode => ToolExposure::DirectModelOnly,
++        }
+     }
+ 
+     fn supports_parallel_tool_calls(&self) -> bool {
+@@ -119,8 +166,13 @@
+     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+         let ToolInvocation { payload, .. } = invocation;
+ 
+-        let args = match payload {
+-            ToolPayload::ToolSearch { arguments } => arguments,
++        let args = match (payload, self.transport) {
++            (ToolPayload::ToolSearch { arguments }, ToolSearchTransport::Native) => arguments,
++            (ToolPayload::Function { arguments }, ToolSearchTransport::FunctionCodeMode) => {
++                serde_json::from_str::<SearchToolCallParams>(&arguments).map_err(|_| {
++                    FunctionCallError::RespondToModel("Invalid tool_search parameters".to_string())
++                })?
++            }
+             _ => {
+                 return Err(FunctionCallError::Fatal(format!(
+                     "{TOOL_SEARCH_TOOL_NAME} handler received unsupported payload"
+@@ -142,17 +194,56 @@
+             ));
+         }
+ 
+-        if self.search_infos.is_empty() {
+-            return Ok(boxed_tool_output(ToolSearchOutput { tools: Vec::new() }));
+-        }
+-
+-        let tools = self.search(query, limit)?;
+-
+-        Ok(boxed_tool_output(ToolSearchOutput { tools }))
++        let tools = if self.search_infos.is_empty() {
++            Vec::new()
++        } else {
++            self.search(query, limit)?
++        };
++        Ok(self.output_for_tools(tools))
+     }
+ }
+ 
+ impl CoreToolRuntime for ToolSearchHandler {}
++
++// Only transport changes. Preserve the original typed definitions and the
++// existing native Code Mode naming/examples; no second tool registry is built.
++impl ToolSearchHandler {
++    fn output_for_tools(&self, tools: Vec<LoadableToolSpec>) -> Box<dyn ToolOutput> {
++        match self.transport {
++            ToolSearchTransport::Native => boxed_tool_output(ToolSearchOutput { tools }),
++            ToolSearchTransport::FunctionCodeMode => {
++                let tools = tools
++                    .into_iter()
++                    .map(ToolSpec::from)
++                    .map(augment_tool_spec_for_code_mode)
++                    .collect::<Vec<_>>();
++                boxed_tool_output(FunctionSearchOutput(
++                    JsonToolOutput::new(serde_json::json!({"tools": tools}))
++                        .with_external_context(),
++                ))
++            }
++        }
++    }
++}
++
++struct FunctionSearchOutput(JsonToolOutput);
++impl ToolOutput for FunctionSearchOutput {
++    fn log_preview(&self) -> String {
++        "Tool search completed".to_string()
++    }
++    fn success_for_logging(&self) -> bool {
++        self.0.success_for_logging()
++    }
++    fn contains_external_context(&self) -> bool {
++        self.0.contains_external_context()
++    }
++    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
++        self.0.to_response_item(call_id, payload)
++    }
++    fn code_mode_result(&self, payload: &ToolPayload) -> serde_json::Value {
++        self.0.code_mode_result(payload)
++    }
++}
+ 
+ impl ToolSearchHandler {
+     fn search(
+@@ -205,8 +296,8 @@
+                 .expect("MCP handler should return search info"),
+         ];
+ 
+-        let first = cache.get_or_build(search_infos.clone());
+-        let second = cache.get_or_build(search_infos.clone());
++        let first = cache.get_or_build(search_infos.clone(), ToolSearchTransport::Native);
++        let second = cache.get_or_build(search_infos.clone(), ToolSearchTransport::Native);
+         assert!(Arc::ptr_eq(&first, &second));
+ 
+         let mut changed_search_infos = search_infos;
+@@ -214,8 +305,142 @@
+             .entry
+             .search_text
+             .push_str(" changed");
+-        let changed = cache.get_or_build(changed_search_infos);
++        let changed = cache.get_or_build(changed_search_infos, ToolSearchTransport::Native);
+         assert!(!Arc::ptr_eq(&first, &changed));
++    }
++
++    #[test]
++    fn tool_search_function_transport_cache_and_output() {
++        let cache = ToolSearchHandlerCache::default();
++        let infos = vec![
++            McpHandler::new(tool_info("calendar", "list_events", "List calendar events"))
++                .unwrap()
++                .search_info()
++                .unwrap(),
++        ];
++        let native = cache.get_or_build(infos.clone(), ToolSearchTransport::Native);
++        let function = cache.get_or_build(infos.clone(), ToolSearchTransport::FunctionCodeMode);
++        assert!(!Arc::ptr_eq(&native, &function));
++        assert!(Arc::ptr_eq(
++            &function,
++            &cache.get_or_build(infos.clone(), ToolSearchTransport::FunctionCodeMode)
++        ));
++        assert!(matches!(native.spec(), ToolSpec::ToolSearch { .. }));
++        assert!(matches!(function.spec(), ToolSpec::Function(_)));
++        assert_eq!(function.exposure(), ToolExposure::DirectModelOnly);
++        let result = function.output_for_tools(function.search("calendar events", 8).unwrap());
++        assert!(result.contains_external_context());
++        assert_eq!(result.log_preview(), "Tool search completed");
++        let payload = ToolPayload::Function {
++            arguments: "{}".into(),
++        };
++        let ResponseInputItem::FunctionCallOutput { call_id, output } =
++            result.to_response_item("ordinary-search", &payload)
++        else {
++            panic!("function search must produce a matching function output");
++        };
++        assert_eq!(call_id, "ordinary-search");
++        let codex_protocol::models::FunctionCallOutputBody::Text(text) = output.body else {
++            panic!("expected JSON text")
++        };
++        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
++        let tools = value["tools"].as_array().unwrap();
++        assert!(!tools.is_empty());
++        let encoded = serde_json::to_string(tools).unwrap();
++        assert!(
++            encoded.contains("mcp__calendar__list_events")
++                && encoded.contains("exec tool declaration:")
++        );
++        let empty = function.output_for_tools(vec![]).code_mode_result(&payload);
++        assert_eq!(empty["tools"], serde_json::json!([]));
++        assert!(matches!(
++            cache
++                .get_or_build(infos, ToolSearchTransport::Native)
++                .spec(),
++            ToolSpec::ToolSearch { .. }
++        ));
++    }
++
++    #[test]
++    fn tool_search_function_transport_bilingual_catalog() {
++        let selected = [
++            (
++                "list_orders",
++                "订单 查询 orders list status",
++                "订单",
++                "orders status",
++            ),
++            (
++                "export_report",
++                "报表 导出 export report csv",
++                "报表",
++                "export csv",
++            ),
++            (
++                "list_events",
++                "日程 查看 calendar events date",
++                "日程",
++                "calendar date",
++            ),
++            (
++                "lookup_stock",
++                "库存 查询 inventory warehouse stock",
++                "库存",
++                "inventory stock",
++            ),
++            (
++                "find_product",
++                "商品 检索 product catalog sku",
++                "商品",
++                "product sku",
++            ),
++            (
++                "shipping_track",
++                "物流 跟踪 shipping tracking parcel",
++                "物流",
++                "shipping parcel",
++            ),
++        ];
++        let mut infos = selected
++            .iter()
++            .map(|(name, text, _, _)| {
++                McpHandler::new(tool_info("ordinary", name, text))
++                    .unwrap()
++                    .search_info()
++                    .unwrap()
++            })
++            .collect::<Vec<_>>();
++        for n in 0..18 {
++            infos.push(
++                McpHandler::new(tool_info(
++                    "unrelated",
++                    &format!("utility_{n}"),
++                    &format!("Utility operation number {n}"),
++                ))
++                .unwrap()
++                .search_info()
++                .unwrap(),
++            );
++        }
++        let handler =
++            ToolSearchHandler::new_with_transport(infos, ToolSearchTransport::FunctionCodeMode);
++        for (name, _, zh, en) in selected {
++            for query in [zh, en] {
++                let results = serde_json::to_string(&handler.search(query, 8).unwrap()).unwrap();
++                assert!(
++                    results.contains(name),
++                    "missing target for ordinary query {query}"
++                );
++            }
++        }
++        let mut timings = Vec::new();
++        for _ in 0..10 {
++            let started = std::time::Instant::now();
++            handler.search("orders status", 8).unwrap();
++            timings.push(started.elapsed());
++        }
++        timings.sort();
++        assert!(timings[9] < std::time::Duration::from_millis(100));
+     }
+ 
+     #[test]
+@@ -257,7 +482,8 @@
+                 .search_info()
+                 .expect("dynamic handler should return search info")
+         }));
+-        let handler = ToolSearchHandler::new(search_infos);
++        let handler =
++            ToolSearchHandler::new_with_transport(search_infos, ToolSearchTransport::Native);
+         let results = [
+             &handler.search_infos[0].entry,
+             &handler.search_infos[2].entry,
+--- a/core/src/tools/spec_plan.rs
++++ b/core/src/tools/spec_plan.rs
+@@ -68,6 +68,7 @@
+ use codex_protocol::openai_models::ConfigShellToolType;
+ use codex_protocol::openai_models::InputModality;
+ use codex_protocol::openai_models::ToolMode;
++use codex_protocol::openai_models::ToolSearchTransport;
+ use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+@@ -231,6 +232,7 @@
+         }
+     }
+     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
++    preserve_function_search_direct_tools(turn_context, &mut planned_tools);
+     append_tool_search_executor(&context, &mut planned_tools);
+     prepend_code_mode_executors(&context, &mut planned_tools);
+     build_model_visible_specs_and_registry(turn_context, planned_tools)
+@@ -356,7 +358,24 @@
+ }
+ 
+ pub(crate) fn search_tool_enabled(turn_context: &TurnContext) -> bool {
+-    turn_context.model_info.supports_search_tool && namespace_tools_enabled(turn_context)
++    if !turn_context.model_info.supports_search_tool || !namespace_tools_enabled(turn_context) {
++        return false;
++    }
++    match turn_context
++        .model_info
++        .tool_search_transport
++        .unwrap_or_default()
++    {
++        ToolSearchTransport::Native => true,
++        ToolSearchTransport::FunctionCodeMode => {
++            !turn_context.session_source.is_non_root_agent()
++                && turn_context.config.code_mode.function_input
++                && matches!(
++                    effective_tool_mode(turn_context),
++                    ToolMode::CodeMode | ToolMode::CodeModeOnly
++                )
++        }
++    }
+ }
+ 
+ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
+@@ -998,8 +1017,33 @@
+         return;
+     }
+ 
+-    let handler: PlannedRuntime = context.tool_search_handler_cache.get_or_build(search_infos);
++    let handler: PlannedRuntime = context.tool_search_handler_cache.get_or_build(
++        search_infos,
++        turn_context
++            .model_info
++            .tool_search_transport
++            .unwrap_or_default(),
++    );
+     planned_tools.add_arc(handler);
++}
++
++// A tool excluded from native exec must keep its direct path. This never
++// re-exposes Hidden tools and never grants permission to execute a tool.
++fn preserve_function_search_direct_tools(turn: &TurnContext, planned: &mut PlannedTools) {
++    if turn.model_info.tool_search_transport != Some(ToolSearchTransport::FunctionCodeMode) {
++        return;
++    }
++    for runtime in &mut planned.runtimes {
++        if runtime.exposure() == ToolExposure::Deferred
++            && (is_excluded_from_code_mode(turn, runtime.code_mode_namespace().as_deref())
++                || codex_tools::collect_code_mode_tool_definitions(std::iter::once(
++                    &runtime.spec(),
++                ))
++                .is_empty())
++        {
++            *runtime = override_tool_exposure(Arc::clone(runtime), ToolExposure::DirectModelOnly);
++        }
++    }
+ }
+ 
+ fn prepend_code_mode_executors(
+--- a/core/src/tools/spec_plan_tests.rs
++++ b/core/src/tools/spec_plan_tests.rs
+@@ -1687,3 +1687,72 @@
+         }
+     }
+ }
++
++#[tokio::test]
++async fn tool_search_function_transport_exposure_and_code_mode() {
++    let plan = probe_with(
++        |turn| {
++            set_feature(turn, Feature::CodeMode, true);
++            Arc::make_mut(&mut turn.config).code_mode.function_input = true;
++            turn.model_info.tool_mode = Some(ToolMode::CodeMode);
++            turn.model_info.supports_search_tool = true;
++            turn.model_info.tool_search_transport =
++                Some(codex_protocol::openai_models::ToolSearchTransport::FunctionCodeMode);
++            Arc::make_mut(&mut turn.config)
++                .code_mode
++                .excluded_tool_namespaces
++                .push("mcp__direct".into());
++        },
++        ToolPlanInputs {
++            deferred_mcp_tools: Some(vec![
++                mcp_tool("deferred", "mcp__deferred", "lookup"),
++                mcp_tool("direct", "mcp__direct", "special_lookup"),
++            ]),
++            ..ToolPlanInputs::default()
++        },
++    )
++    .await;
++    plan.assert_visible_contains(&["tool_search", "exec"]);
++    plan.assert_visible_lacks(&["mcp__deferred"]);
++    assert_eq!(
++        plan.namespace_function_names("mcp__direct"),
++        &["special_lookup".to_string()]
++    );
++    assert_eq!(plan.exposure("tool_search"), ToolExposure::DirectModelOnly);
++    let ToolSpec::Function(exec) = plan.visible_spec("exec") else {
++        panic!("expected native function exec")
++    };
++    assert!(!exec.description.contains("mcp__deferred__lookup"));
++    assert!(!exec.description.contains("tools.tool_search"));
++}
++
++#[tokio::test]
++async fn tool_search_function_transport_requires_root_and_code_mode() {
++    for non_root in [false, true] {
++        let plan = probe_with(
++            |turn| {
++                turn.model_info.supports_search_tool = true;
++                turn.model_info.tool_search_transport =
++                    Some(codex_protocol::openai_models::ToolSearchTransport::FunctionCodeMode);
++                if non_root {
++                    set_feature(turn, Feature::CodeMode, true);
++                    Arc::make_mut(&mut turn.config).code_mode.function_input = true;
++                    turn.model_info.tool_mode = Some(ToolMode::CodeMode);
++                    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                        parent_thread_id: codex_protocol::ThreadId::new(),
++                        depth: 1,
++                        agent_path: None,
++                        agent_nickname: None,
++                        agent_role: None,
++                    });
++                }
++            },
++            ToolPlanInputs {
++                deferred_mcp_tools: Some(vec![mcp_tool("ordinary", "mcp__ordinary", "lookup")]),
++                ..ToolPlanInputs::default()
++            },
++        )
++        .await;
++        plan.assert_visible_lacks(&["tool_search"]);
++    }
++}
+--- a/core/tests/suite/auto_review.rs
++++ b/core/tests/suite/auto_review.rs
+@@ -233,6 +233,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: Some(review_model.to_string()),
+         tool_mode: None,
+--- a/core/tests/suite/model_switching.rs
++++ b/core/tests/suite/model_switching.rs
+@@ -86,6 +86,7 @@
+         input_modalities,
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+@@ -914,6 +915,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- a/core/tests/suite/models_cache_ttl.rs
++++ b/core/tests/suite/models_cache_ttl.rs
+@@ -387,6 +387,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- a/core/tests/suite/personality.rs
++++ b/core/tests/suite/personality.rs
+@@ -586,6 +586,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+@@ -704,6 +705,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- a/core/tests/suite/remote_models.rs
++++ b/core/tests/suite/remote_models.rs
+@@ -479,6 +479,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+@@ -733,6 +734,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+@@ -1260,6 +1262,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- a/core/tests/suite/rmcp_client.rs
++++ b/core/tests/suite/rmcp_client.rs
+@@ -1672,6 +1672,7 @@
+                 input_modalities: vec![InputModality::Text],
+                 used_fallback_model_metadata: false,
+                 supports_search_tool: false,
++                tool_search_transport: None,
+                 use_responses_lite: false,
+                 auto_review_model_override: None,
+                 tool_mode: None,
+--- a/core/tests/suite/spawn_agent_description.rs
++++ b/core/tests/suite/spawn_agent_description.rs
+@@ -60,6 +60,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- a/core/tests/suite/view_image.rs
++++ b/core/tests/suite/view_image.rs
+@@ -1363,6 +1363,7 @@
+         input_modalities: vec![InputModality::Text],
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- a/models-manager/src/manager.rs
++++ b/models-manager/src/manager.rs
+@@ -607,6 +607,18 @@
+     } else {
+         model_info::model_info_from_slug(model)
+     };
++    // Search capability is thread-scoped. The shared process catalogue must
++    // not enable it for title/reviewer sessions, and a per-thread catalogue
++    // must not be silently ignored. Keep all other model lookup behavior.
++    let mut model_info = model_info;
++    if let Some(scoped) = config
++        .model_catalog
++        .as_ref()
++        .and_then(|catalog| find_model_by_longest_prefix(model, &catalog.models))
++    {
++        model_info.supports_search_tool = scoped.supports_search_tool;
++        model_info.tool_search_transport = scoped.tool_search_transport;
++    }
+     model_info::with_config_overrides(model_info, config)
+ }
+ 
+--- a/models-manager/src/manager_tests.rs
++++ b/models-manager/src/manager_tests.rs
+@@ -1131,3 +1131,46 @@
+         "bundled models.json should contain at least one model"
+     );
+ }
++
++#[tokio::test]
++async fn tool_search_function_transport_catalog_is_thread_scoped() {
++    let base = remote_model("ordinary-model", "Ordinary", 1);
++    let mut selected = base.clone();
++    selected.supports_search_tool = true;
++    selected.tool_search_transport =
++        Some(codex_protocol::openai_models::ToolSearchTransport::FunctionCodeMode);
++    selected.description = Some("Thread description must not replace unrelated metadata".into());
++    let manager = static_manager_for_tests(ModelsResponse {
++        models: vec![base.clone()],
++    });
++    let normal = ModelsManagerConfig::default();
++    let ordinary = ModelsManagerConfig {
++        model_catalog: Some(ModelsResponse {
++            models: vec![selected],
++        }),
++        ..normal.clone()
++    };
++    let resolved = manager.get_model_info("ordinary-model", &ordinary).await;
++    assert!(resolved.supports_search_tool);
++    assert_eq!(
++        resolved.tool_search_transport,
++        Some(codex_protocol::openai_models::ToolSearchTransport::FunctionCodeMode)
++    );
++    assert_eq!(resolved.description, base.description);
++    let auxiliary = manager.get_model_info("ordinary-model", &normal).await;
++    assert_eq!(auxiliary.supports_search_tool, base.supports_search_tool);
++    assert_eq!(auxiliary.tool_search_transport, None);
++    let disabled = ModelsManagerConfig {
++        model_catalog: Some(ModelsResponse {
++            models: vec![base.clone()],
++        }),
++        ..normal
++    };
++    assert_eq!(
++        manager
++            .get_model_info("ordinary-model", &disabled)
++            .await
++            .supports_search_tool,
++        base.supports_search_tool
++    );
++}
+--- a/models-manager/src/model_info.rs
++++ b/models-manager/src/model_info.rs
+@@ -111,6 +111,7 @@
+         input_modalities: default_input_modalities(),
+         used_fallback_model_metadata: true, // this is the fallback model metadata
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,
+--- /dev/null
++++ b/protocol/src/bin/codex-model-catalog-schema.rs
+@@ -0,0 +1,5 @@
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let schema = schemars::schema_for!(codex_protocol::openai_models::ModelsResponse);
++    println!("{}", serde_json::to_string_pretty(&schema)?);
++    Ok(())
++}
+--- a/protocol/src/openai_models.rs
++++ b/protocol/src/openai_models.rs
+@@ -348,6 +348,15 @@
+ 
+ const fn default_effective_context_window_percent() -> i64 {
+     95
++}
++
++/// Native search execution is shared; this selects the provider-facing transport.
++#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, TS, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ToolSearchTransport {
++    #[default]
++    Native,
++    FunctionCodeMode,
+ }
+ 
+ /// Model metadata returned by the Codex backend `/models` endpoint.
+@@ -416,6 +425,8 @@
+     pub used_fallback_model_metadata: bool,
+     #[serde(default)]
+     pub supports_search_tool: bool,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub tool_search_transport: Option<ToolSearchTransport>,
+     #[serde(default)]
+     pub use_responses_lite: bool,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -703,6 +714,7 @@
+             input_modalities: default_input_modalities(),
+             used_fallback_model_metadata: false,
+             supports_search_tool: false,
++            tool_search_transport: None,
+             use_responses_lite: false,
+             auto_review_model_override: None,
+             tool_mode: None,
+--- a/tools/src/tool_config_tests.rs
++++ b/tools/src/tool_config_tests.rs
+@@ -46,6 +46,7 @@
+         input_modalities: codex_protocol::openai_models::default_input_modalities(),
+         used_fallback_model_metadata: false,
+         supports_search_tool: false,
++        tool_search_transport: None,
+         use_responses_lite: false,
+         auto_review_model_override: None,
+         tool_mode: None,

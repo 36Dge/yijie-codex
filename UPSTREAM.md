@@ -166,3 +166,14 @@ canonical r3 继续复用 `.local/web-retrieval-guard/workspace` 和 `codex-rs/t
 不得把单个真实 Kimi 三阶段样本或离线通过记为两家生成覆盖率达标。
 
 FEAT-168 adds an independently opt-in local Host image candidate on the native-public-messages-r3 patch chain. The upstream commit remains fixed. Build with `bash scripts/build-host-images.sh`; candidate provenance and scopes are recorded in `docs/host-images.md`.
+
+## FEAT-169 问答与上下文工具候选（2026-11-08）
+
+固定上游不变。在原四组 0020/0021 后增加独立 0022；不直接修改 codex-rs/。
+`build-interaction-tools.sh` 构建独立来源目录并生成 canonical app-server/config schema。
+策略与安全边界见 [两组工具适配](docs/user-input-context-tools.md)。它不是上游升级或发布。
+
+
+## FEAT-170 原生 tool_search（2026-11-08）
+
+0023 在0022之后新增受管Kimi function传输与既有CodeMode调用适配，检索/缓存/目录/执行仍复用原生。补齐线程搜索字段、完整定义历史和外部上下文保护；默认native路径及固定上游不变。独立候选fac52ad79cc7e0a379fc597a7ecfcee573205d38a60c9d0ed3a2e96871ab0f45，stable schema树不变；见[实现与验证边界](docs/tool-search.md)。未提交/发布，不覆盖原制品。

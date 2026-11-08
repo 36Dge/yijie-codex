@@ -1,0 +1,203 @@
+--- a/core/src/tools/function_namespace.rs
++++ b/core/src/tools/function_namespace.rs
+@@ -79,6 +79,10 @@
+ }
+ 
+ impl CoreToolRuntime for FunctionNamespace {
++    fn code_mode_namespace(&self) -> Option<String> {
++        self.handler.code_mode_namespace()
++    }
++
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         self.handler.matches_kind(payload)
+     }
+--- a/core/src/tools/handlers/multi_agents_common.rs
++++ b/core/src/tools/handlers/multi_agents_common.rs
+@@ -219,11 +219,13 @@
+             FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
+         })?;
+     config.approvals_reviewer = turn.config.approvals_reviewer;
+-    if config
+-        .features
+-        .enabled(codex_features::Feature::MultiAgentV2)
+-        && !config.multi_agent_v2.inherit_mcp_servers
++    // Role loading may rebuild config. The active parent's native V2 policy
++    // remains the upper bound for every child and subsequent descendant.
++    if turn.multi_agent_version == codex_protocol::protocol::MultiAgentVersion::V2
++        && (!turn.config.multi_agent_v2.inherit_mcp_servers
++            || !config.multi_agent_v2.inherit_mcp_servers)
+     {
++        config.multi_agent_v2.inherit_mcp_servers = false;
+         let mut servers = config.mcp_servers.get().clone();
+         for server in servers.values_mut() {
+             server.enabled = false;
+@@ -393,3 +395,35 @@
+         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
+     )))
+ }
++
++#[cfg(test)]
++mod native_tools_audit_tests {
++    use super::*;
++    use crate::session::tests::make_session_and_context;
++    use codex_protocol::protocol::MultiAgentVersion;
++    use std::sync::Arc;
++
++    #[tokio::test]
++    async fn native_tools_audit_child_mcp_policy_uses_live_parent() {
++        let (_session, mut turn) = make_session_and_context().await;
++        turn.multi_agent_version = MultiAgentVersion::V2;
++        let mut parent = (*turn.config).clone();
++        parent.multi_agent_v2.inherit_mcp_servers = false;
++        turn.config = Arc::new(parent);
++        let mut child = (*turn.config).clone();
++        child
++            .features
++            .disable(codex_features::Feature::MultiAgentV2)
++            .unwrap();
++        child.multi_agent_v2.inherit_mcp_servers = true;
++        let mut servers = child.mcp_servers.get().clone();
++        servers.insert(
++            "ordinary_note".to_string(),
++            toml::from_str("url = 'http://127.0.0.1:18083/mcp'\nenabled = true\n").unwrap(),
++        );
++        child.mcp_servers.set(servers).unwrap();
++        apply_spawn_agent_runtime_overrides(&mut child, &turn).unwrap();
++        assert!(!child.mcp_servers.get()["ordinary_note"].enabled);
++        assert!(!child.multi_agent_v2.inherit_mcp_servers);
++    }
++}
+--- a/core/src/tools/registry.rs
++++ b/core/src/tools/registry.rs
+@@ -46,6 +46,12 @@
+ /// Implementers provide the shared `ToolExecutor` behavior plus optional
+ /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
+ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
++    /// Logical namespace for existing Code Mode exposure policy. A transport
++    /// alias must not remove restrictions attached to its native namespace.
++    fn code_mode_namespace(&self) -> Option<String> {
++        self.tool_name().namespace
++    }
++
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         matches!(
+             payload,
+@@ -278,6 +284,10 @@
+ }
+ 
+ impl CoreToolRuntime for ExposureOverride {
++    fn code_mode_namespace(&self) -> Option<String> {
++        self.handler.code_mode_namespace()
++    }
++
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         self.handler.matches_kind(payload)
+     }
+--- a/core/src/tools/spec_plan.rs
++++ b/core/src/tools/spec_plan.rs
+@@ -242,8 +242,7 @@
+ ) {
+     for runtime in &mut planned_tools.runtimes {
+         let configured = runtime
+-            .tool_name()
+-            .namespace
++            .code_mode_namespace()
+             .as_ref()
+             .is_some_and(|namespace| {
+                 turn_context
+@@ -288,7 +287,7 @@
+             specs.push(spec_for_model_request(
+                 turn_context,
+                 exposure,
+-                &tool_name,
++                runtime.code_mode_namespace().as_deref(),
+                 spec,
+             ));
+         }
+@@ -309,13 +308,13 @@
+ fn spec_for_model_request(
+     turn_context: &TurnContext,
+     exposure: ToolExposure,
+-    tool_name: &ToolName,
++    policy_namespace: Option<&str>,
+     spec: ToolSpec,
+ ) -> ToolSpec {
+     let tool_mode = effective_tool_mode(turn_context);
+     if matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly)
+         && exposure != ToolExposure::DirectModelOnly
+-        && !is_excluded_from_code_mode(turn_context, tool_name)
++        && !is_excluded_from_code_mode(turn_context, policy_namespace)
+         && codex_code_mode::is_code_mode_nested_tool(spec.name())
+     {
+         codex_tools::augment_tool_spec_for_code_mode(spec)
+@@ -475,13 +474,14 @@
+         ))
+ }
+ 
+-fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) -> bool {
+-    tool_name.namespace.as_ref().is_some_and(|namespace| {
++fn is_excluded_from_code_mode(turn_context: &TurnContext, namespace: Option<&str>) -> bool {
++    namespace.is_some_and(|namespace| {
+         turn_context
+             .config
+             .code_mode
+             .excluded_tool_namespaces
+-            .contains(namespace)
++            .iter()
++            .any(|value| value == namespace)
+     })
+ }
+ 
+@@ -508,7 +508,7 @@
+             continue;
+         }
+ 
+-        if is_excluded_from_code_mode(turn_context, &executor.tool_name()) {
++        if is_excluded_from_code_mode(turn_context, executor.code_mode_namespace().as_deref()) {
+             continue;
+         }
+ 
+--- a/core/src/tools/spec_plan_tests.rs
++++ b/core/src/tools/spec_plan_tests.rs
+@@ -1649,3 +1649,41 @@
+     let ordinary = probe(|_| {}).await;
+     assert!(!ordinary.registered_names.is_empty());
+ }
++
++#[tokio::test]
++async fn native_tools_audit_function_alias_keeps_code_mode_namespace_policy() {
++    for direct_only in [false, true] {
++        let plan = probe_with(
++            |turn| {
++                set_features(turn, &[Feature::CodeMode]);
++                update_config(turn, |config| {
++                    config.code_mode.function_namespaces = vec!["memories".to_string()];
++                    if direct_only {
++                        config.code_mode.direct_only_tool_namespaces = vec!["memories".to_string()];
++                    } else {
++                        config.code_mode.excluded_tool_namespaces = vec!["memories".to_string()];
++                    }
++                });
++            },
++            ToolPlanInputs {
++                dynamic_tools: vec![dynamic_tool(Some("memories"), "audit_sample_read", false)],
++                ..ToolPlanInputs::default()
++            },
++        )
++        .await;
++        plan.assert_visible_contains(&["memories__audit_sample_read"]);
++        let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
++            panic!("native exec spec missing")
++        };
++        assert!(
++            !exec.description.contains("audit_sample_read"),
++            "adapted namespace escaped its existing Code Mode restriction"
++        );
++        if direct_only {
++            assert_eq!(
++                plan.exposure("memories__audit_sample_read"),
++                ToolExposure::DirectModelOnly
++            );
++        }
++    }
++}

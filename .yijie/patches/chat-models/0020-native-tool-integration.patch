@@ -1,0 +1,747 @@
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -80,6 +80,7 @@
+ use codex_protocol::config_types::Verbosity as VerbosityConfig;
+ use codex_protocol::models::ContentItem;
+ use codex_protocol::models::ResponseItem;
++use codex_protocol::models::plaintext_agent_message_content;
+ use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+ use codex_protocol::protocol::InternalSessionSource;
+@@ -849,6 +850,9 @@
+             input
+                 .iter_mut()
+                 .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
++        }
++        if matches!(model_info.slug.as_str(), "kimi-k3.1-pro" | "MiniMax-M3") {
++            project_native_agent_messages(&mut input)?;
+         }
+         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
+         let (instructions, tools) = if model_info.use_responses_lite {
+@@ -2463,3 +2467,67 @@
+ #[cfg(test)]
+ #[path = "client_tests.rs"]
+ mod tests;
++
++// Only the provider request clone is projected. Native V2 history, mailbox,
++// scheduler and turn boundaries continue to use ResponseItem::AgentMessage.
++fn project_native_agent_messages(input: &mut [ResponseItem]) -> Result<()> {
++    for item in input {
++        if let ResponseItem::AgentMessage {
++            author,
++            recipient,
++            content,
++            ..
++        } = item
++        {
++            let text = plaintext_agent_message_content(content).ok_or_else(|| {
++                CodexErr::InvalidRequest("This provider requires plaintext V2 messages; encrypted historical agent messages cannot be replayed by it.".to_string())
++            })?;
++            // Preserve the native identity envelope at ordinary conversation
++            // authority. Agent output never becomes system/developer policy.
++            *item = ResponseItem::Message {
++                id: None,
++                role: "user".to_string(),
++                content: vec![ContentItem::InputText {
++                    text: format!(
++                        "Message Type: MESSAGE\nTask name: {recipient}\nSender: {author}\nPayload:\n{text}"
++                    ),
++                }],
++                phase: None,
++                internal_chat_message_metadata_passthrough: None,
++            };
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod native_message_tests {
++    use super::*;
++    use codex_protocol::AgentPath;
++    use codex_protocol::protocol::InterAgentCommunication;
++
++    #[test]
++    fn native_tools_agent_projection_preserves_native_history_and_identity() {
++        let original = InterAgentCommunication::new(
++            AgentPath::root(),
++            AgentPath::try_from("/root/calculator").unwrap(),
++            vec![],
++            "Calculate 6 * 7".to_string(),
++            true,
++        )
++        .to_model_input_item();
++        let mut request = vec![original.clone()];
++        project_native_agent_messages(&mut request).unwrap();
++        assert!(matches!(original, ResponseItem::AgentMessage { .. }));
++        let ResponseItem::Message { role, content, .. } = &request[0] else {
++            panic!("expected supported message")
++        };
++        assert_eq!(role, "user");
++        let ContentItem::InputText { text } = &content[0] else {
++            panic!("expected native plaintext")
++        };
++        assert!(
++            text.contains("Task name: /root/calculator\nSender: /root\nPayload:\nCalculate 6 * 7")
++        );
++    }
++}
+--- a/core/src/config/config_tests.rs
++++ b/core/src/config/config_tests.rs
+@@ -10424,6 +10424,9 @@
+     .expect("multi-agent v2 config should parse");
+ 
+     let expected = MultiAgentV2Config {
++        plaintext_messages: false,
++        upgrade_existing_threads: false,
++        inherit_mcp_servers: true,
+         multi_agent_mode_hint_text: Some(String::new()),
+         ..Default::default()
+     };
+--- a/core/src/config/mod.rs
++++ b/core/src/config/mod.rs
+@@ -1089,6 +1089,8 @@
+ 
+ #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+ pub struct CodeModeConfig {
++    pub function_input: bool,
++    pub function_namespaces: Vec<String>,
+     pub excluded_tool_namespaces: Vec<String>,
+     pub direct_only_tool_namespaces: Vec<String>,
+ }
+@@ -1147,6 +1149,9 @@
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+ pub struct MultiAgentV2Config {
++    pub plaintext_messages: bool,
++    pub upgrade_existing_threads: bool,
++    pub inherit_mcp_servers: bool,
+     pub max_concurrent_threads_per_session: usize,
+     pub min_wait_timeout_ms: i64,
+     pub max_wait_timeout_ms: i64,
+@@ -1163,6 +1168,9 @@
+ impl MultiAgentV2Config {
+     fn defaults_for_max_concurrency(max_concurrent_threads_per_session: usize) -> Self {
+         Self {
++            plaintext_messages: false,
++            upgrade_existing_threads: false,
++            inherit_mcp_servers: true,
+             max_concurrent_threads_per_session,
+             min_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
+             max_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS,
+@@ -2506,6 +2514,12 @@
+     let base = code_mode_toml_config(config_toml.features.as_ref());
+ 
+     CodeModeConfig {
++        function_namespaces: base
++            .and_then(|config| config.function_namespaces.clone())
++            .unwrap_or_default(),
++        function_input: base
++            .and_then(|config| config.function_input)
++            .unwrap_or(false),
+         excluded_tool_namespaces: base
+             .and_then(|config| config.excluded_tool_namespaces.as_ref())
+             .cloned()
+@@ -2561,6 +2575,15 @@
+         .unwrap_or(default.non_code_mode_only);
+ 
+     MultiAgentV2Config {
++        plaintext_messages: base
++            .and_then(|config| config.plaintext_messages)
++            .unwrap_or(false),
++        upgrade_existing_threads: base
++            .and_then(|config| config.upgrade_existing_threads)
++            .unwrap_or(false),
++        inherit_mcp_servers: base
++            .and_then(|config| config.inherit_mcp_servers)
++            .unwrap_or(true),
+         max_concurrent_threads_per_session,
+         min_wait_timeout_ms,
+         max_wait_timeout_ms,
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -608,8 +608,19 @@
+         let model_info = models_manager
+             .get_model_info(model.as_str(), &config.to_models_manager_config())
+             .await;
+-        let multi_agent_version =
+-            resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version);
++        // An explicit V2 upgrade changes only subsequent execution. Durable history
++        // is still read by the existing reader and is never rewritten. Auxiliary
++        // agents explicitly disabled by their parent remain disabled.
++        let multi_agent_version = if config.features.enabled(Feature::MultiAgentV2)
++            && config.multi_agent_v2.upgrade_existing_threads
++            && (!session_source.is_non_root_agent()
++                || inherited_multi_agent_version != Some(MultiAgentVersion::Disabled))
++            && !config.input_only
++        {
++            Some(MultiAgentVersion::V2)
++        } else {
++            resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
++        };
+         let history_mode = conversation_history.get_history_mode(
+             requested_history_mode.unwrap_or_else(|| thread_store.default_history_mode()),
+         );
+--- a/core/src/tools/code_mode/execute_handler.rs
++++ b/core/src/tools/code_mode/execute_handler.rs
+@@ -121,10 +121,25 @@
+         } = invocation;
+ 
+         match payload {
+-            ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
+-                .execute(session, turn, call_id, input)
++            payload
++                if is_exec_tool_name(&tool_name)
++                    && crate::tools::function_input::matches(
++                        &payload,
++                        matches!(self.spec, ToolSpec::Function(_)),
++                    ) =>
++            {
++                self.execute(
++                    session,
++                    turn,
++                    call_id,
++                    crate::tools::function_input::decode(
++                        &payload,
++                        matches!(self.spec, ToolSpec::Function(_)),
++                    )?,
++                )
+                 .await
+-                .map(boxed_tool_output),
++                .map(boxed_tool_output)
++            }
+             _ => Err(FunctionCallError::RespondToModel(format!(
+                 "{PUBLIC_TOOL_NAME} expects raw JavaScript source text"
+             ))),
+@@ -134,6 +149,6 @@
+ 
+ impl CoreToolRuntime for CodeModeExecuteHandler {
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+-        matches!(payload, ToolPayload::Custom { .. })
++        crate::tools::function_input::matches(payload, matches!(self.spec, ToolSpec::Function(_)))
+     }
+ }
+--- /dev/null
++++ b/core/src/tools/function_input.rs
+@@ -0,0 +1,99 @@
++//! Thin input transport for native text tools on function-only model APIs.
++//! Execution, validation, permissions and lifecycle remain with the native tool.
++use crate::function_tool::FunctionCallError;
++use crate::tools::context::ToolPayload;
++use codex_tools::{JsonSchema, ResponsesApiTool, ToolSpec};
++use serde::Deserialize;
++use std::collections::BTreeMap;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Input {
++    input: String,
++}
++
++pub(super) fn wrap(spec: ToolSpec) -> ToolSpec {
++    let ToolSpec::Freeform(tool) = spec else {
++        return spec;
++    };
++    ToolSpec::Function(ResponsesApiTool {
++        name: tool.name,
++        description: format!(
++            "{}\n\nThis deployment accepts a JSON function call with one string field `input`. Put the complete native source or patch in that string. Syntax and code examples above describe the string contents; do not send a custom tool call.",
++            tool.description.replace(
++                "This is a FREEFORM tool, so do not wrap the patch in JSON.",
++                ""
++            )
++        ),
++        strict: false,
++        defer_loading: None,
++        parameters: JsonSchema::object(
++            BTreeMap::from([(
++                "input".to_string(),
++                JsonSchema::string(Some("Complete native source or patch text.".to_string())),
++            )]),
++            Some(vec!["input".to_string()]),
++            Some(false.into()),
++        ),
++        output_schema: None,
++    })
++}
++
++pub(super) fn matches(payload: &ToolPayload, function_input: bool) -> bool {
++    matches!(
++        (payload, function_input),
++        (ToolPayload::Function { .. }, true) | (ToolPayload::Custom { .. }, false)
++    )
++}
++
++pub(super) fn decode(
++    payload: &ToolPayload,
++    function_input: bool,
++) -> Result<String, FunctionCallError> {
++    match (payload, function_input) {
++        (ToolPayload::Custom { input }, false) => Ok(input.clone()),
++        (ToolPayload::Function { arguments }, true) => serde_json::from_str::<Input>(arguments)
++            .map(|value| value.input)
++            .map_err(|_| {
++                FunctionCallError::RespondToModel(
++                    "Expected JSON containing only a string `input` field.".to_string(),
++                )
++            }),
++        _ => Err(FunctionCallError::RespondToModel(
++            "Native text tool input format does not match its declared schema.".to_string(),
++        )),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn native_tools_function_input_preserves_normal_text() {
++        let source = "text(6 * 7);\n";
++        let payload = ToolPayload::Function {
++            arguments: serde_json::json!({"input":source}).to_string(),
++        };
++        assert_eq!(decode(&payload, true).unwrap(), source);
++        assert!(matches(&payload, true));
++        assert!(!matches(&payload, false));
++    }
++
++    #[test]
++    fn native_tools_custom_input_remains_native() {
++        let source = "*** Begin Patch\n*** Add File: note.txt\n+ordinary note\n*** End Patch\n";
++        let payload = ToolPayload::Custom {
++            input: source.to_string(),
++        };
++        assert_eq!(decode(&payload, false).unwrap(), source);
++    }
++
++    #[test]
++    fn native_tools_function_input_reports_normal_shape_error() {
++        let payload = ToolPayload::Function {
++            arguments: serde_json::json!({"input":42}).to_string(),
++        };
++        assert!(decode(&payload, true).is_err());
++    }
++}
+--- /dev/null
++++ b/core/src/tools/function_namespace.rs
+@@ -0,0 +1,123 @@
++//! Function-only transport names for explicitly selected native namespaces.
++//! The original runtime still owns execution, permissions, hooks and cancellation.
++use std::sync::Arc;
++
++use crate::function_tool::FunctionCallError;
++use crate::tools::context::{ToolInvocation, ToolOutput, ToolPayload};
++use crate::tools::registry::{
++    CoreToolRuntime, PostToolUsePayload, PreToolUsePayload, ToolArgumentDiffConsumer,
++    ToolTelemetryTags,
++};
++use codex_tools::{
++    ResponsesApiNamespaceTool, ResponsesApiTool, ToolExecutor, ToolExposure, ToolName, ToolSpec,
++};
++use futures::future::BoxFuture;
++
++pub(super) fn adapt(
++    handler: Arc<dyn CoreToolRuntime>,
++    plaintext_messages: bool,
++) -> Option<Arc<dyn CoreToolRuntime>> {
++    let original = handler.tool_name();
++    let namespace = original.namespace.as_ref()?;
++    let ToolSpec::Namespace(mut spec) = handler.spec() else {
++        return None;
++    };
++    if spec.tools.len() != 1 {
++        return None;
++    }
++    let ResponsesApiNamespaceTool::Function(mut function) = spec.tools.remove(0);
++    let alias = ToolName::plain(format!("{}__{}", namespace, original.name));
++    function.name = alias.name.clone();
++    if plaintext_messages {
++        if let Some(message) = function
++            .parameters
++            .properties
++            .as_mut()
++            .and_then(|p| p.get_mut("message"))
++        {
++            message.encrypted = None;
++        }
++    }
++    Some(Arc::new(FunctionNamespace {
++        handler,
++        original,
++        alias,
++        function,
++    }))
++}
++
++struct FunctionNamespace {
++    handler: Arc<dyn CoreToolRuntime>,
++    original: ToolName,
++    alias: ToolName,
++    function: ResponsesApiTool,
++}
++
++impl FunctionNamespace {
++    fn native_invocation(&self, mut invocation: ToolInvocation) -> ToolInvocation {
++        invocation.tool_name = self.original.clone();
++        invocation
++    }
++}
++
++impl ToolExecutor<ToolInvocation> for FunctionNamespace {
++    fn tool_name(&self) -> ToolName {
++        self.alias.clone()
++    }
++    fn spec(&self) -> ToolSpec {
++        ToolSpec::Function(self.function.clone())
++    }
++    fn exposure(&self) -> ToolExposure {
++        self.handler.exposure()
++    }
++    fn supports_parallel_tool_calls(&self) -> bool {
++        self.handler.supports_parallel_tool_calls()
++    }
++    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
++        self.handler.handle(self.native_invocation(invocation))
++    }
++}
++
++impl CoreToolRuntime for FunctionNamespace {
++    fn matches_kind(&self, payload: &ToolPayload) -> bool {
++        self.handler.matches_kind(payload)
++    }
++    fn waits_for_runtime_cancellation(&self) -> bool {
++        self.handler.waits_for_runtime_cancellation()
++    }
++    fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
++        self.handler.create_diff_consumer()
++    }
++    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
++        self.handler
++            .pre_tool_use_payload(&self.native_invocation(invocation.clone()))
++    }
++    fn post_tool_use_payload(
++        &self,
++        invocation: &ToolInvocation,
++        result: &dyn ToolOutput,
++    ) -> Option<PostToolUsePayload> {
++        self.handler
++            .post_tool_use_payload(&self.native_invocation(invocation.clone()), result)
++    }
++    fn with_updated_hook_input(
++        &self,
++        invocation: ToolInvocation,
++        updated_input: serde_json::Value,
++    ) -> Result<ToolInvocation, FunctionCallError> {
++        let mut updated = self
++            .handler
++            .with_updated_hook_input(self.native_invocation(invocation), updated_input)?;
++        updated.tool_name = self.alias.clone();
++        Ok(updated)
++    }
++    fn telemetry_tags<'a>(
++        &'a self,
++        invocation: &'a ToolInvocation,
++    ) -> BoxFuture<'a, ToolTelemetryTags> {
++        Box::pin(async move {
++            let native = self.native_invocation(invocation.clone());
++            self.handler.telemetry_tags(&native).await
++        })
++    }
++}
+--- a/core/src/tools/handlers/apply_patch.rs
++++ b/core/src/tools/handlers/apply_patch.rs
+@@ -60,11 +60,15 @@
+ #[derive(Default)]
+ pub struct ApplyPatchHandler {
+     multi_environment: bool,
++    function_input: bool,
+ }
+ 
+ impl ApplyPatchHandler {
+-    pub(crate) fn new(multi_environment: bool) -> Self {
+-        Self { multi_environment }
++    pub(crate) fn new(multi_environment: bool, function_input: bool) -> Self {
++        Self {
++            multi_environment,
++            function_input,
++        }
+     }
+ }
+ 
+@@ -254,6 +258,7 @@
+ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
+     match payload {
+         ToolPayload::Custom { input } => Some(input.clone()),
++        ToolPayload::Function { .. } => crate::tools::function_input::decode(payload, true).ok(),
+         _ => None,
+     }
+ }
+@@ -332,7 +337,12 @@
+     }
+ 
+     fn spec(&self) -> ToolSpec {
+-        create_apply_patch_freeform_tool(self.multi_environment)
++        let spec = create_apply_patch_freeform_tool(self.multi_environment);
++        if self.function_input {
++            crate::tools::function_input::wrap(spec)
++        } else {
++            spec
++        }
+     }
+ 
+     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+@@ -356,11 +366,7 @@
+             ..
+         } = invocation;
+ 
+-        let ToolPayload::Custom { input: patch_input } = payload else {
+-            return Err(FunctionCallError::RespondToModel(
+-                "apply_patch handler received unsupported payload".to_string(),
+-            ));
+-        };
++        let patch_input = crate::tools::function_input::decode(&payload, self.function_input)?;
+         let args = match codex_apply_patch::parse_patch(&patch_input) {
+             Ok(args) => args,
+             Err(parse_error) => {
+@@ -495,11 +501,15 @@
+ 
+ impl CoreToolRuntime for ApplyPatchHandler {
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+-        matches!(payload, ToolPayload::Custom { .. })
++        crate::tools::function_input::matches(payload, self.function_input)
+     }
+ 
+     fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
+-        Some(Box::<ApplyPatchArgumentDiffConsumer>::default())
++        // JSON fragments are not native patch text; terminal emission still reports
++        // the verified complete patch through the existing file-change lifecycle.
++        (!self.function_input).then(|| {
++            Box::<ApplyPatchArgumentDiffConsumer>::default() as Box<dyn ToolArgumentDiffConsumer>
++        })
+     }
+ 
+     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+@@ -518,6 +528,9 @@
+         invocation.payload = match invocation.payload {
+             ToolPayload::Custom { .. } => ToolPayload::Custom {
+                 input: patch.to_string(),
++            },
++            ToolPayload::Function { .. } if self.function_input => ToolPayload::Function {
++                arguments: serde_json::json!({"input": patch}).to_string(),
+             },
+             payload => payload,
+         };
+--- a/core/src/tools/handlers/multi_agents_common.rs
++++ b/core/src/tools/handlers/multi_agents_common.rs
+@@ -219,6 +219,21 @@
+             FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
+         })?;
+     config.approvals_reviewer = turn.config.approvals_reviewer;
++    if config
++        .features
++        .enabled(codex_features::Feature::MultiAgentV2)
++        && !config.multi_agent_v2.inherit_mcp_servers
++    {
++        let mut servers = config.mcp_servers.get().clone();
++        for server in servers.values_mut() {
++            server.enabled = false;
++        }
++        config.mcp_servers.set(servers).map_err(|_| {
++            FunctionCallError::RespondToModel(
++                "child MCP configuration cannot satisfy native requirements".to_string(),
++            )
++        })?;
++    }
+     #[allow(deprecated)]
+     let turn_cwd = turn.cwd.clone();
+     config.cwd = turn_cwd;
+--- a/core/src/tools/handlers/multi_agents_v2/message_tool.rs
++++ b/core/src/tools/handlers/multi_agents_v2/message_tool.rs
+@@ -100,8 +100,12 @@
+         .session_source
+         .get_agent_path()
+         .unwrap_or_else(AgentPath::root);
+-    let communication =
+-        communication_from_tool_message(author, receiver_agent_path.clone(), message);
++    let communication = communication_from_tool_message(
++        author,
++        receiver_agent_path.clone(),
++        message,
++        turn.config.multi_agent_v2.plaintext_messages,
++    );
+     let kind = match mode {
+         MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
+         MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
+--- a/core/src/tools/handlers/multi_agents_v2/spawn.rs
++++ b/core/src/tools/handlers/multi_agents_v2/spawn.rs
+@@ -108,7 +108,12 @@
+         .session_source
+         .get_agent_path()
+         .unwrap_or_else(AgentPath::root);
+-    let communication = communication_from_tool_message(author, new_agent_path.clone(), message);
++    let communication = communication_from_tool_message(
++        author,
++        new_agent_path.clone(),
++        message,
++        turn.config.multi_agent_v2.plaintext_messages,
++    );
+     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
+     let spawned_agent = Box::pin(
+         session
+--- a/core/src/tools/handlers/multi_agents_v2.rs
++++ b/core/src/tools/handlers/multi_agents_v2.rs
+@@ -55,7 +55,11 @@
+     author: AgentPath,
+     recipient: AgentPath,
+     message: String,
++    plaintext_messages: bool,
+ ) -> InterAgentCommunication {
++    if plaintext_messages {
++        return InterAgentCommunication::new(author, recipient, Vec::new(), message, true);
++    }
+     InterAgentCommunication::new_encrypted(
+         author,
+         recipient,
+--- a/core/src/tools/mod.rs
++++ b/core/src/tools/mod.rs
+@@ -1,6 +1,8 @@
+ pub(crate) mod code_mode;
+ pub(crate) mod context;
+ pub(crate) mod events;
++pub(crate) mod function_input;
++pub(crate) mod function_namespace;
+ pub(crate) mod handlers;
+ pub(crate) mod hook_names;
+ pub(crate) mod hosted_spec;
+--- a/core/src/tools/spec_plan.rs
++++ b/core/src/tools/spec_plan.rs
+@@ -200,6 +200,36 @@
+     };
+     let mut planned_tools = PlannedTools::default();
+     add_tool_sources(&context, &mut planned_tools);
++    // Adapt only reviewed namespaces; the underlying native runtimes are retained.
++    let mut reserved = planned_tools
++        .runtimes
++        .iter()
++        .filter(|r| r.tool_name().namespace.is_none())
++        .map(|r| r.tool_name())
++        .collect::<HashSet<_>>();
++    for runtime in &mut planned_tools.runtimes {
++        if runtime.tool_name().namespace.as_ref().is_some_and(|name| {
++            turn_context
++                .config
++                .code_mode
++                .function_namespaces
++                .contains(name)
++        }) {
++            if let Some(adapted) = crate::tools::function_namespace::adapt(
++                runtime.clone(),
++                turn_context.config.multi_agent_v2.plaintext_messages
++                    && runtime.tool_name().namespace
++                        == turn_context.config.multi_agent_v2.tool_namespace,
++            ) {
++                if reserved.insert(adapted.tool_name()) {
++                    *runtime = adapted;
++                } else {
++                    warn!("Native function namespace alias unavailable");
++                    *runtime = override_tool_exposure(runtime.clone(), ToolExposure::Hidden);
++                }
++            }
++        }
++    }
+     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
+     append_tool_search_executor(&context, &mut planned_tools);
+     prepend_code_mode_executors(&context, &mut planned_tools);
+@@ -503,12 +533,19 @@
+ 
+     vec![
+         Arc::new(CodeModeExecuteHandler::new(
+-            create_code_mode_tool(
+-                &enabled_tools,
+-                &namespace_descriptions,
+-                tool_mode == ToolMode::CodeModeOnly,
+-                deferred_tools_available,
+-            ),
++            {
++                let spec = create_code_mode_tool(
++                    &enabled_tools,
++                    &namespace_descriptions,
++                    tool_mode == ToolMode::CodeModeOnly,
++                    deferred_tools_available,
++                );
++                if turn_context.config.code_mode.function_input {
++                    crate::tools::function_input::wrap(spec)
++                } else {
++                    spec
++                }
++            },
+             code_mode_nested_tool_specs,
+         )),
+         Arc::new(CodeModeWaitHandler),
+@@ -740,7 +777,11 @@
+     if environment_mode.has_environment() && turn_context.model_info.apply_patch_tool_type.is_some()
+     {
+         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+-        planned_tools.add(ApplyPatchHandler::new(include_environment_id));
++        planned_tools.add(ApplyPatchHandler::new(
++            include_environment_id,
++            turn_context.model_info.apply_patch_tool_type
++                == Some(codex_protocol::openai_models::ApplyPatchToolType::Function),
++        ));
+     }
+ 
+     if turn_context
+--- a/features/src/feature_configs.rs
++++ b/features/src/feature_configs.rs
+@@ -7,6 +7,12 @@
+ #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+ #[serde(deny_unknown_fields)]
+ pub struct CodeModeConfigToml {
++    /// Accept native source as a JSON function `input` string.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub function_input: Option<bool>,
++    /// Exact native namespaces transported as plain function names.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub function_namespaces: Option<Vec<String>>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub enabled: Option<bool>,
+     /// Exact tool namespaces to omit from the code-mode nested tool surface.
+@@ -32,6 +38,15 @@
+ #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+ #[serde(deny_unknown_fields)]
+ pub struct MultiAgentV2ConfigToml {
++    /// Use native plaintext inter-agent messages with function-only providers.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub plaintext_messages: Option<bool>,
++    /// Explicitly use V2 for new execution when resuming an existing thread.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub upgrade_existing_threads: Option<bool>,
++    /// Whether child agents inherit configured MCP servers. Defaults to true.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub inherit_mcp_servers: Option<bool>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub enabled: Option<bool>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+--- a/memories/write/src/start.rs
++++ b/memories/write/src/start.rs
+@@ -27,7 +27,8 @@
+     config: Arc<Config>,
+     source: &SessionSource,
+ ) {
+-    if config.ephemeral
++    if !config.memories.generate_memories
++        || config.ephemeral
+         || !config.features.enabled(Feature::MemoryTool)
+         || source.is_non_root_agent()
+     {
+--- a/protocol/src/openai_models.rs
++++ b/protocol/src/openai_models.rs
+@@ -280,6 +280,7 @@
+ #[serde(rename_all = "snake_case")]
+ pub enum ApplyPatchToolType {
+     Freeform,
++    Function,
+ }
+ 
+ #[derive(
