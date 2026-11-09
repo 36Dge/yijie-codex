@@ -1,0 +1,598 @@
+--- a/config/src/config_toml.rs
++++ b/config/src/config_toml.rs
+@@ -148,10 +148,21 @@
+     pub enabled: Option<bool>,
+ }
+ 
++/// Owned process cleanup policy. Cooperative mode never escalates to a force kill.
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum ExecShutdownPolicy {
++    #[default]
++    Default,
++    CooperativeOnly,
++}
++
+ /// Base config deserialized from ~/.codex/config.toml.
+ #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+ #[schemars(deny_unknown_fields)]
+ pub struct ConfigToml {
++    /// Opt-in normal process shutdown; unsupported execution backends fail before spawn.
++    pub exec_shutdown_policy: Option<ExecShutdownPolicy>,
+     /// Restrict this thread to explicit text input and model text output.
+     /// Disables tools, external instructions and extension initialization.
+     pub input_only: Option<bool>,
+--- a/core/src/config/mod.rs
++++ b/core/src/config/mod.rs
+@@ -613,6 +613,7 @@
+ /// Application configuration loaded from disk and merged with overrides.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Config {
++    pub exec_shutdown_policy: codex_config::config_toml::ExecShutdownPolicy,
+     /// Native input-only execution restriction; never a model instruction.
+     pub input_only: bool,
+     /// Use the authenticated desktop Host for image generation in this thread.
+@@ -3863,6 +3864,7 @@
+             model,
+             service_tier,
+             review_model,
++            exec_shutdown_policy: cfg.exec_shutdown_policy.unwrap_or_default(),
+             input_only: cfg.input_only.unwrap_or(false),
+             yijie_host_images: cfg.yijie_host_images.unwrap_or(false) && !cfg.input_only.unwrap_or(false),
+             model_context_window: cfg.model_context_window,
+--- a/core/src/session/handlers.rs
++++ b/core/src/session/handlers.rs
+@@ -61,6 +61,9 @@
+ use tracing::warn;
+ 
+ pub async fn interrupt(sess: &Arc<Session>) {
++    sess.services
++        .unified_exec_manager
++        .request_cooperative_stop();
+     sess.interrupt_task().await;
+ }
+ 
+--- a/core/src/session/session.rs
++++ b/core/src/session/session.rs
+@@ -1079,7 +1079,7 @@
+                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
+                 unified_exec_manager: UnifiedExecProcessManager::new(
+                     config.background_terminal_max_timeout,
+-                ),
++                ).with_shutdown_policy(config.exec_shutdown_policy),
+                 elicitations: crate::elicitation::ElicitationService::new(),
+                 shell_zsh_path: config.zsh_path.clone(),
+                 main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
+--- a/core/src/tools/handlers/shell.rs
++++ b/core/src/tools/handlers/shell.rs
+@@ -61,6 +61,11 @@
+ }
+ 
+ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, FunctionCallError> {
++    if args.turn.config.exec_shutdown_policy
++        == codex_config::config_toml::ExecShutdownPolicy::CooperativeOnly
++    {
++        return Err(FunctionCallError::RespondToModel("Use exec_command: this session requires native cooperative shutdown; the legacy shell backend is unavailable".into()));
++    }
+     let RunExecLikeArgs {
+         tool_name,
+         exec_params,
+--- a/core/src/tools/runtimes/unified_exec.rs
++++ b/core/src/tools/runtimes/unified_exec.rs
+@@ -138,7 +138,13 @@
+     pub fn new(manager: &'a UnifiedExecProcessManager, shell_mode: UnifiedExecShellMode) -> Self {
+         Self {
+             manager,
+-            shell_mode,
++            // The driver-backed fork has its own termination owner. Use the
++            // native direct backend until it supports cooperative shutdown.
++            shell_mode: if manager.cooperative_only() {
++                UnifiedExecShellMode::Direct
++            } else {
++                shell_mode
++            },
+         }
+     }
+ }
+--- a/core/src/unified_exec/mod.rs
++++ b/core/src/unified_exec/mod.rs
+@@ -133,13 +133,51 @@
+ 
+ pub(crate) struct UnifiedExecProcessManager {
+     process_store: Mutex<ProcessStore>,
++    cooperative_only: bool,
++    cooperative_processes: process::CooperativeProcesses,
+     max_write_stdin_yield_time_ms: u64,
+ }
+ 
+ impl UnifiedExecProcessManager {
++    pub(crate) fn with_shutdown_policy(
++        mut self,
++        policy: codex_config::config_toml::ExecShutdownPolicy,
++    ) -> Self {
++        self.cooperative_only =
++            policy == codex_config::config_toml::ExecShutdownPolicy::CooperativeOnly;
++        self
++    }
++    pub(crate) fn request_cooperative_stop(&self) {
++        if !self.cooperative_only {
++            return;
++        }
++        let processes = self
++            .cooperative_processes
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        for process in processes.iter().filter_map(std::sync::Weak::upgrade) {
++            process.request_terminate();
++        }
++    }
++    pub(crate) fn cooperative_stop_pending(&self) -> bool {
++        self.cooperative_only
++            && self
++                .cooperative_processes
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .iter()
++                .filter_map(std::sync::Weak::upgrade)
++                .any(|p| p.stop_requested() && !p.has_exited())
++    }
++    pub(crate) fn cooperative_only(&self) -> bool {
++        self.cooperative_only
++    }
++
+     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
+         Self {
+             process_store: Mutex::new(ProcessStore::default()),
++            cooperative_only: false,
++            cooperative_processes: Default::default(),
+             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
+                 .max(MIN_EMPTY_YIELD_TIME_MS),
+         }
+--- a/core/src/unified_exec/process.rs
++++ b/core/src/unified_exec/process.rs
+@@ -33,6 +33,9 @@
+ use super::head_tail_buffer::HeadTailBuffer;
+ use super::process_state::ProcessState;
+ 
++pub(crate) type CooperativeProcesses =
++    Arc<std::sync::Mutex<Vec<std::sync::Weak<ExecCommandSession>>>>;
++
+ const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+ pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
+     /// Returns file descriptors that must stay open across the child `exec()`.
+@@ -67,7 +70,7 @@
+ 
+ /// Transport-specific process handle used by unified exec.
+ enum ProcessHandle {
+-    Local(Box<ExecCommandSession>),
++    Local(Arc<ExecCommandSession>),
+     ExecServer(Arc<dyn ExecProcess>),
+ }
+ 
+@@ -179,6 +182,11 @@
+     }
+ 
+     pub(super) fn has_exited(&self) -> bool {
++        if let ProcessHandle::Local(p) = &self.process_handle {
++            if p.cooperative_only() {
++                return p.has_exited();
++            }
++        }
+         let state = self.state_rx.borrow().clone();
+         match &self.process_handle {
+             ProcessHandle::Local(process_handle) => state.has_exited || process_handle.has_exited(),
+@@ -206,6 +214,12 @@
+     }
+ 
+     pub(super) fn terminate(&self) {
++        if let ProcessHandle::Local(p) = &self.process_handle {
++            if p.cooperative_only() {
++                p.request_terminate();
++                return;
++            }
++        }
+         match &self.process_handle {
+             ProcessHandle::Local(process_handle) => process_handle.terminate(),
+             ProcessHandle::ExecServer(process_handle) => {
+@@ -219,6 +233,18 @@
+     }
+ 
+     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
++        if let ProcessHandle::Local(p) = &self.process_handle {
++            if p.cooperative_only() {
++                p.request_terminate();
++                return if p.has_exited() {
++                    Ok(())
++                } else {
++                    Err(UnifiedExecError::process_failed(
++                        "STOP_PENDING: command is still closing normally".into(),
++                    ))
++                };
++            }
++        }
+         match &self.process_handle {
+             ProcessHandle::Local(process_handle) => process_handle.terminate(),
+             ProcessHandle::ExecServer(process_handle) => {
+@@ -314,10 +340,20 @@
+         Ok(())
+     }
+ 
++    #[cfg(target_os = "windows")]
+     pub(super) async fn from_spawned(
+         spawned: SpawnedPty,
+         sandbox_type: SandboxType,
+         spawn_lifecycle: SpawnLifecycleHandle,
++    ) -> Result<Self, UnifiedExecError> {
++        Self::from_spawned_with_policy(spawned, sandbox_type, spawn_lifecycle, None).await
++    }
++
++    pub(super) async fn from_spawned_with_policy(
++        spawned: SpawnedPty,
++        sandbox_type: SandboxType,
++        spawn_lifecycle: SpawnLifecycleHandle,
++        cooperative: Option<&CooperativeProcesses>,
+     ) -> Result<Self, UnifiedExecError> {
+         let SpawnedPty {
+             session: process_handle,
+@@ -325,9 +361,18 @@
+             stderr_rx,
+             mut exit_rx,
+         } = spawned;
++        let process_handle = Arc::new(process_handle);
++        if let Some(registry) = cooperative {
++            process_handle.set_cooperative_only();
++            let mut registry = registry
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            registry.retain(|entry| entry.strong_count() > 0);
++            registry.push(Arc::downgrade(&process_handle));
++        }
+         let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
+         let mut managed = Self::new(
+-            ProcessHandle::Local(Box::new(process_handle)),
++            ProcessHandle::Local(Arc::clone(&process_handle)),
+             sandbox_type,
+             Some(spawn_lifecycle),
+         );
+@@ -339,6 +384,23 @@
+             Arc::clone(&managed.output_closed_notify),
+             managed.output_tx.clone(),
+         ));
++
++        if cooperative.is_some() {
++            // Register before the first await and retain a strong handle even
++            // if the caller is cancelled before insertion into ProcessStore.
++            let state_tx = managed.state_tx.clone();
++            let cancellation = managed.cancellation_token.clone();
++            tokio::spawn(async move {
++                let exit_code = exit_rx.await.ok();
++                while !process_handle.has_exited() {
++                    tokio::time::sleep(Duration::from_millis(20)).await;
++                }
++                let state = state_tx.borrow().clone();
++                state_tx.send_replace(state.exited(exit_code));
++                cancellation.cancel();
++            });
++            return Ok(managed);
++        }
+ 
+         match exit_rx.try_recv() {
+             Ok(exit_code) => {
+--- a/core/src/unified_exec/process_manager.rs
++++ b/core/src/unified_exec/process_manager.rs
+@@ -424,6 +424,14 @@
+     pub(crate) async fn release_process_id(&self, process_id: i32) {
+         let removed = {
+             let mut store = self.process_store.lock().await;
++            if self.cooperative_only
++                && store
++                    .processes
++                    .get(&process_id)
++                    .is_some_and(|e| !e.process.has_exited())
++            {
++                return;
++            }
+             store.remove(process_id)
+         };
+         if let Some(entry) = removed {
+@@ -437,6 +445,28 @@
+         context: &UnifiedExecContext,
+     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+         let cwd = request.cwd.clone();
++        if self.cooperative_stop_pending() {
++            self.release_process_id(request.process_id).await;
++            return Err(UnifiedExecError::process_failed(
++                "STOP_PENDING: waiting for the previous command to close normally".into(),
++            ));
++        }
++        if self.cooperative_only {
++            let mut store = self.process_store.lock().await;
++            let finished: Vec<i32> = store
++                .processes
++                .iter()
++                .filter(|(_, e)| e.process.has_exited())
++                .map(|(id, _)| *id)
++                .collect();
++            for id in finished {
++                store.remove(id);
++            }
++            if store.reserved_process_ids.len() > MAX_UNIFIED_EXEC_PROCESSES {
++                store.reserved_process_ids.remove(&request.process_id);
++                return Err(UnifiedExecError::process_failed("STOP_PENDING: native process capacity is occupied; no active process was evicted".into()));
++            }
++        }
+         let process = self
+             .open_session_with_sandbox(&request, cwd.clone(), context)
+             .await;
+@@ -918,7 +948,11 @@
+         };
+         let pruned_entry = {
+             let mut store = self.process_store.lock().await;
+-            let pruned_entry = Self::prune_processes_if_needed(&mut store);
++            let pruned_entry = if self.cooperative_only {
++                None
++            } else {
++                Self::prune_processes_if_needed(&mut store)
++            };
+             store.processes.insert(process_id, entry);
+             pruned_entry
+         };
+@@ -990,6 +1024,9 @@
+         mut spawn_lifecycle: SpawnLifecycleHandle,
+         environment: &codex_exec_server::Environment,
+     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
++        if self.cooperative_only && (!cfg!(unix) || environment.is_remote()) {
++            return Err(UnifiedExecError::create_process("cooperative_only requires the qualified local Unix native backend; no process was started".into()));
++        }
+         let inherited_fds = spawn_lifecycle.inherited_fds();
+ 
+         #[cfg(target_os = "windows")]
+@@ -1131,7 +1168,13 @@
+         let spawned =
+             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+         spawn_lifecycle.after_spawn();
+-        UnifiedExecProcess::from_spawned(spawned, request.sandbox, spawn_lifecycle).await
++        UnifiedExecProcess::from_spawned_with_policy(
++            spawned,
++            request.sandbox,
++            spawn_lifecycle,
++            self.cooperative_only.then_some(&self.cooperative_processes),
++        )
++        .await
+     }
+ 
+     pub(super) async fn open_session_with_sandbox(
+@@ -1407,6 +1450,48 @@
+     }
+ 
+     pub(crate) async fn terminate_all_processes(&self) {
++        if self.cooperative_only {
++            let started = Instant::now();
++            let mut warned = false;
++            loop {
++                let pending = {
++                    let mut registry = self
++                        .cooperative_processes
++                        .lock()
++                        .unwrap_or_else(std::sync::PoisonError::into_inner);
++                    registry.retain(|p| p.upgrade().is_some_and(|p| !p.has_exited()));
++                    registry
++                        .iter()
++                        .filter_map(std::sync::Weak::upgrade)
++                        .collect::<Vec<_>>()
++                };
++                if pending.is_empty() {
++                    break;
++                }
++                for process in pending {
++                    process.request_terminate();
++                }
++                if !warned && started.elapsed() >= Duration::from_secs(30) {
++                    warned = true;
++                    let session = self
++                        .process_store
++                        .lock()
++                        .await
++                        .processes
++                        .values()
++                        .find_map(|e| e.session.upgrade());
++                    if let Some(session) = session {
++                        session.send_event_raw(codex_protocol::protocol::Event {
++                            id: String::new(),
++                            msg: codex_protocol::protocol::EventMsg::Warning(codex_protocol::protocol::WarningEvent {
++                                message: "STOP_PENDING: waiting for commands to close normally; no process was force terminated".into(),
++                            }),
++                        }).await;
++                    }
++                }
++                tokio::time::sleep(Duration::from_millis(50)).await;
++            }
++        }
+         let entries: Vec<ProcessEntry> = {
+             let mut processes = self.process_store.lock().await;
+             let entries: Vec<ProcessEntry> = processes
+--- /dev/null
++++ b/utils/pty/src/cooperative_tests.rs
+@@ -0,0 +1,86 @@
++//! Normal process completion and supported cooperative cancellation only.
++//! No process kill, fault injection, executable substitution or permission edits.
++use crate::spawn_pipe_process;
++use std::collections::HashMap;
++use std::time::Duration;
++
++#[tokio::test]
++async fn cooperative_normal_exit_preserves_output_and_code() {
++    let mut child = spawn_pipe_process(
++        "/bin/sh",
++        &["-c".into(), "printf 'ordinary output\\n'".into()],
++        std::env::temp_dir().as_path(),
++        &HashMap::new(),
++        &None,
++    )
++    .await
++    .expect("normal spawn");
++    child.session.set_cooperative_only();
++    assert_eq!(child.exit_rx.await.expect("normal exit"), 0);
++    let mut output = Vec::new();
++    while let Some(bytes) = child.stdout_rx.recv().await {
++        output.extend(bytes);
++    }
++    while !child.session.has_exited() {
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    assert_eq!(output, b"ordinary output\n");
++    // Already exited: cleanup must not signal a recycled process group.
++    child.session.terminate();
++    assert!(!child.session.stop_requested());
++}
++
++#[tokio::test]
++async fn cooperative_stop_is_idempotent_and_process_exits_normally() {
++    let mut child = spawn_pipe_process(
++        "/bin/sh", &["-c".into(), "trap 'printf stopped; exit 0' INT; printf ready; for i in 1 2 3 4 5; do sleep 0.1; done".into()],
++        std::env::temp_dir().as_path(), &HashMap::new(), &None,
++    ).await.expect("normal spawn");
++    child.session.set_cooperative_only();
++    assert!(
++        child
++            .stdout_rx
++            .recv()
++            .await
++            .expect("ready output")
++            .starts_with(b"ready")
++    );
++    child.session.request_terminate();
++    child.session.request_terminate();
++    assert!(child.session.stop_requested());
++    assert_eq!(child.exit_rx.await.expect("cooperative exit"), 0);
++    let mut tail = Vec::new();
++    while let Some(bytes) = child.stdout_rx.recv().await {
++        tail.extend(bytes);
++    }
++    while !child.session.has_exited() {
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    assert!(tail.ends_with(b"stopped"));
++}
++
++#[tokio::test]
++async fn cooperative_exited_parent_drains_normal_descendant_output() {
++    let mut child = spawn_pipe_process(
++        "/bin/sh",
++        &["-c".into(), "(sleep 0.2; printf tail) & printf head; exit 0".into()],
++        std::env::temp_dir().as_path(),
++        &HashMap::new(),
++        &None,
++    )
++    .await
++    .expect("normal spawn");
++    child.session.set_cooperative_only();
++    assert_eq!(child.exit_rx.await.expect("parent exits normally"), 0);
++    // The process group may still own an output writer; retain it until EOF,
++    // without sending a signal using the already-exited parent's identity.
++    child.session.request_terminate();
++    let mut output = Vec::new();
++    while let Some(bytes) = child.stdout_rx.recv().await {
++        output.extend(bytes);
++    }
++    while !child.session.has_exited() {
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    assert_eq!(output, b"headtail");
++}
+--- a/utils/pty/src/lib.rs
++++ b/utils/pty/src/lib.rs
+@@ -43,3 +43,6 @@
+ pub use win::conpty::RawConPty;
+ #[cfg(windows)]
+ pub use windows_input::WindowsTtyInputNormalizer;
++
++#[cfg(all(test, unix))]
++mod cooperative_tests;
+--- a/utils/pty/src/process.rs
++++ b/utils/pty/src/process.rs
+@@ -115,6 +115,8 @@
+     reader_abort_handles: StdMutex<Vec<AbortHandle>>,
+     writer_handle: StdMutex<Option<JoinHandle<()>>>,
+     wait_handle: StdMutex<Option<JoinHandle<()>>>,
++    cooperative_only: AtomicBool,
++    stop_requested: AtomicBool,
+     exit_status: Arc<AtomicBool>,
+     exit_code: Arc<StdMutex<Option<i32>>>,
+     // PtyHandles must be preserved because the process will receive Control+C if the
+@@ -152,6 +154,8 @@
+             reader_abort_handles: StdMutex::new(reader_abort_handles),
+             writer_handle: StdMutex::new(Some(writer_handle)),
+             wait_handle: StdMutex::new(Some(wait_handle)),
++            cooperative_only: AtomicBool::new(false),
++            stop_requested: AtomicBool::new(false),
+             exit_status,
+             exit_code,
+             _pty_handles: StdMutex::new(pty_handles),
+@@ -159,6 +163,20 @@
+         }
+     }
+ 
++    /// Must be selected immediately after native spawn, before any await.
++    pub fn set_cooperative_only(&self) {
++        self.cooperative_only
++            .store(true, std::sync::atomic::Ordering::Release);
++    }
++    pub fn stop_requested(&self) -> bool {
++        self.stop_requested
++            .load(std::sync::atomic::Ordering::Acquire)
++    }
++    pub fn cooperative_only(&self) -> bool {
++        self.cooperative_only
++            .load(std::sync::atomic::Ordering::Acquire)
++    }
++
+     /// Returns a channel sender for writing raw bytes to the child stdin.
+     pub fn writer_sender(&self) -> mpsc::Sender<Vec<u8>> {
+         if let Ok(writer_tx) = self.writer_tx.lock()
+@@ -175,6 +193,11 @@
+     /// True if the child process has exited.
+     pub fn has_exited(&self) -> bool {
+         self.exit_status.load(std::sync::atomic::Ordering::SeqCst)
++            && (!self.cooperative_only()
++                || self
++                    .reader_handle
++                    .lock()
++                    .is_ok_and(|h| h.as_ref().is_none_or(|h| h.is_finished())))
+     }
+ 
+     /// Returns the exit code if known.
+@@ -219,6 +242,21 @@
+     /// Attempts to kill the child while leaving the reader/writer tasks alive
+     /// so callers can still drain output until EOF.
+     pub fn request_terminate(&self) {
++        if self.cooperative_only() {
++            if !self.has_exited()
++                && !self
++                    .stop_requested
++                    .swap(true, std::sync::atomic::Ordering::AcqRel)
++            {
++                self.close_stdin();
++                // Output can still be draining after the direct child exits.
++                // Do not signal a process-group id whose owner already exited.
++                if !self.exit_status.load(std::sync::atomic::Ordering::SeqCst) {
++                    let _ = self.signal(ProcessSignal::Interrupt);
++                }
++            }
++            return;
++        }
+         if let Ok(mut killer_opt) = self.killer.lock()
+             && let Some(mut killer) = killer_opt.take()
+         {
+@@ -240,6 +278,11 @@
+     /// Attempts to kill the child and abort helper tasks.
+     pub fn terminate(&self) {
+         self.request_terminate();
++        // Keep helpers/PTY ownership until natural EOF. Dropping JoinHandles
++        // detaches them; it must not abort the child's wait/output tasks here.
++        if self.cooperative_only() {
++            return;
++        }
+ 
+         if let Ok(mut h) = self.reader_handle.lock()
+             && let Some(handle) = h.take()

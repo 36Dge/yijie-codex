@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- FEAT-171: add the optional native `cooperative_only` process lifecycle policy
+  and a separate content-addressed build. Retain live command ownership and
+  output through normal stop; no force-kill fallback in this profile. Reuse
+  native execution/approval/view_image. See `docs/document-runtime.md`.
+  Reaudit: keep draining output after direct-child exit without signalling its
+  retired process-group identity; three normal lifecycle tests cover this path.
+
 - Accept both exact v1 public-message namespace spellings through 0018. The
   observed hyphen spelling now supplies the explicit model-declared phase,
   while unknown stages/versions remain unknown. Streaming, completed messages

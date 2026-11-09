@@ -1,5 +1,10 @@
 # Upstream
 
+2026-11-09 FEAT-171 appends the authorized 0024 cooperative-only execution
+cleanup overlay after 0023. Canonical upstream remains unchanged; retained
+artifacts are not overwritten. See `docs/document-runtime.md` and the canonical
+`scripts/build-document-runtime.sh` entry. This is a local candidate, not a release.
+
 2026-11-05 native-public-messages r2 appends 0017 after the retained 0016 candidate.
 It validates the existing one-declaration-per-Item contract after a real provider
 returned a scripted opening/final transcript inside one Item. Reuse the native
