@@ -1,0 +1,1239 @@
+diff --git a/app-server-protocol/src/protocol/common.rs b/app-server-protocol/src/protocol/common.rs
+--- a/app-server-protocol/src/protocol/common.rs
++++ b/app-server-protocol/src/protocol/common.rs
+@@ -796,6 +796,16 @@
+         params: v2::SkillsConfigWriteParams,
+         serialization: global("config"),
+         response: v2::SkillsConfigWriteResponse,
++    },
++    PluginStateRead => "plugin/state/read" {
++        params: v2::PluginStateReadParams,
++        serialization: global("config"),
++        response: v2::PluginStateReadResponse,
++    },
++    PluginRefresh => "plugin/refresh" {
++        params: v2::PluginRefreshParams,
++        serialization: global("config"),
++        response: v2::PluginRefreshResponse,
+     },
+     PluginInstall => "plugin/install" {
+         params: v2::PluginInstallParams,
+diff --git a/app-server-protocol/src/protocol/v2/plugin.rs b/app-server-protocol/src/protocol/v2/plugin.rs
+--- a/app-server-protocol/src/protocol/v2/plugin.rs
++++ b/app-server-protocol/src/protocol/v2/plugin.rs
+@@ -895,3 +895,59 @@
+ /// Treat this as an invalidation signal and re-run `skills/list` with the
+ /// client's current parameters when refreshed skill metadata is needed.
+ pub struct SkillsChangedNotification {}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct PluginStateReadParams {
++    #[serde(default)]
++    pub plugin_ids: Vec<String>,
++    #[serde(default)]
++    pub marketplace_names: Vec<String>,
++    pub cwd: Option<AbsolutePathBuf>,
++}
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct PluginState {
++    pub plugin_id: String,
++    pub user_config_present: bool,
++    pub user_enabled: Option<bool>,
++    pub effective_enabled: bool,
++    pub cache_state: PluginCacheState,
++    pub cache_version: Option<String>,
++    pub manifest_valid: bool,
++    pub catalog_listed: bool,
++    pub skills: Vec<SkillSummary>,
++    pub errors: Vec<String>,
++}
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "snake_case")]
++#[ts(export_to = "v2/")]
++pub enum PluginCacheState {
++    Absent,
++    Valid,
++    Invalid,
++}
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct PluginStateReadResponse {
++    pub states: Vec<PluginState>,
++}
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct PluginRefreshParams {
++    pub plugin_id: String,
++    pub marketplace_path: AbsolutePathBuf,
++    #[serde(default)]
++    pub force: bool,
++}
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct PluginRefreshResponse {
++    pub changed: bool,
++    pub state: PluginState,
++}
+diff --git a/app-server/src/message_processor.rs b/app-server/src/message_processor.rs
+--- a/app-server/src/message_processor.rs
++++ b/app-server/src/message_processor.rs
+@@ -382,6 +382,7 @@
+         let plugin_processor = PluginRequestProcessor::new(
+             auth_manager.clone(),
+             Arc::clone(&thread_manager),
++            thread_watch_manager.clone(),
+             outgoing.clone(),
+             analytics_events_client.clone(),
+             config_manager.clone(),
+@@ -1235,6 +1236,12 @@
+             ClientRequest::SkillsConfigWrite { params, .. } => {
+                 self.catalog_processor.skills_config_write(params).await
+             }
++            ClientRequest::PluginStateRead { params, .. } => {
++                self.plugin_processor.plugin_state_read(params).await
++            }
++            ClientRequest::PluginRefresh { params, .. } => {
++                self.plugin_processor.plugin_refresh(params).await
++            }
+             ClientRequest::PluginInstall { params, .. } => {
+                 self.plugin_processor.plugin_install(params).await
+             }
+diff --git a/app-server/src/request_processors/marketplace_processor.rs b/app-server/src/request_processors/marketplace_processor.rs
+--- a/app-server/src/request_processors/marketplace_processor.rs
++++ b/app-server/src/request_processors/marketplace_processor.rs
+@@ -73,6 +73,9 @@
+         params: MarketplaceUpgradeParams,
+     ) -> Result<MarketplaceUpgradeResponse, JSONRPCErrorError> {
+         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
++        if config.plugins_config_input().local_only() {
++            return Err(invalid_request("remote marketplace upgrades are disabled"));
++        }
+         let plugins_manager = self.thread_manager.plugins_manager();
+         let MarketplaceUpgradeParams { marketplace_name } = params;
+         let plugins_input = config.plugins_config_input();
+@@ -106,6 +109,19 @@
+         params: MarketplaceAddParams,
+     ) -> Result<MarketplaceAddResponse, JSONRPCErrorError> {
+         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
++        if config.plugins_config_input().local_only() {
++            if params.ref_name.is_some()
++                || params.sparse_paths.as_ref().is_some_and(|p| !p.is_empty())
++                || !codex_core_plugins::local_policy::allows_root(
++                    &config.config_layer_stack,
++                    std::path::Path::new(&params.source),
++                )
++            {
++                return Err(invalid_request(
++                    "marketplace source is not an admitted local root",
++                ));
++            }
++        }
+         add_marketplace_to_codex_home(
+             self.config.codex_home.to_path_buf(),
+             config.config_layer_stack.requirements().clone(),
+diff --git a/app-server/src/request_processors/plugins.rs b/app-server/src/request_processors/plugins.rs
+--- a/app-server/src/request_processors/plugins.rs
++++ b/app-server/src/request_processors/plugins.rs
+@@ -5,6 +5,10 @@
+ use codex_app_server_protocol::PluginInstallPolicy;
+ use codex_app_server_protocol::PluginSharePrincipalRole;
+ use codex_app_server_protocol::PluginShareTargetRole;
++use codex_app_server_protocol::{
++    PluginCacheState, PluginRefreshParams, PluginRefreshResponse, PluginState,
++    PluginStateReadParams, PluginStateReadResponse,
++};
+ use codex_config::types::McpServerConfig;
+ use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
+ use codex_core_plugins::PluginListBackgroundTaskOptions;
+@@ -31,6 +35,7 @@
+ pub(crate) struct PluginRequestProcessor {
+     auth_manager: Arc<AuthManager>,
+     thread_manager: Arc<ThreadManager>,
++    thread_watch_manager: crate::thread_status::ThreadWatchManager,
+     outgoing: Arc<OutgoingMessageSender>,
+     analytics_events_client: AnalyticsEventsClient,
+     config_manager: ConfigManager,
+@@ -353,6 +358,7 @@
+     pub(crate) fn new(
+         auth_manager: Arc<AuthManager>,
+         thread_manager: Arc<ThreadManager>,
++        thread_watch_manager: crate::thread_status::ThreadWatchManager,
+         outgoing: Arc<OutgoingMessageSender>,
+         analytics_events_client: AnalyticsEventsClient,
+         config_manager: ConfigManager,
+@@ -361,11 +367,106 @@
+         Self {
+             auth_manager,
+             thread_manager,
++            thread_watch_manager,
+             outgoing,
+             analytics_events_client,
+             config_manager,
+             workspace_settings_cache,
+         }
++    }
++
++    pub(crate) async fn plugin_state_read(
++        &self,
++        params: PluginStateReadParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let config = self
++            .load_latest_config(params.cwd.map(|p| p.to_path_buf()))
++            .await?;
++        let states = self
++            .thread_manager
++            .plugins_manager()
++            .managed_plugin_states(
++                &config.plugins_config_input(),
++                &params.plugin_ids,
++                &params.marketplace_names,
++            )
++            .await
++            .map_err(invalid_request)?;
++        Ok(Some(
++            PluginStateReadResponse {
++                states: states.into_iter().map(managed_state_to_wire).collect(),
++            }
++            .into(),
++        ))
++    }
++
++    pub(crate) async fn plugin_refresh(
++        &self,
++        params: PluginRefreshParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        self.ensure_managed_plugins_idle().await?;
++        let config = self.load_latest_config(None).await?;
++        let input = config.plugins_config_input();
++        let manager = self.thread_manager.plugins_manager();
++        let changed = manager
++            .refresh_managed_plugin(
++                &input,
++                &params.plugin_id,
++                &params.marketplace_path,
++                params.force,
++            )
++            .await
++            .map_err(invalid_request)?;
++        self.on_effective_plugins_changed();
++        let states = manager
++            .managed_plugin_states(&input, &[params.plugin_id], &[])
++            .await
++            .map_err(invalid_request)?;
++        let state = states
++            .into_iter()
++            .next()
++            .ok_or_else(|| internal_error("plugin state unavailable"))?;
++        Ok(Some(
++            PluginRefreshResponse {
++                changed,
++                state: managed_state_to_wire(state),
++            }
++            .into(),
++        ))
++    }
++
++    async fn ensure_managed_plugins_idle(&self) -> Result<(), JSONRPCErrorError> {
++        for id in self.thread_manager.list_thread_ids().await {
++            let thread = self
++                .thread_manager
++                .get_thread(id)
++                .await
++                .map_err(|_| internal_error("thread state unavailable"))?;
++            let status = thread.agent_status().await;
++            // A new empty root remains PendingInit until its first turn. Use
++            // native lifecycle facts to distinguish it from queued child work.
++            let pending_child =
++                matches!(status, codex_protocol::protocol::AgentStatus::PendingInit)
++                    && matches!(
++                        thread.config_snapshot().await.session_source,
++                        codex_protocol::protocol::SessionSource::SubAgent(_)
++                    );
++            let watched = self
++                .thread_watch_manager
++                .loaded_status_for_thread(&id.to_string())
++                .await;
++            if matches!(status, codex_protocol::protocol::AgentStatus::Running)
++                || pending_child
++                || matches!(
++                    watched,
++                    codex_app_server_protocol::ThreadStatus::Active { .. }
++                )
++                || !thread.list_background_terminals().await.is_empty()
++            {
++                return Err(invalid_request("plugin_resources_busy"));
++            }
++        }
++        Ok(())
+     }
+ 
+     pub(crate) async fn plugin_list(
+@@ -399,6 +500,16 @@
+         &self,
+         params: PluginSkillReadParams,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        if self
++            .load_latest_config(None)
++            .await?
++            .plugins_config_input()
++            .local_only()
++        {
++            return Err(invalid_request(
++                "remote plugin operations are disabled by local policy",
++            ));
++        }
+         self.plugin_skill_read_response(params)
+             .await
+             .map(|response| Some(response.into()))
+@@ -408,6 +519,16 @@
+         &self,
+         params: PluginShareSaveParams,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        if self
++            .load_latest_config(None)
++            .await?
++            .plugins_config_input()
++            .local_only()
++        {
++            return Err(invalid_request(
++                "remote plugin operations are disabled by local policy",
++            ));
++        }
+         self.plugin_share_save_response(params)
+             .await
+             .map(|response| Some(response.into()))
+@@ -417,6 +538,16 @@
+         &self,
+         params: PluginShareUpdateTargetsParams,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        if self
++            .load_latest_config(None)
++            .await?
++            .plugins_config_input()
++            .local_only()
++        {
++            return Err(invalid_request(
++                "remote plugin operations are disabled by local policy",
++            ));
++        }
+         self.plugin_share_update_targets_response(params)
+             .await
+             .map(|response| Some(response.into()))
+@@ -426,6 +557,16 @@
+         &self,
+         params: PluginShareListParams,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        if self
++            .load_latest_config(None)
++            .await?
++            .plugins_config_input()
++            .local_only()
++        {
++            return Err(invalid_request(
++                "remote plugin operations are disabled by local policy",
++            ));
++        }
+         self.plugin_share_list_response(params)
+             .await
+             .map(|response| Some(response.into()))
+@@ -435,6 +576,16 @@
+         &self,
+         params: PluginShareCheckoutParams,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        if self
++            .load_latest_config(None)
++            .await?
++            .plugins_config_input()
++            .local_only()
++        {
++            return Err(invalid_request(
++                "remote plugin operations are disabled by local policy",
++            ));
++        }
+         self.plugin_share_checkout_response(params)
+             .await
+             .map(|response| Some(response.into()))
+@@ -444,6 +595,16 @@
+         &self,
+         params: PluginShareDeleteParams,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        if self
++            .load_latest_config(None)
++            .await?
++            .plugins_config_input()
++            .local_only()
++        {
++            return Err(invalid_request(
++                "remote plugin operations are disabled by local policy",
++            ));
++        }
+         self.plugin_share_delete_response(params)
+             .await
+             .map(|response| Some(response.into()))
+@@ -553,6 +714,14 @@
+         let include_vertical = marketplace_kinds.contains(&PluginListMarketplaceKind::Vertical);
+ 
+         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
++        if config.plugins_config_input().local_only()
++            && marketplace_kinds
++                .iter()
++                .any(|k| *k != PluginListMarketplaceKind::Local)
++        {
++            return Err(invalid_request("only local marketplaces are enabled"));
++        }
++
+         let empty_response = || PluginListResponse {
+             marketplaces: Vec::new(),
+             marketplace_load_errors: Vec::new(),
+@@ -576,8 +745,9 @@
+         let include_created_by_me_remote = marketplace_kinds
+             .contains(&PluginListMarketplaceKind::CreatedByMeRemote)
+             && config.features.enabled(Feature::RemotePlugin);
+-        let include_global_remote =
+-            !explicit_marketplace_kinds && config.features.enabled(Feature::RemotePlugin);
++        let include_global_remote = !explicit_marketplace_kinds
++            && config.features.enabled(Feature::RemotePlugin)
++            && !plugins_input.local_only();
+         let use_remote_global_catalog =
+             include_global_remote && auth_mode.is_some_and(DomainAuthMode::uses_codex_backend);
+         let remote_plugin_service_config = RemotePluginServiceConfig {
+@@ -593,7 +763,11 @@
+             let config_for_marketplace_listing = plugins_input.clone();
+             let plugins_manager_for_marketplace_listing = plugins_manager.clone();
+             let roots_for_marketplace_listing = roots.clone();
+-            let shared_plugin_ids_by_local_path = load_shared_plugin_ids_by_local_path(&config)?;
++            let shared_plugin_ids_by_local_path = if config.plugins_config_input().local_only() {
++                Default::default()
++            } else {
++                load_shared_plugin_ids_by_local_path(&config)?
++            };
+             match tokio::task::spawn_blocking(move || {
+                 let outcome = plugins_manager_for_marketplace_listing
+                     .list_marketplaces_for_config(
+@@ -949,6 +1123,9 @@
+         visible_marketplaces: &[&str],
+         auth: Option<&CodexAuth>,
+     ) -> Vec<PluginMarketplaceEntry> {
++        if plugins_input.local_only() {
++            return Vec::new();
++        }
+         let remote_marketplaces = if let Some(remote_marketplaces) = plugins_manager
+             .build_remote_installed_plugin_marketplaces_from_cache(visible_marketplaces)
+         {
+@@ -987,6 +1164,14 @@
+         &self,
+         params: PluginReadParams,
+     ) -> Result<PluginReadResponse, JSONRPCErrorError> {
++        let local_config = self.load_latest_config(None).await?;
++        if local_config.plugins_config_input().local_only()
++            && params.remote_marketplace_name.is_some()
++        {
++            return Err(invalid_request(
++                "remote plugins are disabled by local policy",
++            ));
++        }
+         let plugins_manager = self.thread_manager.plugins_manager();
+         let PluginReadParams {
+             marketplace_path,
+@@ -1423,6 +1608,17 @@
+         &self,
+         params: PluginInstallParams,
+     ) -> Result<PluginInstallResponse, JSONRPCErrorError> {
++        let local_config = self.load_latest_config(None).await?;
++        if local_config.plugins_config_input().local_only()
++            && params.remote_marketplace_name.is_some()
++        {
++            return Err(invalid_request(
++                "remote plugins are disabled by local policy",
++            ));
++        }
++        if local_config.plugins_config_input().local_only() {
++            self.ensure_managed_plugins_idle().await?;
++        }
+         let PluginInstallParams {
+             marketplace_path,
+             remote_marketplace_name,
+@@ -1918,6 +2114,17 @@
+         &self,
+         params: PluginUninstallParams,
+     ) -> Result<PluginUninstallResponse, JSONRPCErrorError> {
++        let local_config = self.load_latest_config(None).await?;
++        if local_config.plugins_config_input().local_only() {
++            self.ensure_managed_plugins_idle().await?;
++            let id = PluginId::parse(&params.plugin_id)
++                .map_err(|_| invalid_request("only local plugin identities are accepted"))?;
++            if !codex_core_plugins::local_policy::allowed_names(&local_config.config_layer_stack)
++                .contains(&id.marketplace_name)
++            {
++                return Err(invalid_request("plugin marketplace is not admitted"));
++            }
++        }
+         let PluginUninstallParams { plugin_id } = params;
+         if codex_plugin::PluginId::parse(&plugin_id).is_err()
+             && !is_valid_remote_plugin_id(&plugin_id)
+@@ -2394,3 +2601,28 @@
+ ) -> JSONRPCErrorError {
+     internal_error(format!("install remote plugin bundle: {err}"))
+ }
++
++fn managed_state_to_wire(state: codex_core_plugins::ManagedPluginState) -> PluginState {
++    let mut skills = plugin_skills_to_info(&state.skills, &state.disabled_paths);
++    for skill in &mut skills {
++        skill.enabled &= state.effective_enabled;
++    }
++    PluginState {
++        plugin_id: state.plugin_id,
++        user_config_present: state.user_enabled.is_some(),
++        user_enabled: state.user_enabled,
++        effective_enabled: state.effective_enabled,
++        cache_state: if !state.cache_present {
++            PluginCacheState::Absent
++        } else if state.manifest_valid {
++            PluginCacheState::Valid
++        } else {
++            PluginCacheState::Invalid
++        },
++        cache_version: state.cache_version,
++        manifest_valid: state.manifest_valid,
++        catalog_listed: state.catalog_listed,
++        skills,
++        errors: state.errors,
++    }
++}
+diff --git a/config/src/config_toml.rs b/config/src/config_toml.rs
+--- a/config/src/config_toml.rs
++++ b/config/src/config_toml.rs
+@@ -161,6 +161,12 @@
+ #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+ #[schemars(deny_unknown_fields)]
+ pub struct ConfigToml {
++    /// Restrict plugin catalogs to explicitly configured local roots.
++    pub plugin_marketplace_mode: Option<PluginMarketplaceMode>,
++    /// Let a managed host explicitly request the existing native refresh path.
++    pub plugin_refresh_mode: Option<PluginRefreshMode>,
++    #[serde(default)]
++    pub plugin_allowed_local_roots: Vec<codex_utils_absolute_path::AbsolutePathBuf>,
+     /// Opt-in normal process shutdown; unsupported execution backends fail before spawn.
+     pub exec_shutdown_policy: Option<ExecShutdownPolicy>,
+     /// Restrict this thread to explicit text input and model text output.
+@@ -1035,3 +1041,20 @@
+         assert!(message.contains("comma-separated strings are not supported"));
+     }
+ }
++
++#[derive(
++    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
++)]
++#[serde(rename_all = "snake_case")]
++pub enum PluginMarketplaceMode {
++    Native,
++    LocalOnly,
++}
++#[derive(
++    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
++)]
++#[serde(rename_all = "snake_case")]
++pub enum PluginRefreshMode {
++    Automatic,
++    Explicit,
++}
+diff --git a/core-plugins/src/lib.rs b/core-plugins/src/lib.rs
+--- a/core-plugins/src/lib.rs
++++ b/core-plugins/src/lib.rs
+@@ -2,7 +2,9 @@
+ mod discoverable;
+ pub mod installed_marketplaces;
+ pub mod loader;
++pub mod local_policy;
+ mod manager;
++pub use manager::ManagedPluginState;
+ pub mod manifest;
+ pub mod marketplace;
+ pub mod marketplace_add;
+diff --git a/core-plugins/src/local_policy.rs b/core-plugins/src/local_policy.rs
+new file mode 100644
+--- /dev/null
++++ b/core-plugins/src/local_policy.rs
+@@ -0,0 +1,98 @@
++//! Optional managed-local policy. Catalog and install machinery remain native.
++use crate::marketplace::{MarketplacePluginSource, marketplace_root_dir};
++use codex_config::ConfigLayerStack;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use std::path::{Path, PathBuf};
++
++pub fn local_only(stack: &ConfigLayerStack) -> bool {
++    stack
++        .effective_config()
++        .get("plugin_marketplace_mode")
++        .and_then(toml::Value::as_str)
++        == Some("local_only")
++}
++pub fn explicit_refresh(stack: &ConfigLayerStack) -> bool {
++    stack
++        .effective_config()
++        .get("plugin_refresh_mode")
++        .and_then(toml::Value::as_str)
++        == Some("explicit")
++}
++pub fn roots(stack: &ConfigLayerStack) -> Vec<AbsolutePathBuf> {
++    stack
++        .effective_config()
++        .get("plugin_allowed_local_roots")
++        .and_then(toml::Value::as_array)
++        .into_iter()
++        .flatten()
++        .filter_map(toml::Value::as_str)
++        .filter_map(|p| AbsolutePathBuf::try_from(PathBuf::from(p)).ok())
++        .collect()
++}
++pub fn allows_root(stack: &ConfigLayerStack, root: &Path) -> bool {
++    if !local_only(stack) {
++        return true;
++    }
++    let Ok(root) = root.canonicalize() else {
++        return false;
++    };
++    roots(stack)
++        .iter()
++        .any(|p| p.as_path().canonicalize().is_ok_and(|p| p == root))
++}
++pub fn validate_marketplace(
++    stack: &ConfigLayerStack,
++    path: &AbsolutePathBuf,
++) -> Result<(), String> {
++    if !local_only(stack) {
++        return Ok(());
++    }
++    let root = marketplace_root_dir(path).map_err(|e| e.to_string())?;
++    if !allows_root(stack, root.as_path()) {
++        return Err("plugin marketplace is outside the configured local roots".into());
++    }
++    Ok(())
++}
++pub fn validate_source(
++    stack: &ConfigLayerStack,
++    path: &AbsolutePathBuf,
++    source: &MarketplacePluginSource,
++) -> Result<(), String> {
++    validate_marketplace(stack, path)?;
++    if !local_only(stack) {
++        return Ok(());
++    }
++    let MarketplacePluginSource::Local { path: source } = source else {
++        return Err("managed-local plugins require a local source".into());
++    };
++    let root = marketplace_root_dir(path)
++        .map_err(|e| e.to_string())?
++        .as_path()
++        .canonicalize()
++        .map_err(|_| "local marketplace is unavailable")?;
++    let source = source
++        .as_path()
++        .canonicalize()
++        .map_err(|_| "local plugin source is unavailable")?;
++    if !source.starts_with(root) {
++        return Err("local plugin source is outside its marketplace".into());
++    }
++    Ok(())
++}
++pub fn allowed_names(stack: &ConfigLayerStack) -> std::collections::HashSet<String> {
++    let config = stack.effective_user_config();
++    config
++        .as_ref()
++        .and_then(|c| c.get("marketplaces"))
++        .and_then(toml::Value::as_table)
++        .into_iter()
++        .flatten()
++        .filter_map(|(name, entry)| {
++            (entry.get("source_type").and_then(toml::Value::as_str) == Some("local"))
++                .then(|| entry.get("source").and_then(toml::Value::as_str))
++                .flatten()
++                .filter(|p| allows_root(stack, Path::new(p)))
++                .map(|_| name.clone())
++        })
++        .collect()
++}
+diff --git a/core-plugins/src/manager.rs b/core-plugins/src/manager.rs
+--- a/core-plugins/src/manager.rs
++++ b/core-plugins/src/manager.rs
+@@ -112,12 +112,20 @@
+ }
+ 
+ impl PluginsConfigInput {
++    pub fn local_only(&self) -> bool {
++        crate::local_policy::local_only(&self.config_layer_stack)
++    }
++    pub fn explicit_refresh(&self) -> bool {
++        crate::local_policy::explicit_refresh(&self.config_layer_stack)
++    }
+     pub fn new(
+         config_layer_stack: ConfigLayerStack,
+         plugins_enabled: bool,
+         remote_plugin_enabled: bool,
+         chatgpt_base_url: String,
+     ) -> Self {
++        let remote_plugin_enabled =
++            remote_plugin_enabled && !crate::local_policy::local_only(&config_layer_stack);
+         Self {
+             config_layer_stack,
+             plugins_enabled,
+@@ -960,6 +968,9 @@
+         notify: RemoteInstalledPluginsCacheRefreshNotify,
+         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+     ) {
++        if config.local_only() {
++            return;
++        }
+         if !config.plugins_enabled {
+             return;
+         }
+@@ -980,6 +991,9 @@
+         auth: Option<CodexAuth>,
+         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+     ) {
++        if config.local_only() {
++            return;
++        }
+         if !config.plugins_enabled {
+             return;
+         }
+@@ -1095,7 +1109,7 @@
+         config: &PluginsConfigInput,
+         auth: Option<&CodexAuth>,
+     ) -> Result<Vec<String>, RemotePluginFetchError> {
+-        if !config.plugins_enabled {
++        if !config.plugins_enabled || config.local_only() {
+             return Ok(Vec::new());
+         }
+ 
+@@ -1129,6 +1143,7 @@
+         if !config.plugins_enabled
+             || !config.remote_plugin_enabled
+             || !auth.is_some_and(CodexAuth::uses_codex_backend)
++            || config.local_only()
+         {
+             return RecommendedPluginsMode::Legacy;
+         }
+@@ -1296,6 +1311,8 @@
+         config_layer_stack: &ConfigLayerStack,
+         request: &PluginInstallRequest,
+     ) -> Result<ResolvedMarketplacePlugin, PluginInstallError> {
++        crate::local_policy::validate_marketplace(config_layer_stack, &request.marketplace_path)
++            .map_err(|e| PluginStoreError::Invalid(e))?;
+         let resolved = match find_installable_marketplace_plugin(
+             &request.marketplace_path,
+             &request.plugin_name,
+@@ -1307,6 +1324,12 @@
+                 return Err(err.into());
+             }
+         };
++        crate::local_policy::validate_source(
++            config_layer_stack,
++            &request.marketplace_path,
++            &resolved.source,
++        )
++        .map_err(|e| PluginStoreError::Invalid(e))?;
+         if let Err(message) =
+             MarketplacePolicy::from_requirements(config_layer_stack.requirements())
+                 .validate_install(
+@@ -1691,7 +1714,18 @@
+             return Err(MarketplaceError::PluginsDisabled);
+         }
+ 
++        crate::local_policy::validate_marketplace(
++            &config.config_layer_stack,
++            &request.marketplace_path,
++        )
++        .map_err(MarketplaceError::InvalidPlugin)?;
+         let plugin = find_marketplace_plugin(&request.marketplace_path, &request.plugin_name)?;
++        crate::local_policy::validate_source(
++            &config.config_layer_stack,
++            &request.marketplace_path,
++            &plugin.source,
++        )
++        .map_err(MarketplaceError::InvalidPlugin)?;
+         MarketplacePolicy::from_requirements(config.config_layer_stack.requirements())
+             .validate_install(
+                 &config.config_layer_stack,
+@@ -1929,6 +1963,9 @@
+         auth_manager: Arc<AuthManager>,
+         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+     ) {
++        if config.local_only() {
++            return;
++        }
+         if config.plugins_enabled {
+             let use_remote_global_catalog =
+                 config.remote_plugin_enabled && auth_manager.current_auth_uses_codex_backend();
+@@ -2188,6 +2225,9 @@
+         roots: &[AbsolutePathBuf],
+         mode: NonCuratedCacheRefreshMode,
+     ) {
++        if config.explicit_refresh() {
++            return;
++        }
+         let marketplace_roots =
+             self.marketplace_roots(config, roots, /*include_openai_curated*/ false);
+         let outcome = match self.list_marketplaces_with_policy(config, &marketplace_roots) {
+@@ -2527,6 +2567,9 @@
+         additional_roots: &[AbsolutePathBuf],
+         include_openai_curated: bool,
+     ) -> Vec<AbsolutePathBuf> {
++        if config.local_only() {
++            return crate::local_policy::roots(&config.config_layer_stack);
++        }
+         // Treat the curated catalog as an extra marketplace root so plugin listing can surface it
+         // without requiring every caller to know where it is stored.
+         let mut roots = additional_roots.to_vec();
+@@ -2567,7 +2610,28 @@
+         config: &PluginsConfigInput,
+         roots: &[AbsolutePathBuf],
+     ) -> Result<MarketplaceListOutcome, MarketplaceError> {
+-        let mut outcome = list_marketplaces_with_home(roots, home_dir().as_deref())?;
++        let home = if config.local_only() {
++            None
++        } else {
++            home_dir()
++        };
++        let mut outcome = list_marketplaces_with_home(roots, home.as_deref())?;
++        if config.local_only() {
++            outcome.marketplaces.retain(|market| {
++                crate::local_policy::validate_marketplace(&config.config_layer_stack, &market.path)
++                    .is_ok()
++            });
++            for market in &mut outcome.marketplaces {
++                market.plugins.retain(|plugin| {
++                    crate::local_policy::validate_source(
++                        &config.config_layer_stack,
++                        &market.path,
++                        &plugin.source,
++                    )
++                    .is_ok()
++                });
++            }
++        }
+         let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
+         if !policy.is_restricted() {
+             return Ok(outcome);
+@@ -2759,3 +2823,6 @@
+ #[cfg(test)]
+ #[path = "manager_tests.rs"]
+ mod tests;
++
++mod managed;
++pub use managed::ManagedPluginState;
+diff --git a/core-plugins/src/manager/managed.rs b/core-plugins/src/manager/managed.rs
+new file mode 100644
+--- /dev/null
++++ b/core-plugins/src/manager/managed.rs
+@@ -0,0 +1,382 @@
++//! Bounded facts and a bridge to the existing local refresh machinery.
++use super::*;
++use std::collections::BTreeSet;
++use std::fs;
++
++#[derive(Debug)]
++pub struct ManagedPluginState {
++    pub plugin_id: String,
++    pub user_enabled: Option<bool>,
++    pub effective_enabled: bool,
++    pub cache_version: Option<String>,
++    pub cache_present: bool,
++    pub manifest_valid: bool,
++    pub catalog_listed: bool,
++    pub skills: Vec<SkillMetadata>,
++    pub disabled_paths: HashSet<AbsolutePathBuf>,
++    pub errors: Vec<String>,
++}
++
++impl PluginsManager {
++    pub async fn managed_plugin_states(
++        &self,
++        config: &PluginsConfigInput,
++        requested: &[String],
++        marketplaces: &[String],
++    ) -> Result<Vec<ManagedPluginState>, String> {
++        if requested.len() > 512 || marketplaces.len() > 16 {
++            return Err("plugin state request is too large".into());
++        }
++        if self
++            .non_curated_cache_refresh_state
++            .read()
++            .map_err(|_| "plugin refresh state unavailable")?
++            .in_flight
++        {
++            return Err("plugin_refresh_busy".into());
++        }
++        let allowed = crate::local_policy::allowed_names(&config.config_layer_stack);
++        if !config.local_only() || marketplaces.iter().any(|m| !allowed.contains(m)) {
++            return Err("plugin state requires an admitted local marketplace".into());
++        }
++        let user = config
++            .config_layer_stack
++            .effective_user_config()
++            .unwrap_or_else(|| toml::Value::Table(Default::default()));
++        let raw = user.get("plugins").and_then(toml::Value::as_table);
++        let effective =
++            configured_plugins_from_stack(&config.config_layer_stack, self.codex_home.as_path());
++        let mut ids = BTreeSet::new();
++        for value in requested {
++            let id = PluginId::parse(value).map_err(|_| "invalid plugin identity")?;
++            if !allowed.contains(&id.marketplace_name) {
++                return Err("plugin marketplace is not admitted".into());
++            }
++            ids.insert(value.clone());
++        }
++        for name in marketplaces {
++            codex_plugin::validate_plugin_segment(name, "marketplace")
++                .map_err(|_| "invalid marketplace")?;
++            if let Some(raw) = raw {
++                for key in raw.keys() {
++                    if PluginId::parse(key).is_ok_and(|id| id.marketplace_name == *name) {
++                        ids.insert(key.clone());
++                    }
++                }
++            }
++            let directory = self.store.root().join(name);
++            match fs::read_dir(directory.as_path()) {
++                Ok(entries) => {
++                    for entry in entries {
++                        let entry = entry.map_err(|_| "plugin cache unreadable")?;
++                        let name = entry
++                            .file_name()
++                            .into_string()
++                            .map_err(|_| "plugin cache name unavailable")?;
++                        if name.starts_with("plugin-install-") || name.starts_with("plugin-backup-")
++                        {
++                            continue;
++                        }
++                        let market = directory
++                            .as_path()
++                            .file_name()
++                            .and_then(|v| v.to_str())
++                            .ok_or("invalid cache marketplace")?;
++                        if let Ok(id) = PluginId::new(name, market.to_owned()) {
++                            ids.insert(id.as_key());
++                        }
++                        if ids.len() > 512 {
++                            return Err("plugin inventory exceeds the request limit".into());
++                        }
++                    }
++                }
++                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++                Err(_) => return Err("plugin cache unreadable".into()),
++            }
++        }
++        let roots = crate::local_policy::roots(&config.config_layer_stack);
++        let listed = crate::marketplace::list_marketplaces_with_home(&roots, None)
++            .map_err(|_| "local marketplace inventory unavailable")?;
++        let catalog_error = !listed.errors.is_empty();
++        let listed_ids: HashSet<String> = listed
++            .marketplaces
++            .iter()
++            .flat_map(|market| {
++                market
++                    .plugins
++                    .iter()
++                    .map(|p| format!("{}@{}", p.name, market.name))
++            })
++            .collect();
++        let rules = skill_config_rules_from_stack(&config.config_layer_stack);
++        let mut result = Vec::with_capacity(ids.len());
++        for value in ids {
++            let id = PluginId::parse(&value).map_err(|_| "invalid plugin identity")?;
++            let base = self.store.plugin_base_root(&id);
++            let present = base
++                .as_path()
++                .try_exists()
++                .map_err(|_| "plugin cache unreadable")?;
++            if present {
++                fs::read_dir(base.as_path()).map_err(|_| "plugin cache unreadable")?;
++            }
++            let version = self.store.active_plugin_version(&id);
++            let user_enabled = raw
++                .and_then(|v| v.get(&value))
++                .map(|v| v.clone().try_into::<codex_config::types::PluginConfig>())
++                .transpose()
++                .map_err(|_| "plugin user configuration is invalid")?
++                .map(|v| v.enabled);
++            let enabled =
++                config.plugins_enabled && effective.get(&value).is_some_and(|p| p.enabled);
++            let mut state = ManagedPluginState {
++                plugin_id: value.clone(),
++                user_enabled,
++                effective_enabled: enabled,
++                cache_version: version,
++                cache_present: present,
++                manifest_valid: false,
++                catalog_listed: listed_ids.contains(&value),
++                skills: Vec::new(),
++                disabled_paths: HashSet::new(),
++                errors: Vec::new(),
++            };
++            if catalog_error {
++                state.errors.push("catalog_unavailable".into());
++            }
++            if let Some(root) = self.store.active_plugin_root(&id) {
++                if let Some(manifest) =
++                    load_plugin_manifest(root.as_path()).filter(|m| m.name == id.plugin_name)
++                {
++                    let parsed = load_plugin_skills(
++                        &root,
++                        &id,
++                        &manifest,
++                        self.restriction_product,
++                        &rules,
++                        None,
++                    )
++                    .await;
++                    state.manifest_valid = !parsed.had_errors;
++                    state.skills = parsed.skills;
++                    state.disabled_paths = parsed.disabled_skill_paths;
++                }
++            }
++            if present && !state.manifest_valid {
++                state.errors.push("cache_invalid".into());
++            }
++            result.push(state);
++        }
++        Ok(result)
++    }
++
++    pub async fn refresh_managed_plugin(
++        &self,
++        config: &PluginsConfigInput,
++        plugin_key: &str,
++        marketplace_path: &AbsolutePathBuf,
++        force: bool,
++    ) -> Result<bool, String> {
++        if !config.local_only() || !config.explicit_refresh() {
++            return Err("explicit local refresh is not enabled".into());
++        }
++        if self
++            .non_curated_cache_refresh_state
++            .read()
++            .map_err(|_| "plugin refresh state unavailable")?
++            .in_flight
++        {
++            return Err("plugin_refresh_busy".into());
++        }
++        let id = PluginId::parse(plugin_key).map_err(|_| "invalid plugin identity")?;
++        let resolved = find_marketplace_plugin(marketplace_path, &id.plugin_name)
++            .map_err(|_| "plugin source unavailable")?;
++        if resolved.plugin_id != id {
++            return Err("plugin source identity differs".into());
++        }
++        crate::local_policy::validate_source(
++            &config.config_layer_stack,
++            marketplace_path,
++            &resolved.source,
++        )?;
++        MarketplacePolicy::from_requirements(config.config_layer_stack.requirements())
++            .validate_install(
++                &config.config_layer_stack,
++                self.codex_home.as_path(),
++                marketplace_path,
++                &id.marketplace_name,
++            )?;
++        let configured =
++            configured_plugins_from_stack(&config.config_layer_stack, self.codex_home.as_path());
++        if !configured.contains_key(plugin_key) {
++            return Err("plugin is not configured; first install is required".into());
++        }
++        let root = crate::marketplace::marketplace_root_dir(marketplace_path)
++            .map_err(|_| "invalid marketplace layout")?;
++        let outcome = if force {
++            refresh_non_curated_plugin_cache_force_reinstall_detailed(
++                self.codex_home.as_path(),
++                &[root],
++                &[plugin_key.to_owned()],
++            )
++        } else {
++            refresh_non_curated_plugin_cache_detailed(
++                self.codex_home.as_path(),
++                &[root],
++                &[plugin_key.to_owned()],
++            )
++        }?;
++        self.clear_caches_after_marketplace_source_refresh(outcome.cache_refreshed);
++        if !outcome.errors.is_empty() {
++            return Err("native plugin refresh failed; inspect state before retry".into());
++        }
++        Ok(outcome.cache_refreshed)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn input(home: &Path, root: &Path, enabled: Option<bool>) -> PluginsConfigInput {
++        let mut value = serde_json::json!({
++            "plugin_marketplace_mode":"local_only", "plugin_refresh_mode":"explicit",
++            "plugin_allowed_local_roots":[root.to_str().unwrap()],
++            "marketplaces":{"local":{"source_type":"local","source":root.to_str().unwrap()}}
++        });
++        if let Some(enabled) = enabled {
++            value["plugins"] = serde_json::json!({"plain@local":{"enabled":enabled}});
++        }
++        let config = codex_config::ConfigLayerStack::default().with_user_config(
++            &AbsolutePathBuf::try_from(home.join("config.toml")).unwrap(),
++            toml::Value::try_from(value).unwrap(),
++        );
++        PluginsConfigInput::new(config, true, false, String::new())
++    }
++    fn source(root: &Path, version: &str) -> AbsolutePathBuf {
++        let dir = root.join(format!("plugin-{version}"));
++        fs::create_dir_all(dir.join(".codex-plugin")).unwrap();
++        fs::create_dir_all(dir.join("skills/main")).unwrap();
++        fs::write(
++            dir.join(".codex-plugin/plugin.json"),
++            serde_json::to_vec(
++                &serde_json::json!({"name":"plain","version":version,"skills":"./skills"}),
++            )
++            .unwrap(),
++        )
++        .unwrap();
++        fs::write(dir.join("skills/main/SKILL.md"), "---\nname: plain\ndescription: Ordinary arithmetic explanation.\n---\nExplain six times seven.\n").unwrap();
++        fs::create_dir_all(root.join(".agents/plugins")).unwrap();
++        fs::write(root.join(".agents/plugins/marketplace.json"), serde_json::to_vec(&serde_json::json!({"name":"local","plugins":[{"name":"plain","source":format!("./plugin-{version}")}]})).unwrap()).unwrap();
++        AbsolutePathBuf::try_from(dir).unwrap()
++    }
++    #[tokio::test]
++    async fn managed_plugin_inventory_separates_cache_configuration_and_catalog() {
++        let temp = tempfile::tempdir().unwrap();
++        let home = temp.path().join("home");
++        let root = temp.path().join("catalog");
++        fs::create_dir_all(&home).unwrap();
++        let src = source(&root, "1.0.0");
++        let manager = PluginsManager::new(home.clone());
++        let config = input(&home, &root, None);
++        let absent = manager
++            .managed_plugin_states(&config, &["plain@local".into()], &[])
++            .await
++            .unwrap();
++        assert!(!absent[0].cache_present);
++        assert!(absent[0].user_enabled.is_none());
++        assert!(absent[0].catalog_listed);
++        manager
++            .store
++            .install(src, PluginId::parse("plain@local").unwrap())
++            .unwrap();
++        let partial = manager
++            .managed_plugin_states(&config, &[], &["local".into()])
++            .await
++            .unwrap();
++        assert!(partial[0].manifest_valid);
++        assert!(partial[0].user_enabled.is_none());
++        assert_eq!(partial[0].skills.len(), 1);
++        fs::write(
++            root.join(".agents/plugins/marketplace.json"),
++            r#"{"name":"local","plugins":[]}"#,
++        )
++        .unwrap();
++        let disabled = manager
++            .managed_plugin_states(&input(&home, &root, Some(false)), &[], &["local".into()])
++            .await
++            .unwrap();
++        assert!(disabled[0].cache_present);
++        assert_eq!(disabled[0].user_enabled, Some(false));
++        assert!(!disabled[0].catalog_listed);
++        assert!(!disabled[0].effective_enabled);
++        manager
++            .store
++            .uninstall(&PluginId::parse("plain@local").unwrap())
++            .unwrap();
++        let config_only = manager
++            .managed_plugin_states(&input(&home, &root, Some(false)), &[], &["local".into()])
++            .await
++            .unwrap();
++        assert!(!config_only[0].cache_present);
++        assert_eq!(config_only[0].user_enabled, Some(false));
++    }
++    #[tokio::test]
++    async fn managed_plugin_native_refresh_and_rollback_preserve_disabled_intent() {
++        let temp = tempfile::tempdir().unwrap();
++        let home = temp.path().join("home");
++        let root = temp.path().join("catalog");
++        fs::create_dir_all(&home).unwrap();
++        let src = source(&root, "1.0.0");
++        let manager = PluginsManager::new(home.clone());
++        let id = PluginId::parse("plain@local").unwrap();
++        manager.store.install(src, id.clone()).unwrap();
++        let config = input(&home, &root, Some(false));
++        let manifest =
++            AbsolutePathBuf::try_from(root.join(".agents/plugins/marketplace.json")).unwrap();
++        source(&root, "2.0.0");
++        assert!(
++            manager
++                .refresh_managed_plugin(&config, "plain@local", &manifest, false)
++                .await
++                .unwrap()
++        );
++        assert_eq!(
++            manager.store.active_plugin_version(&id).as_deref(),
++            Some("2.0.0")
++        );
++        source(&root, "1.0.0");
++        assert!(
++            manager
++                .refresh_managed_plugin(&config, "plain@local", &manifest, true)
++                .await
++                .unwrap()
++        );
++        let state = manager
++            .managed_plugin_states(&config, &["plain@local".into()], &[])
++            .await
++            .unwrap();
++        assert_eq!(state[0].cache_version.as_deref(), Some("1.0.0"));
++        assert_eq!(state[0].user_enabled, Some(false));
++        assert!(!state[0].effective_enabled);
++    }
++    #[test]
++    fn managed_plugin_policy_keeps_existing_defaults_and_scopes_local_sources() {
++        assert!(!crate::local_policy::local_only(
++            &codex_config::ConfigLayerStack::default()
++        ));
++        let temp = tempfile::tempdir().unwrap();
++        let root = temp.path().join("catalog");
++        source(&root, "1.0.0");
++        let config = input(temp.path(), &root, None);
++        assert!(config.local_only());
++        assert!(config.explicit_refresh());
++        assert!(crate::local_policy::allows_root(
++            &config.config_layer_stack,
++            &root
++        ));
++        assert!(!crate::local_policy::allows_root(
++            &config.config_layer_stack,
++            temp.path()
++        ));
++    }
++}
+diff --git a/core-plugins/src/marketplace_policy.rs b/core-plugins/src/marketplace_policy.rs
+--- a/core-plugins/src/marketplace_policy.rs
++++ b/core-plugins/src/marketplace_policy.rs
+@@ -292,7 +292,16 @@
+         return HashMap::new();
+     };
+     match plugins_value.clone().try_into() {
+-        Ok(plugins) => plugins,
++        Ok(mut plugins) => {
++            if crate::local_policy::local_only(config_layer_stack) {
++                let names = crate::local_policy::allowed_names(config_layer_stack);
++                let map: &mut HashMap<String, PluginConfig> = &mut plugins;
++                map.retain(|key, _| {
++                    PluginId::parse(key).is_ok_and(|id| names.contains(&id.marketplace_name))
++                });
++            }
++            plugins
++        }
+         Err(err) => {
+             tracing::warn!("invalid plugins config: {err}");
+             HashMap::new()

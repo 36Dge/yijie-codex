@@ -1,5 +1,12 @@
 # Upstream
 
+2026-11-13 FEAT-174 appends the authorized 0025 native local Skill marketplace
+policy/state/refresh overlay after 0024. The fixed upstream and canonical source
+remain unchanged. Local-only source admission and explicit refresh reuse native
+PluginStore, configuration, Skill loading and refresh machinery. See
+`docs/native-skill-marketplace.md`; canonical build:
+`scripts/build-native-skill-marketplace.sh`. Local candidate only; no release.
+
 2026-11-09 FEAT-171 appends the authorized 0024 cooperative-only execution
 cleanup overlay after 0023. Canonical upstream remains unchanged; retained
 artifacts are not overwritten. See `docs/document-runtime.md` and the canonical

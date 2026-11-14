@@ -1,5 +1,12 @@
 # Yijie Changelog
 
+2026-11-13 FEAT-174 appends the authorized 0025 native local Skill marketplace
+policy/state/refresh overlay after 0024. The fixed upstream and canonical source
+remain unchanged. Local-only source admission and explicit refresh reuse native
+PluginStore, configuration, Skill loading and refresh machinery. See
+`docs/native-skill-marketplace.md`; canonical build:
+`scripts/build-native-skill-marketplace.sh`. Local candidate only; no release.
+
 ## Unreleased
 
 - FEAT-171: add the optional native `cooperative_only` process lifecycle policy
