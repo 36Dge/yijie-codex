@@ -20,7 +20,7 @@ index 0d32858..f27f6e8 100644
 --- a/code-mode/src/runtime/mod.rs
 +++ b/code-mode/src/runtime/mod.rs
 @@ -145,7 +145,7 @@ struct RuntimeConfig {
- 
+
  pub(super) struct RuntimeState {
      event_tx: mpsc::UnboundedSender<RuntimeEvent>,
 -    pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
@@ -35,7 +35,7 @@ index 00185ed..9c6872c 100644
 @@ -63,12 +63,55 @@ fn is_exit_exception(
          && exception.to_rust_string_lossy(scope) == EXIT_SENTINEL
  }
- 
+
 +// JS code can still inspect the original MCP content or individual chunks.
 +// Printing the result (including inside arrays or JSON.stringify) emits one
 +// bounded receipt. Only the registered deep-search callback uses this view.
@@ -112,7 +112,7 @@ index 9a00df6..b424aaa 100644
 --- a/core/src/tools/context.rs
 +++ b/core/src/tools/context.rs
 @@ -67,6 +67,7 @@ pub struct ToolInvocation {
- 
+
  #[derive(Clone, Debug)]
  pub struct McpToolOutput {
 +    pub model_preview: Option<JsonValue>,
@@ -121,7 +121,7 @@ index 9a00df6..b424aaa 100644
      pub wall_time: Duration,
 @@ -96,9 +97,13 @@ impl ToolOutput for McpToolOutput {
      }
- 
+
      fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
 -        serde_json::to_value(&self.result).unwrap_or_else(|err| {
 +        let raw = serde_json::to_value(&self.result).unwrap_or_else(|err| {
@@ -133,10 +133,10 @@ index 9a00df6..b424aaa 100644
 +            None => raw,
 +        }
      }
- 
+
      fn post_tool_use_input(&self, _payload: &ToolPayload) -> Option<JsonValue> {
 @@ -112,7 +117,13 @@ impl ToolOutput for McpToolOutput {
- 
+
  impl McpToolOutput {
      fn response_payload(&self) -> FunctionCallOutputPayload {
 -        let mut payload = self.result.as_function_call_output_payload();
@@ -187,13 +187,13 @@ index 6ac5b69..001a201 100644
              content: vec![serde_json::json!({
                  "type": "text",
 diff --git a/core/src/tools/handlers/mcp.rs b/core/src/tools/handlers/mcp.rs
-index c9533fd..6054ec7 100644
+index c9533fd..7e5ae75 100644
 --- a/core/src/tools/handlers/mcp.rs
 +++ b/core/src/tools/handlers/mcp.rs
 @@ -153,7 +153,15 @@ impl McpHandler {
          )
          .await;
- 
+
 +        let model_preview = if self.tool_info.server_name == "yijie_web"
 +            && self.tool_info.tool.name == "kimi_web_search_pro"
 +        {
@@ -206,7 +206,27 @@ index c9533fd..6054ec7 100644
              result: result.result,
              tool_input: result.tool_input,
              wall_time: started.elapsed(),
-@@ -438,6 +446,7 @@ mod tests {
+@@ -164,6 +172,19 @@ impl McpHandler {
+ }
+
+ impl CoreToolRuntime for McpHandler {
++    fn coalesces_pending_calls(&self) -> bool {
++        self.tool_info.server_name == "yijie_web"
++            && self.tool_info.tool.name == "kimi_web_search_pro"
++            && self
++                .tool_info
++                .tool
++                .meta
++                .as_ref()
++                .and_then(|meta| meta.get("ai.yijie/coalescesExactTurnRequests"))
++                .and_then(serde_json::Value::as_bool)
++                == Some(true)
++    }
++
+     fn telemetry_tags<'a>(
+         &'a self,
+         _invocation: &'a ToolInvocation,
+@@ -438,6 +459,7 @@ mod tests {
              arguments: json!({ "path": "/tmp/notes.txt" }).to_string(),
          };
          let output = McpToolOutput {
@@ -223,15 +243,156 @@ index e588265..39dacff 100644
  pub(crate) mod tool_dispatch_trace;
  pub(crate) mod web_retrieval_guard;
 +pub(crate) mod web_search_preview;
- 
+
  use std::borrow::Cow;
- 
+
+diff --git a/core/src/tools/registry.rs b/core/src/tools/registry.rs
+index c34cfe1..3bbe8b0 100644
+--- a/core/src/tools/registry.rs
++++ b/core/src/tools/registry.rs
+@@ -46,6 +46,11 @@ pub use codex_tools::ToolExposure;
+ /// Implementers provide the shared `ToolExecutor` behavior plus optional
+ /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
+ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
++    /// A verified handler can join pending exact matches at its authorized execution boundary.
++    fn coalesces_pending_calls(&self) -> bool {
++        false
++    }
++
+     /// Logical namespace for existing Code Mode exposure policy. A transport
+     /// alias must not remove restrictions attached to its native namespace.
+     fn code_mode_namespace(&self) -> Option<String> {
+@@ -284,6 +289,10 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
+ }
+
+ impl CoreToolRuntime for ExposureOverride {
++    fn coalesces_pending_calls(&self) -> bool {
++        self.handler.coalesces_pending_calls()
++    }
++
+     fn code_mode_namespace(&self) -> Option<String> {
+         self.handler.code_mode_namespace()
+     }
+@@ -550,8 +559,13 @@ impl ToolRegistry {
+
+         // Reuse the native pre-execution refusal path. No handler, approval
+         // escalation, process or connector request starts after a refusal.
+-        if let Err(err) = crate::session::answer_completion::before_tool(&invocation.turn)
+-            .and_then(|()| crate::tools::web_retrieval_guard::before(&invocation))
++        if let Err(err) =
++            crate::session::answer_completion::before_tool(&invocation.turn).and_then(|()| {
++                crate::tools::web_retrieval_guard::before(
++                    &invocation,
++                    tool.coalesces_pending_calls(),
++                )
++            })
+         {
+             dispatch_trace.record_failed(&err);
+             if let FunctionCallError::RespondToModel(message) = &err {
+diff --git a/core/src/tools/web_retrieval_guard.rs b/core/src/tools/web_retrieval_guard.rs
+index 9f00225..726d4e8 100644
+--- a/core/src/tools/web_retrieval_guard.rs
++++ b/core/src/tools/web_retrieval_guard.rs
+@@ -202,7 +202,10 @@ fn operation(invocation: &ToolInvocation) -> Option<Operation> {
+     })
+ }
+
+-pub(crate) fn before(invocation: &ToolInvocation) -> Result<(), FunctionCallError> {
++pub(crate) fn before(
++    invocation: &ToolInvocation,
++    coalesces_pending_calls: bool,
++) -> Result<(), FunctionCallError> {
+     if invocation.tool_name.name == "write_stdin" {
+         return before_stdin(invocation);
+     }
+@@ -216,6 +219,7 @@ pub(crate) fn before(invocation: &ToolInvocation) -> Result<(), FunctionCallErro
+         &invocation.call_id,
+         operation,
+         retrieval(&flat_tool_name(&invocation.tool_name)),
++        coalesces_pending_calls,
+     )
+ }
+
+@@ -271,15 +275,17 @@ fn admit(
+     call_id: &str,
+     operation: Operation,
+     is_retrieval: bool,
++    coalesces_pending_calls: bool,
+ ) -> Result<(), FunctionCallError> {
+     let deny = |message: String| Err(FunctionCallError::RespondToModel(message));
+     if state.searched && operation.web {
+         return deny(WEB_BLOCK.to_string());
+     }
+-    if state
+-        .pending
+-        .values()
+-        .any(|pending| pending.key == operation.key)
++    if !coalesces_pending_calls
++        && state
++            .pending
++            .values()
++            .any(|pending| pending.key == operation.key)
+     {
+         return deny("YIJIE_OPERATION_PENDING：已拦截。相同操作尚未收尾，请等待原调用或使用 write_stdin 读取结果，不要重复启动。".to_string());
+     }
+@@ -992,13 +998,15 @@ mod tests {
+             permission: "workspace-write".into(),
+         };
+         let mut state = State::default();
+-        admit(&mut state, "first", operation.clone(), false).unwrap();
++        admit(&mut state, "first", operation.clone(), false, false).unwrap();
+         assert!(
+-            admit(&mut state, "duplicate", operation.clone(), false)
++            admit(&mut state, "duplicate", operation.clone(), false, false)
+                 .unwrap_err()
+                 .to_string()
+                 .contains("YIJIE_OPERATION_PENDING")
+         );
++        admit(&mut state, "shared", operation.clone(), true, true).unwrap();
++        state.pending.remove("shared");
+         state.pending.remove("first");
+         state.failed.insert(
+             operation.key.clone(),
+@@ -1010,28 +1018,28 @@ mod tests {
+             },
+         );
+         assert!(
+-            admit(&mut state, "retry", operation.clone(), false)
++            admit(&mut state, "retry", operation.clone(), false, false)
+                 .unwrap_err()
+                 .to_string()
+                 .contains("YIJIE_UNCHANGED_FAILURE")
+         );
+         assert!(state.pending.is_empty());
+         fs::write(&input, "corrected input").unwrap();
+-        admit(&mut state, "corrected", operation.clone(), false).unwrap();
++        admit(&mut state, "corrected", operation.clone(), false, false).unwrap();
+         state.pending.remove("corrected");
+         state.searched = true;
+         operation.web = true;
+         assert!(
+-            admit(&mut state, "fetch", operation.clone(), false)
++            admit(&mut state, "fetch", operation.clone(), false, false)
+                 .unwrap_err()
+                 .to_string()
+                 .contains("YIJIE_WEB_RETRIEVAL_ONLY")
+         );
+         assert!(state.pending.is_empty());
+         operation.web = false;
+-        admit(&mut state, "local", operation.clone(), false).unwrap();
++        admit(&mut state, "local", operation.clone(), false, false).unwrap();
+         let mut next_turn = State::default();
+-        admit(&mut next_turn, "new-turn", operation, false).unwrap();
++        admit(&mut next_turn, "new-turn", operation, false, false).unwrap();
+     }
+
+     #[test]
 diff --git a/core/src/tools/web_search_preview.rs b/core/src/tools/web_search_preview.rs
 new file mode 100644
-index 0000000..f220eb6
+index 0000000..677c8df
 --- /dev/null
 +++ b/core/src/tools/web_search_preview.rs
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,139 @@
 +//! Model-visible evidence from one native deep search. Original MCP items
 +//! and both programmatic receipt representations remain available to the cell.
 +use codex_protocol::mcp::CallToolResult;
@@ -239,7 +400,9 @@ index 0000000..f220eb6
 +use serde_json::Value;
 +use serde_json::json;
 +
-+const MAX_PREVIEW_BYTES: usize = 10_000;
++// Three parallel topics, including the cell envelope, must fit the Kimi
++// model's 12 KB tool-output budget even when individual snippets are long.
++const MAX_PREVIEW_BYTES: usize = 3_800;
 +
 +pub(crate) fn preview(arguments: &Value, result: &CallToolResult) -> Option<Value> {
 +    let query = arguments.get("query")?.as_str()?;
