@@ -7,10 +7,12 @@ spec.loader.exec_module(previous_module)
 base = previous_module.base
 previous = base.reviewed_patch_files
 def reviewed_patches(patch_dir, profile="input-only"):
-    patch = patch_dir / "chat-models/0025-native-skill-marketplace.patch"
-    if not patch.is_file() or patch.is_symlink():
-        raise SystemExit("Native skill marketplace patch unavailable")
-    return previous(patch_dir, profile) + [patch]
+    patches = [patch_dir / "chat-models" / name for name in (
+        "0025-native-skill-marketplace.patch", "0026-deep-search-model-view.patch",
+    )]
+    if any(not patch.is_file() or patch.is_symlink() for patch in patches):
+        raise SystemExit("Reviewed local Runtime patch unavailable")
+    return previous(patch_dir, profile) + patches
 base.reviewed_patch_files = reviewed_patches
 if __name__ == "__main__":
     raise SystemExit(base.main())
