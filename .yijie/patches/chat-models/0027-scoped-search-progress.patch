@@ -1,0 +1,669 @@
+diff --git a/core/src/session/answer_completion.rs b/core/src/session/answer_completion.rs
+index 6f684bc..8a5314b 100644
+--- a/core/src/session/answer_completion.rs
++++ b/core/src/session/answer_completion.rs
+@@ -67,6 +67,7 @@ pub(crate) fn observe(turn: &TurnContext, items: &[ResponseItem]) {
+                     .collect::<Vec<_>>()
+                     .join("\n");
+                 // Steered input starts a new decision context, not a replay.
++                crate::tools::search_progress::reset(turn);
+                 *state = State {
+                     request,
+                     ..State::default()
+@@ -295,6 +296,22 @@ fn process_only(text: &str) -> bool {
+         })
+ }
+
++pub(crate) fn finish_search(turn: &TurnContext) {
++    state(turn)
++        .lock()
++        .unwrap_or_else(PoisonError::into_inner)
++        .finalizing = true;
++}
++pub(crate) fn search_correction() -> ResponseItem {
++    let text = "The last step only requested the same already-delivered search evidence. Keep these exact searches closed. Work on a different missing fact within the user's filters, read a new source or passage, continue other requested work, or give the supported answer now.";
++    ResponseItem::Message {
++        id: None,
++        role: "developer".into(),
++        content: vec![ContentItem::InputText { text: text.into() }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
+ pub(crate) fn feedback(turn: &TurnContext) -> ResponseItem {
+     let repeated_plan = state(turn)
+         .lock()
+diff --git a/core/src/session/step_context.rs b/core/src/session/step_context.rs
+index 1d7316d..62aacf3 100644
+--- a/core/src/session/step_context.rs
++++ b/core/src/session/step_context.rs
+@@ -12,6 +12,7 @@ use tokio::sync::OnceCell;
+ #[derive(Debug)]
+ pub(crate) struct StepContext {
+     pub(crate) turn: Arc<TurnContext>,
++    pub(crate) search_progress: std::sync::Mutex<crate::tools::search_progress::Step>,
+     pub(crate) environments: TurnEnvironmentSnapshot,
+     /// Capability roots bound to ready environments in this exact step.
+     pub(crate) selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
+@@ -34,6 +35,7 @@ impl StepContext {
+         Self {
+             turn,
+             environments,
++            search_progress: Default::default(),
+             selected_capability_roots,
+             mcp,
+             mcp_tool_snapshot: OnceCell::new(),
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+index c2f8c61..52d367e 100644
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -298,6 +298,7 @@ pub(crate) async fn run_turn(
+             Ok((sampling_request_output, sampling_request_input)) => {
+                 let SamplingRequestResult {
+                     needs_follow_up: model_needs_follow_up,
++                    independent_provider_work,
+                     last_agent_message: sampling_request_last_agent_message,
+                 } = sampling_request_output;
+                 can_drain_pending_input = true;
+@@ -382,6 +383,40 @@ pub(crate) async fn run_turn(
+                     continue;
+                 }
+
++                if model_needs_follow_up
++                    && !independent_provider_work
++                    && !has_pending_input
++                    && !sess.services.code_mode_service.has_open_cells()
++                    && !super::answer_completion::finalizing(&turn_context)
++                    && turn_context.final_output_json_schema.is_none()
++                    && turn_context
++                        .developer_instructions
++                        .as_deref()
++                        .is_some_and(|v| v.contains(super::answer_completion::MARKER))
++                {
++                    use crate::tools::search_progress::{Next, advance};
++                    match advance(&step_context.search_progress, &turn_context) {
++                        Next::Correct => {
++                            sess.record_conversation_items(
++                                &turn_context,
++                                &[super::answer_completion::search_correction()],
++                            )
++                            .await;
++                            continue;
++                        }
++                        Next::Finish
++                            if crate::tools::search_progress::work_is_settled(&sess).await =>
++                        {
++                            super::answer_completion::finish_search(&turn_context);
++                            sess.record_conversation_items(
++                                &turn_context,
++                                &[super::answer_completion::feedback(&turn_context)],
++                            )
++                            .await;
++                        }
++                        Next::Finish | Next::Ordinary => {}
++                    }
++                }
+                 match super::answer_completion::decide(
+                     &turn_context,
+                     sampling_request_last_agent_message.as_deref(),
+@@ -1411,6 +1446,7 @@ pub(crate) async fn built_tools(
+
+ #[derive(Debug)]
+ struct SamplingRequestResult {
++    independent_provider_work: bool,
+     needs_follow_up: bool,
+     last_agent_message: Option<String>,
+ }
+@@ -2045,6 +2081,7 @@ async fn try_run_sampling_request(
+     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+         FuturesOrdered::new();
+     let mut needs_follow_up = false;
++    let mut independent_provider_work = false;
+     let mut last_agent_message: Option<String> = None;
+     let mut active_item: Option<TurnItem> = None;
+     let mut active_tool_argument_diff_consumer: Option<(
+@@ -2127,6 +2164,14 @@ async fn try_run_sampling_request(
+         match event {
+             ResponseEvent::Created => {}
+             ResponseEvent::OutputItemDone(mut item) => {
++                // Hosted actions do not enter the local tool registry.
++                independent_provider_work |= matches!(
++                    &item,
++                    ResponseItem::WebSearchCall { .. }
++                        | ResponseItem::ImageGenerationCall { .. }
++                        | ResponseItem::LocalShellCall { .. }
++                        | ResponseItem::ToolSearchCall { .. }
++                );
+                 if turn_context.item_ids_enabled() {
+                     assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                 }
+@@ -2218,6 +2263,7 @@ async fn try_run_sampling_request(
+                 // todo: remove before stabilizing multi-agent v2
+                 if preempt_for_mailbox_mail && sess.input_queue.has_pending_mailbox_items().await {
+                     break Ok(SamplingRequestResult {
++                        independent_provider_work,
+                         needs_follow_up: true,
+                         last_agent_message,
+                     });
+@@ -2389,6 +2435,7 @@ async fn try_run_sampling_request(
+                     needs_follow_up = true;
+                 }
+                 break Ok(SamplingRequestResult {
++                    independent_provider_work,
+                     needs_follow_up,
+                     last_agent_message,
+                 });
+diff --git a/core/src/tools/code_mode/delegate.rs b/core/src/tools/code_mode/delegate.rs
+index acb4546..775fda2 100644
+--- a/core/src/tools/code_mode/delegate.rs
++++ b/core/src/tools/code_mode/delegate.rs
+@@ -42,6 +42,14 @@ impl CodeModeDispatchBroker {
+         dispatch_gate(&self.dispatch_gates, cell_id).send_replace(true);
+     }
+
++    pub(super) fn has_open_cells(&self) -> bool {
++        !self
++            .dispatch_gates
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .is_empty()
++    }
++
+     pub(super) fn close_cell(&self, cell_id: &CellId) {
+         remove_dispatch_gate(&self.dispatch_gates, cell_id);
+     }
+diff --git a/core/src/tools/code_mode/mod.rs b/core/src/tools/code_mode/mod.rs
+index bde373d..3676c9a 100644
+--- a/core/src/tools/code_mode/mod.rs
++++ b/core/src/tools/code_mode/mod.rs
+@@ -127,6 +127,10 @@ impl CodeModeService {
+         self.dispatch_broker.mark_cell_ready_for_dispatch(cell_id);
+     }
+
++    pub(crate) fn has_open_cells(&self) -> bool {
++        self.dispatch_broker.has_open_cells()
++    }
++
+     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
+         self.dispatch_broker.close_cell(cell_id);
+     }
+diff --git a/core/src/tools/function_namespace.rs b/core/src/tools/function_namespace.rs
+index 16ce504..e64d148 100644
+--- a/core/src/tools/function_namespace.rs
++++ b/core/src/tools/function_namespace.rs
+@@ -79,6 +79,12 @@ impl ToolExecutor<ToolInvocation> for FunctionNamespace {
+ }
+
+ impl CoreToolRuntime for FunctionNamespace {
++    fn coalesces_pending_calls(&self) -> bool {
++        self.handler.coalesces_pending_calls()
++    }
++    fn deep_search_receipts(&self) -> bool {
++        self.handler.deep_search_receipts()
++    }
+     fn code_mode_namespace(&self) -> Option<String> {
+         self.handler.code_mode_namespace()
+     }
+diff --git a/core/src/tools/handlers/mcp.rs b/core/src/tools/handlers/mcp.rs
+index 7e5ae75..c37d492 100644
+--- a/core/src/tools/handlers/mcp.rs
++++ b/core/src/tools/handlers/mcp.rs
+@@ -160,6 +160,13 @@ impl McpHandler {
+         } else {
+             None
+         };
++        if self.deep_search_receipts() {
++            step_context
++                .search_progress
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .receive(result.result.meta.as_ref(), model_preview.as_ref());
++        }
+         Ok(boxed_tool_output(McpToolOutput {
+             model_preview,
+             result: result.result,
+@@ -172,6 +179,17 @@ impl McpHandler {
+ }
+
+ impl CoreToolRuntime for McpHandler {
++    fn deep_search_receipts(&self) -> bool {
++        self.coalesces_pending_calls()
++            && self
++                .tool_info
++                .tool
++                .meta
++                .as_ref()
++                .and_then(|m| m.get("ai.yijie/searchReceiptVersion"))
++                .and_then(Value::as_u64)
++                == Some(2)
++    }
+     fn coalesces_pending_calls(&self) -> bool {
+         self.tool_info.server_name == "yijie_web"
+             && self.tool_info.tool.name == "kimi_web_search_pro"
+diff --git a/core/src/tools/mod.rs b/core/src/tools/mod.rs
+index 39dacff..902951c 100644
+--- a/core/src/tools/mod.rs
++++ b/core/src/tools/mod.rs
+@@ -14,6 +14,7 @@ pub(crate) mod registry;
+ pub(crate) mod router;
+ pub(crate) mod runtimes;
+ pub(crate) mod sandboxing;
++pub(crate) mod search_progress;
+ pub(crate) mod spec_plan;
+ pub(crate) mod tool_dispatch_trace;
+ pub(crate) mod web_retrieval_guard;
+diff --git a/core/src/tools/registry.rs b/core/src/tools/registry.rs
+index 3bbe8b0..a0c733c 100644
+--- a/core/src/tools/registry.rs
++++ b/core/src/tools/registry.rs
+@@ -47,6 +47,10 @@ pub use codex_tools::ToolExposure;
+ /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
+ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+     /// A verified handler can join pending exact matches at its authorized execution boundary.
++    fn deep_search_receipts(&self) -> bool {
++        false
++    }
++
+     fn coalesces_pending_calls(&self) -> bool {
+         false
+     }
+@@ -289,6 +293,9 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
+ }
+
+ impl CoreToolRuntime for ExposureOverride {
++    fn deep_search_receipts(&self) -> bool {
++        self.handler.deep_search_receipts()
++    }
+     fn coalesces_pending_calls(&self) -> bool {
+         self.handler.coalesces_pending_calls()
+     }
+@@ -479,6 +486,16 @@ impl ToolRegistry {
+             }
+         };
+
++        let deep = tool.deep_search_receipts();
++        let cell = crate::tools::code_mode::is_exec_tool_name(&invocation.tool_name);
++        if !cell {
++            invocation
++                .step_context
++                .search_progress
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .begin(deep);
++        }
+         let telemetry_tags = tool.telemetry_tags(&invocation).await;
+         let mut tool_result_tags =
+             Vec::with_capacity(base_tool_result_tags.len() + telemetry_tags.len());
+@@ -564,6 +581,7 @@ impl ToolRegistry {
+                 crate::tools::web_retrieval_guard::before(
+                     &invocation,
+                     tool.coalesces_pending_calls(),
++                    deep,
+                 )
+             })
+         {
+@@ -605,10 +623,12 @@ impl ToolRegistry {
+                     async move {
+                         let observed = invocation_for_tool.clone();
+                         let result = handle_any_tool(tool.as_ref(), invocation_for_tool).await;
+-                        crate::tools::web_retrieval_guard::after(
+-                            &observed,
+-                            result.as_ref().map(|result| result.result.as_ref()),
+-                        );
++                        if !deep {
++                            crate::tools::web_retrieval_guard::after(
++                                &observed,
++                                result.as_ref().map(|result| result.result.as_ref()),
++                            );
++                        }
+                         match result {
+                             Ok(result) => {
+                                 let preview = result.result.log_preview();
+@@ -710,6 +730,20 @@ impl ToolRegistry {
+                         });
+                     }
+                 }
++                if (cell || deep)
++                    && invocation.source == crate::tools::context::ToolCallSource::Direct
++                {
++                    invocation
++                        .step_context
++                        .search_progress
++                        .lock()
++                        .unwrap_or_else(std::sync::PoisonError::into_inner)
++                        .output(
++                            result
++                                .result
++                                .to_response_item(&result.call_id, &result.payload),
++                        );
++                }
+                 dispatch_trace.record_completed(
+                     &invocation,
+                     &result.call_id,
+diff --git a/core/src/tools/search_progress.rs b/core/src/tools/search_progress.rs
+new file mode 100644
+index 0000000..e08fd94
+--- /dev/null
++++ b/core/src/tools/search_progress.rs
+@@ -0,0 +1,258 @@
++//! Only completed native deep-search receipts can drive this turn's correction.
++//! Compare the material actually exposed at the outer tool boundary. A script
++//! that extracts fresh chunks or produces another deliverable stays ordinary.
++use std::collections::HashMap;
++use std::sync::Mutex;
++use std::sync::PoisonError;
++
++use crate::session::session::Session;
++use crate::session::turn_context::TurnContext;
++use codex_protocol::models::{
++    FunctionCallOutputBody, FunctionCallOutputContentItem, ResponseInputItem,
++};
++use serde_json::Value;
++
++#[derive(Debug, Default)]
++pub(crate) struct Step {
++    expected: usize,
++    previews: Vec<(String, bool, Value)>,
++    printed: Vec<Value>,
++    other: bool,
++}
++#[derive(Default)]
++pub(crate) struct History {
++    delivered: HashMap<String, Value>,
++    correction_sent: bool,
++}
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum Next {
++    Ordinary,
++    Correct,
++    Finish,
++}
++
++impl Step {
++    pub(crate) fn begin(&mut self, deep: bool) {
++        if deep {
++            self.expected += 1;
++        } else {
++            self.other = true;
++        }
++    }
++
++    pub(crate) fn receive(&mut self, meta: Option<&Value>, preview: Option<&Value>) {
++        let Some(fact) = meta.and_then(|v| v.get("ai.yijie/deep-search-receipt")) else {
++            return;
++        };
++        let Some(view) = preview else { return };
++        let Some(id) = fact["operation_id"]
++            .as_str()
++            .filter(|v| uuid::Uuid::parse_str(v).is_ok())
++        else {
++            return;
++        };
++        if self.previews.len() >= 64
++            || fact["version"] != 2
++            || fact["availability"] != "available"
++            || fact["dispatch"] != "responded"
++            || (fact["outcome"] == "empty" && view["status"] != "no_matches")
++            || !matches!(
++                fact["outcome"].as_str(),
++                Some("empty" | "results" | "partial")
++            )
++        {
++            return;
++        }
++        let repeated = matches!(fact["relation"].as_str(), Some("joined" | "reused"));
++        self.previews.push((id.to_owned(), repeated, view.clone()));
++    }
++
++    pub(crate) fn output(&mut self, response: ResponseInputItem) {
++        if self.other || self.previews.is_empty() {
++            self.other = true;
++            return;
++        }
++        let payload = match response {
++            ResponseInputItem::FunctionCallOutput { output, .. }
++            | ResponseInputItem::CustomToolCallOutput { output, .. } => output,
++            _ => {
++                self.other = true;
++                return;
++            }
++        };
++        if let FunctionCallOutputBody::ContentItems(items) = &payload.body
++            && items
++                .iter()
++                .any(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }))
++        {
++            self.other = true;
++            return;
++        }
++        let Some(text) = payload.body.to_text() else {
++            self.other = true;
++            return;
++        };
++        let Some((header, body)) = text.split_once("Output:") else {
++            self.other = true;
++            return;
++        };
++        let header = header.trim();
++        if !(header.starts_with("Wall time:") || header.starts_with("Script completed\nWall time "))
++            || body.len() > 65536
++        {
++            self.other = true;
++            return;
++        }
++        for line in body.lines().map(str::trim).filter(|v| !v.is_empty()) {
++            let Ok(value) = serde_json::from_str::<Value>(line) else {
++                self.other = true;
++                return;
++            };
++            if !self.collect(&value) {
++                self.other = true;
++                return;
++            }
++        }
++    }
++    fn collect(&mut self, value: &Value) -> bool {
++        if self.printed.len() >= 64 {
++            return false;
++        }
++        if self.previews.iter().any(|(_, _, p)| p == value) {
++            self.printed.push(value.clone());
++            return true;
++        }
++        if let Some(rows) = value.as_array() {
++            if rows.is_empty()
++                && self.previews.len() == 1
++                && self.previews[0].2["status"] == "no_matches"
++            {
++                self.printed.push(self.previews[0].2.clone());
++                return true;
++            }
++            return !rows.is_empty() && rows.iter().all(|v| self.collect(v));
++        }
++        if let Some(o) = value.as_object()
++            && o.len() == 2
++            && o.get("i").is_some_and(Value::is_u64)
++            && let Some(r) = o.get("r")
++        {
++            return self.collect(r);
++        }
++        false
++    }
++    fn advance(&self, history: &mut History) -> Next {
++        if self.other
++            || self.previews.is_empty()
++            || self.expected != self.previews.len()
++            || self.printed.len() != self.previews.len()
++        {
++            return Next::Ordinary;
++        }
++        let mut remaining = self.printed.clone();
++        for (_, _, v) in &self.previews {
++            let Some(i) = remaining.iter().position(|p| p == v) else {
++                return Next::Ordinary;
++            };
++            remaining.swap_remove(i);
++        }
++        let mut only_repeats = true;
++        for (id, repeated, view) in &self.previews {
++            // The same operation can expose a different material projection.
++            // Compare the selected sources and their versioned content too.
++            let mut material = view.clone();
++            if let Some(object) = material.as_object_mut() {
++                object.remove("reused");
++            }
++            only_repeats &= *repeated && history.delivered.get(id) == Some(&material);
++            if history.delivered.len() < 1024 || history.delivered.contains_key(id) {
++                history.delivered.insert(id.clone(), material);
++            }
++        }
++        if !only_repeats {
++            return Next::Ordinary;
++        }
++        if history.correction_sent {
++            return Next::Finish;
++        }
++        history.correction_sent = true;
++        Next::Correct
++    }
++}
++pub(crate) fn advance(step: &Mutex<Step>, turn: &TurnContext) -> Next {
++    let history = turn
++        .extension_data
++        .get_or_init(|| Mutex::new(History::default()));
++    step.lock()
++        .unwrap_or_else(PoisonError::into_inner)
++        .advance(&mut history.lock().unwrap_or_else(PoisonError::into_inner))
++}
++/// Before withdrawing turn tools, honor independent work already in flight.
++pub(crate) async fn work_is_settled(session: &Session) -> bool {
++    if session.services.code_mode_service.has_open_cells()
++        || !session
++            .services
++            .unified_exec_manager
++            .list_processes()
++            .await
++            .is_empty()
++    {
++        return false;
++    }
++    let agents = &session.services.agent_control;
++    let Ok(children) = agents
++        .list_live_agent_subtree_thread_ids(session.thread_id)
++        .await
++    else {
++        return false;
++    };
++    for child in children {
++        if child != session.thread_id
++            && matches!(
++                agents.get_status(child).await,
++                codex_protocol::protocol::AgentStatus::PendingInit
++                    | codex_protocol::protocol::AgentStatus::Running
++            )
++        {
++            return false;
++        }
++    }
++    true
++}
++pub(crate) fn reset(turn: &TurnContext) {
++    let history = turn
++        .extension_data
++        .get_or_init(|| Mutex::new(History::default()));
++    *history.lock().unwrap_or_else(PoisonError::into_inner) = History::default();
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++    fn search(id: &str, repeated: bool) -> Step {
++        let p = json!({"query":id,"results":[],"reused":repeated});
++        Step {
++            expected: 1,
++            previews: vec![(id.into(), repeated, p.clone())],
++            printed: vec![p],
++            other: false,
++        }
++    }
++    #[test]
++    fn bounded_search_correction_keeps_changed_work_and_material_reads() {
++        let mut h = History::default();
++        assert_eq!(search("temple", false).advance(&mut h), Next::Ordinary);
++        assert_eq!(search("temple", true).advance(&mut h), Next::Correct);
++        let mut mixed = search("weather", false);
++        let old = search("temple", true);
++        mixed.expected += 1;
++        mixed.previews.extend(old.previews);
++        mixed.printed.extend(old.printed);
++        assert_eq!(mixed.advance(&mut h), Next::Ordinary);
++        let mut chunk = search("weather", true);
++        chunk.printed = vec![json!({"body":"new source"})];
++        assert_eq!(chunk.advance(&mut h), Next::Ordinary);
++        assert_eq!(search("temple", true).advance(&mut h), Next::Finish);
++    }
++}
+diff --git a/core/src/tools/web_retrieval_guard.rs b/core/src/tools/web_retrieval_guard.rs
+index 726d4e8..3645a37 100644
+--- a/core/src/tools/web_retrieval_guard.rs
++++ b/core/src/tools/web_retrieval_guard.rs
+@@ -205,7 +205,15 @@ fn operation(invocation: &ToolInvocation) -> Option<Operation> {
+ pub(crate) fn before(
+     invocation: &ToolInvocation,
+     coalesces_pending_calls: bool,
++    typed_deep_search: bool,
+ ) -> Result<(), FunctionCallError> {
++    if typed_deep_search {
++        state(&invocation.turn)
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .searched = true;
++        return Ok(());
++    }
+     if invocation.tool_name.name == "write_stdin" {
+         return before_stdin(invocation);
+     }
+diff --git a/core/src/tools/web_search_preview.rs b/core/src/tools/web_search_preview.rs
+index 677c8df..d0137f9 100644
+--- a/core/src/tools/web_search_preview.rs
++++ b/core/src/tools/web_search_preview.rs
+@@ -37,6 +37,38 @@ pub(crate) fn preview(arguments: &Value, result: &CallToolResult) -> Option<Valu
+     {
+         view["reused"] = Value::Bool(true);
+     }
++    if let Some(receipt) = result
++        .meta
++        .as_ref()
++        .and_then(|m| m.get("ai.yijie/deep-search-receipt"))
++        && receipt["version"] == 2
++        && let Some(id) = receipt["operation_id"].as_str()
++        && uuid::Uuid::parse_str(id).is_ok()
++    {
++        view["search_ref"] = json!(id);
++        if matches!(receipt["relation"].as_str(), Some("joined" | "reused")) {
++            view["reused"] = json!(true);
++        }
++        if rows.is_empty()
++            && receipt["outcome"] == "empty"
++            && structured["truncated"] == false
++            && structured["dropped_results"] == 0
++        {
++            view["status"] = json!("no_matches");
++            view["guidance"] = json!(
++                "No matches for these exact filters. Use a different focused query within the user's constraints, read existing sources, or answer with the evidence available."
++            );
++            for field in ["sites", "time_window", "limit"] {
++                if let Some(v) = arguments.get(field) {
++                    if v.to_string().len() <= 600 {
++                        view[field] = v.clone()
++                    } else {
++                        view["preview_truncated"] = json!(true)
++                    }
++                }
++            }
++        }
++    }
+     let mut sources = Vec::with_capacity(rows.len());
+     for (index, row) in rows.iter().enumerate() {
+         let mut source = json!({"index": index});
