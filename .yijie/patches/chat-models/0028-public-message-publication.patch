@@ -1,0 +1,1620 @@
+diff --git a/analytics/src/reducer.rs b/analytics/src/reducer.rs
+--- a/analytics/src/reducer.rs
++++ b/analytics/src/reducer.rs
+@@ -407,6 +407,7 @@
+             ThreadItem::UserMessage { .. }
+             | ThreadItem::HookPrompt { .. }
+             | ThreadItem::AgentMessage { .. }
++            | ThreadItem::UnpublishedText { .. }
+             | ThreadItem::Plan { .. }
+             | ThreadItem::Reasoning { .. }
+             | ThreadItem::ImageView { .. }
+@@ -1738,6 +1739,7 @@
+         ThreadItem::UserMessage { .. }
+         | ThreadItem::HookPrompt { .. }
+         | ThreadItem::AgentMessage { .. }
++        | ThreadItem::UnpublishedText { .. }
+         | ThreadItem::Plan { .. }
+         | ThreadItem::Reasoning { .. }
+         | ThreadItem::SubAgentActivity { .. }
+diff --git a/app-server/src/bespoke_event_handling.rs b/app-server/src/bespoke_event_handling.rs
+--- a/app-server/src/bespoke_event_handling.rs
++++ b/app-server/src/bespoke_event_handling.rs
+@@ -2131,6 +2131,7 @@
+             RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "after rollback".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             })),
+         ];
+diff --git a/app-server/src/request_processors/thread_resume_redaction.rs b/app-server/src/request_processors/thread_resume_redaction.rs
+--- a/app-server/src/request_processors/thread_resume_redaction.rs
++++ b/app-server/src/request_processors/thread_resume_redaction.rs
+@@ -72,6 +72,7 @@
+                 id: "agent-1".to_string(),
+                 text: "kept".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             ThreadItem::McpToolCall {
+@@ -119,6 +120,7 @@
+                 id: "agent-1".to_string(),
+                 text: "kept".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }
+         );
+diff --git a/app-server/src/request_processors/token_usage_replay.rs b/app-server/src/request_processors/token_usage_replay.rs
+--- a/app-server/src/request_processors/token_usage_replay.rs
++++ b/app-server/src/request_processors/token_usage_replay.rs
+@@ -158,6 +158,7 @@
+             RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "first answer".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             })),
+             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+diff --git a/app-server/tests/suite/v2/external_agent_config.rs b/app-server/tests/suite/v2/external_agent_config.rs
+--- a/app-server/tests/suite/v2/external_agent_config.rs
++++ b/app-server/tests/suite/v2/external_agent_config.rs
+@@ -805,6 +805,7 @@
+             id: "item-4".into(),
+             text: "<EXTERNAL SESSION IMPORTED>".into(),
+             phase: None,
++            publication: None,
+             memory_citation: None,
+         })
+     );
+diff --git a/app-server/tests/suite/v2/thread_read.rs b/app-server/tests/suite/v2/thread_read.rs
+--- a/app-server/tests/suite/v2/thread_read.rs
++++ b/app-server/tests/suite/v2/thread_read.rs
+@@ -1440,6 +1440,7 @@
+             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
+                 message: text.to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }))?,
+         })
+diff --git a/app-server/tests/suite/v2/thread_resume.rs b/app-server/tests/suite/v2/thread_resume.rs
+--- a/app-server/tests/suite/v2/thread_resume.rs
++++ b/app-server/tests/suite/v2/thread_resume.rs
+@@ -2211,6 +2211,7 @@
+             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "Still running".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }))?,
+         })
+@@ -2302,6 +2303,7 @@
+             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "Interrupted after usage".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }))?,
+         })
+@@ -2632,6 +2634,7 @@
+             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "Still running".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }))?,
+         })
+diff --git a/app-server-client/src/lib.rs b/app-server-client/src/lib.rs
+--- a/app-server-client/src/lib.rs
++++ b/app-server-client/src/lib.rs
+@@ -1208,6 +1208,7 @@
+                 id: "item".to_string(),
+                 text: text.to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+         })
+@@ -2173,6 +2174,7 @@
+                             id: "item".to_string(),
+                             text: "hello".to_string(),
+                             phase: None,
++                            publication: None,
+                             memory_citation: None,
+                         },
+                     }
+diff --git a/app-server-protocol/src/protocol/thread_history.rs b/app-server-protocol/src/protocol/thread_history.rs
+--- a/app-server-protocol/src/protocol/thread_history.rs
++++ b/app-server-protocol/src/protocol/thread_history.rs
+@@ -324,6 +324,7 @@
+             EventMsg::AgentMessage(payload) => self.handle_agent_message(
+                 payload.message.clone(),
+                 payload.phase.clone(),
++                payload.publication.clone(),
+                 payload.memory_citation.clone().map(Into::into),
+             ),
+             EventMsg::AgentReasoning(payload) => self.handle_agent_reasoning(payload),
+@@ -484,17 +485,30 @@
+         &mut self,
+         text: String,
+         phase: Option<MessagePhase>,
++        publication: Option<codex_protocol::items::PublicMessagePublication>,
+         memory_citation: Option<crate::protocol::v2::MemoryCitation>,
+     ) {
+         if text.is_empty() {
+             return;
+         }
+ 
+-        let id = self.next_item_id();
++        let id = publication
++            .as_ref()
++            .map(|p| p.item_id.clone())
++            .unwrap_or_else(|| self.next_item_id());
++        if let Some(p) = publication.as_ref().filter(|p| p.source.is_undelivered()) {
++            self.push_item_in_current_turn(ThreadItem::UnpublishedText {
++                id,
++                text,
++                publication: p.clone(),
++            });
++            return;
++        }
+         self.push_item_in_current_turn(ThreadItem::AgentMessage {
+             id,
+             text,
+             phase,
++            publication,
+             memory_citation,
+         });
+     }
+@@ -1367,7 +1381,24 @@
+         let changed_item = {
+             let turn = self.ensure_turn();
+             let changed_item = tracking_changes.then(|| (turn.id.clone(), item.clone()));
+-            turn.items.push(item);
++            let publication = match &item {
++                ThreadItem::AgentMessage { publication, .. } => publication.as_ref(),
++                ThreadItem::UnpublishedText { publication, .. } => Some(publication),
++                _ => None,
++            };
++            if let Some(stamp) = publication {
++                if let Some(index) = turn.items.iter().position(|old| old.id() == item.id()) {
++                    turn.items[index] = item;
++                } else {
++                    let index = stamp.after_item_id.as_ref()
++                        .and_then(|id| turn.items.iter().position(|old| old.id() == id))
++                        .map(|i| i + 1)
++                        .unwrap_or_else(|| (stamp.order as usize).min(turn.items.len()));
++                    turn.items.insert(index, item);
++                }
++            } else {
++                turn.items.push(item);
++            }
+             changed_item
+         };
+         if let Some((turn_id, item)) = changed_item {
+@@ -1647,6 +1678,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "Hi there".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::AgentReasoning(AgentReasoningEvent {
+@@ -1666,6 +1698,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "Reply two".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+         ];
+@@ -1704,6 +1737,7 @@
+                 id: "item-2".into(),
+                 text: "Hi there".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }
+         );
+@@ -1737,6 +1771,7 @@
+                 id: "item-5".into(),
+                 text: "Reply two".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }
+         );
+@@ -2185,6 +2220,7 @@
+         let events = vec![EventMsg::AgentMessage(AgentMessageEvent {
+             message: "Final reply".into(),
+             phase: Some(CoreMessagePhase::FinalAnswer),
++            publication: None,
+             memory_citation: None,
+         })];
+ 
+@@ -2200,6 +2236,7 @@
+                 id: "item-1".into(),
+                 text: "Final reply".into(),
+                 phase: Some(MessagePhase::FinalAnswer),
++                publication: None,
+                 memory_citation: None,
+             }
+         );
+@@ -2292,6 +2329,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "interlude".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::AgentReasoning(AgentReasoningEvent {
+@@ -2340,6 +2378,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "Working...".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::TurnAborted(TurnAbortedEvent {
+@@ -2359,6 +2398,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "Second attempt complete.".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+         ];
+@@ -2390,6 +2430,7 @@
+                 id: "item-2".into(),
+                 text: "Working...".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }
+         );
+@@ -2414,6 +2455,7 @@
+                 id: "item-4".into(),
+                 text: "Second attempt complete.".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }
+         );
+@@ -2433,6 +2475,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "A1".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::UserMessage(UserMessageEvent {
+@@ -2446,6 +2489,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "A2".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+@@ -2460,6 +2504,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "A3".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+         ];
+@@ -2490,6 +2535,7 @@
+                     id: "item-2".into(),
+                     text: "A1".into(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 },
+             ]
+@@ -2509,6 +2555,7 @@
+                     id: "item-4".into(),
+                     text: "A3".into(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 },
+             ]
+@@ -2529,6 +2576,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "A1".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::UserMessage(UserMessageEvent {
+@@ -2542,6 +2590,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "A2".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 99 }),
+@@ -3511,6 +3560,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "still in b".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
+@@ -3582,6 +3632,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "still in b".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+         ];
+@@ -3884,6 +3935,7 @@
+             EventMsg::AgentMessage(AgentMessageEvent {
+                 message: "done".into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }),
+             EventMsg::Error(ErrorEvent {
+diff --git a/app-server-protocol/src/protocol/v2/item.rs b/app-server-protocol/src/protocol/v2/item.rs
+--- a/app-server-protocol/src/protocol/v2/item.rs
++++ b/app-server-protocol/src/protocol/v2/item.rs
+@@ -239,7 +239,17 @@
+     },
+     #[serde(rename_all = "camelCase")]
+     #[ts(rename_all = "camelCase")]
++    UnpublishedText {
++        id: String,
++        text: String,
++        publication: codex_protocol::items::PublicMessagePublication,
++    },
++    #[serde(rename_all = "camelCase")]
++    #[ts(rename_all = "camelCase")]
+     AgentMessage {
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        #[ts(optional)]
++        publication: Option<codex_protocol::items::PublicMessagePublication>,
+         id: String,
+         text: String,
+         #[serde(default)]
+@@ -421,6 +431,7 @@
+             ThreadItem::UserMessage { id, .. }
+             | ThreadItem::HookPrompt { id, .. }
+             | ThreadItem::AgentMessage { id, .. }
++            | ThreadItem::UnpublishedText { id, .. }
+             | ThreadItem::Plan { id, .. }
+             | ThreadItem::Reasoning { id, .. }
+             | ThreadItem::CommandExecution { id, .. }
+@@ -842,10 +853,22 @@
+                         CoreAgentMessageContent::Text { text } => text,
+                     })
+                     .collect::<String>();
++                if let Some(publication) = agent
++                    .publication
++                    .as_ref()
++                    .filter(|p| p.source.is_undelivered())
++                {
++                    return ThreadItem::UnpublishedText {
++                        id: agent.id,
++                        text,
++                        publication: publication.clone(),
++                    };
++                }
+                 ThreadItem::AgentMessage {
+                     id: agent.id,
+                     text,
+                     phase: agent.phase,
++                    publication: agent.publication,
+                     memory_citation: agent.memory_citation.map(Into::into),
+                 }
+             }
+diff --git a/app-server-protocol/src/protocol/v2/tests.rs b/app-server-protocol/src/protocol/v2/tests.rs
+--- a/app-server-protocol/src/protocol/v2/tests.rs
++++ b/app-server-protocol/src/protocol/v2/tests.rs
+@@ -2579,6 +2579,7 @@
+             },
+         ],
+         phase: None,
++        publication: None,
+         memory_citation: None,
+     });
+ 
+@@ -2588,6 +2589,7 @@
+             id: "agent-1".to_string(),
+             text: "Hello world".to_string(),
+             phase: None,
++            publication: None,
+             memory_citation: None,
+         }
+     );
+@@ -2598,6 +2600,7 @@
+             text: "final".to_string(),
+         }],
+         phase: Some(MessagePhase::FinalAnswer),
++        publication: None,
+         memory_citation: Some(CoreMemoryCitation {
+             entries: vec![CoreMemoryCitationEntry {
+                 path: "MEMORY.md".to_string(),
+@@ -2615,6 +2618,7 @@
+             id: "agent-2".to_string(),
+             text: "final".to_string(),
+             phase: Some(MessagePhase::FinalAnswer),
++            publication: None,
+             memory_citation: Some(MemoryCitation {
+                 entries: vec![MemoryCitationEntry {
+                     path: "MEMORY.md".to_string(),
+diff --git a/core/src/event_mapping.rs b/core/src/event_mapping.rs
+--- a/core/src/event_mapping.rs
++++ b/core/src/event_mapping.rs
+@@ -144,6 +144,7 @@
+         id,
+         content,
+         phase,
++        publication: None,
+         memory_citation: None,
+     }
+ }
+diff --git a/core/src/session/answer_completion.rs b/core/src/session/answer_completion.rs
+--- a/core/src/session/answer_completion.rs
++++ b/core/src/session/answer_completion.rs
+@@ -112,6 +112,15 @@
+             .lock()
+             .unwrap_or_else(PoisonError::into_inner)
+             .finalizing
++}
++
++pub(crate) fn last_delivery_attempt(turn: &TurnContext) -> bool {
++    if !enabled(turn) {
++        return false;
++    }
++    let s = state(turn);
++    let s = s.lock().unwrap_or_else(PoisonError::into_inner);
++    s.finalizing && s.attempts == MAX_RECOVERIES
+ }
+ 
+ pub(crate) fn before_tool(turn: &TurnContext) -> Result<(), FunctionCallError> {
+diff --git a/core/src/session/mod.rs b/core/src/session/mod.rs
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -1,5 +1,6 @@
+ pub(crate) mod answer_completion;
+ pub(crate) mod public_messages;
++pub(crate) mod publication;
+ 
+ use std::borrow::Cow;
+ use std::collections::BTreeMap;
+@@ -1800,6 +1801,14 @@
+ 
+     /// Persist the event to rollout and send it to clients.
+     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
++        if publication::enabled(turn_context) {
++            publication::dispatch(self, turn_context, msg).await;
++        } else {
++            self.send_event_direct(turn_context, msg).await;
++        }
++    }
++
++    pub(super) async fn send_event_direct(&self, turn_context: &TurnContext, msg: EventMsg) {
+         let legacy_source = msg.clone();
+         if let EventMsg::Error(error) = &legacy_source
+             && error
+diff --git a/core/src/session/public_messages.rs b/core/src/session/public_messages.rs
+--- a/core/src/session/public_messages.rs
++++ b/core/src/session/public_messages.rs
+@@ -158,6 +158,7 @@
+     pending: Option<PendingMessage>,
+     ready: VecDeque<ResponseEvent>,
+     last_declared_commentary: bool,
++    pub(crate) defer_declared_start: bool,
+     body_parser: Option<StandaloneMarkerParser>,
+ }
+ 
+@@ -168,6 +169,7 @@
+             pending: None,
+             ready: VecDeque::new(),
+             last_declared_commentary: false,
++            defer_declared_start: false,
+             body_parser: None,
+         }
+     }
+@@ -198,7 +200,11 @@
+         self.ready
+             .push_back(ResponseEvent::OutputItemAdded(with_public_text(
+                 &pending.added,
+-                phase,
++                if self.defer_declared_start {
++                    None
++                } else {
++                    phase
++                },
+                 "",
+             )));
+         self.push_body(body);
+diff --git a/core/src/session/publication.rs b/core/src/session/publication.rs
+new file mode 100644
+--- /dev/null
++++ b/core/src/session/publication.rs
+@@ -0,0 +1,452 @@
++//! Publication decisions for the negotiated desktop projection. Provider items,
++//! tool dispatch, mailbox semantics and the sampling loop remain independent.
++use std::sync::Arc;
++
++use codex_protocol::items::{
++    AgentMessageContent, AgentMessageItem, PublicMessagePublication, PublicPhaseSource as Source,
++    TurnItem,
++};
++use codex_protocol::models::MessagePhase;
++use codex_protocol::protocol::{
++    AgentMessageContentDeltaEvent, EventMsg, ItemCompletedEvent, ItemStartedEvent, SessionSource,
++};
++use tokio::sync::Mutex;
++
++use super::{Session, turn_context::TurnContext};
++
++pub(crate) const MARKER: &str = "[yijie-publication-v2]";
++const MAX_ITEM_BYTES: usize = 256 * 1024;
++const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
++const MAX_PENDING_ITEMS: usize = 128;
++const CHUNK_BYTES: usize = 16 * 1024;
++
++pub(crate) fn enabled(turn: &TurnContext) -> bool {
++    super::public_messages::enabled(turn)
++        && !turn.realtime_active
++        && !matches!(
++            turn.session_source,
++            SessionSource::SubAgent(_) | SessionSource::Internal(_)
++        )
++        && turn
++            .developer_instructions
++            .as_deref()
++            .is_some_and(|s| s.lines().any(|l| l == MARKER))
++}
++
++#[derive(Default, Clone, Copy, PartialEq)]
++enum Purpose {
++    #[default]
++    Mixed,
++    Progress,
++    Delivery,
++}
++
++struct Candidate {
++    item: AgentMessageItem,
++    stamp: PublicMessagePublication,
++    start_ms: i64,
++    done_ms: Option<i64>,
++    preview: String,
++    published: Option<MessagePhase>,
++    provider_phase: Option<MessagePhase>,
++}
++
++#[derive(Default)]
++pub(crate) struct State {
++    pending: Vec<Candidate>,
++    order: u32,
++    previous: Option<String>,
++    selected: Option<String>,
++    purpose: Purpose,
++    completing: Option<(String, Option<MessagePhase>)>,
++}
++
++fn state(turn: &TurnContext) -> Arc<Mutex<State>> {
++    turn.extension_data
++        .get_or_init(|| Mutex::new(State::default()))
++}
++
++fn take_prefix(text: &str, limit: usize) -> &str {
++    let mut end = text.len().min(limit);
++    while !text.is_char_boundary(end) {
++        end -= 1;
++    }
++    &text[..end]
++}
++
++fn text(item: &AgentMessageItem) -> String {
++    item.content
++        .iter()
++        .map(|AgentMessageContent::Text { text }| text.as_str())
++        .collect()
++}
++
++fn set_text(item: &mut AgentMessageItem, text: String) {
++    item.content = vec![AgentMessageContent::Text { text }];
++}
++
++impl State {
++    fn reserve(&mut self, id: &str) -> PublicMessagePublication {
++        let stamp = PublicMessagePublication {
++            item_id: id.to_owned(),
++            order: self.order,
++            after_item_id: self.previous.replace(id.to_owned()),
++            source: Source::Superseded,
++            truncated: false,
++        };
++        self.order = self.order.saturating_add(1);
++        stamp
++    }
++    fn bytes(&self) -> usize {
++        self.pending.iter().map(|m| m.preview.len()).sum()
++    }
++
++    fn held_events(
++        &self,
++        mut m: Candidate,
++        phase: Option<MessagePhase>,
++        source: Source,
++        at: i64,
++        turn: &TurnContext,
++        sess: &Session,
++    ) -> Vec<EventMsg> {
++        if m.preview.trim().is_empty() {
++            return Vec::new();
++        }
++        m.stamp.source = source;
++        m.item.phase = phase;
++        m.item.publication = Some(m.stamp);
++        let mut start = m.item.clone();
++        set_text(&mut start, String::new());
++        let mut events = vec![EventMsg::ItemStarted(ItemStartedEvent {
++            thread_id: sess.thread_id,
++            turn_id: turn.sub_id.clone(),
++            item: TurnItem::AgentMessage(start),
++            started_at_ms: m.start_ms,
++        })];
++        if !source.is_undelivered() {
++            let mut rest = m.preview.as_str();
++            while !rest.is_empty() {
++                let part = take_prefix(rest, CHUNK_BYTES);
++                events.push(EventMsg::AgentMessageContentDelta(
++                    AgentMessageContentDeltaEvent {
++                        thread_id: sess.thread_id.to_string(),
++                        turn_id: turn.sub_id.clone(),
++                        item_id: m.item.id.clone(),
++                        delta: part.into(),
++                    },
++                ));
++                rest = &rest[part.len()..];
++            }
++        }
++        set_text(&mut m.item, m.preview);
++        events.push(EventMsg::ItemCompleted(ItemCompletedEvent {
++            thread_id: sess.thread_id,
++            turn_id: turn.sub_id.clone(),
++            item: TurnItem::AgentMessage(m.item),
++            completed_at_ms: m.done_ms.unwrap_or(at),
++        }));
++        events
++    }
++
++    fn resolve_held(
++        &mut self,
++        sess: &Session,
++        turn: &TurnContext,
++        work: bool,
++        terminal: Option<Source>,
++        at: i64,
++    ) -> Vec<EventMsg> {
++        let mut events = Vec::new();
++        let pending = std::mem::take(&mut self.pending);
++        for m in pending {
++            if m.published.is_some() {
++                // Already streamed. Never synthesize completion of a live item.
++                if terminal.is_none() {
++                    self.pending.push(m);
++                }
++                continue;
++            }
++            let (phase, source) = if work && m.done_ms.is_some() {
++                (Some(MessagePhase::Commentary), Source::SubsequentWork)
++            } else if terminal == Some(Source::TurnCommit)
++                && self.selected.as_deref() == Some(m.item.id.as_str())
++                && m.done_ms.is_some()
++            {
++                (Some(MessagePhase::FinalAnswer), if m.item.phase == Some(MessagePhase::FinalAnswer) {
++                    Source::Declaration
++                } else { Source::TurnCommit })
++            } else if let Some(reason) = terminal {
++                (
++                    None,
++                    if reason == Source::TurnCommit {
++                        Source::Superseded
++                    } else {
++                        reason
++                    },
++                )
++            } else {
++                self.pending.push(m);
++                continue;
++            };
++            events.extend(self.held_events(m, phase, source, at, turn, sess));
++        }
++        events
++    }
++
++    fn start(
++        &mut self,
++        sess: &Session,
++        turn: &TurnContext,
++        mut start: ItemStartedEvent,
++    ) -> Vec<EventMsg> {
++        let TurnItem::AgentMessage(item) = &mut start.item else {
++            let id = start.item.id();
++            if self.previous.as_deref() != Some(&id) {
++                self.reserve(&id);
++            }
++            return vec![EventMsg::ItemStarted(start)];
++        };
++        if self.pending.iter().any(|m| m.item.id == item.id) {
++            return Vec::new();
++        }
++        let mut events = Vec::new();
++        if self.pending.len() >= MAX_PENDING_ITEMS {
++            // Never evict already-published active identities; the native stream
++            // has one active assistant item per response.
++            if let Some(i) = self.pending.iter().position(|m| m.published.is_none()) {
++                let old = self.pending.remove(i);
++                events.extend(self.held_events(
++                    old,
++                    None,
++                    Source::DisplayLimit,
++                    start.started_at_ms,
++                    turn,
++                    sess,
++                ));
++            }
++        }
++        let mut stamp = self.reserve(&item.id);
++        let provider_phase = match self.completing.as_ref() {
++            Some((id, phase)) if id == &item.id => phase.clone(),
++            _ => item.phase.clone(),
++        };
++        let phase = match (provider_phase.clone(), self.purpose) {
++            (Some(phase), _) => Some((phase, Source::Provider)),
++            (_, Purpose::Progress) => Some((MessagePhase::Commentary, Source::ProgressStep)),
++            (_, Purpose::Delivery) => Some((MessagePhase::FinalAnswer, Source::FinalStep)),
++            _ => None,
++        };
++        if let Some((p, origin)) = &phase {
++            stamp.source = *origin;
++            item.publication = Some(stamp.clone());
++            item.phase = Some(p.clone());
++        }
++        let body = text(item);
++        let preview = take_prefix(
++            &body,
++            MAX_ITEM_BYTES.min(MAX_PENDING_BYTES.saturating_sub(self.bytes())),
++        )
++        .to_owned();
++        stamp.truncated = preview.len() < body.len();
++        let mut snapshot = item.clone();
++        set_text(&mut snapshot, String::new());
++        self.pending.push(Candidate {
++            item: snapshot,
++            stamp,
++            preview,
++            start_ms: start.started_at_ms,
++            done_ms: None,
++            provider_phase,
++            published: phase.map(|(p, _)| p),
++        });
++        if item.publication.is_some() {
++            events.push(EventMsg::ItemStarted(start));
++        }
++        events
++    }
++
++    fn route(
++        &mut self,
++        sess: &Session,
++        turn: &TurnContext,
++        msg: EventMsg,
++        succeeded: bool,
++    ) -> Vec<EventMsg> {
++        match msg {
++            EventMsg::ItemStarted(e) => self.start(sess, turn, e),
++            EventMsg::AgentMessageContentDelta(d) => {
++                let remaining = MAX_PENDING_BYTES.saturating_sub(self.bytes());
++                let Some(m) = self.pending.iter_mut().find(|m| m.item.id == d.item_id) else {
++                    return Vec::new();
++                };
++                let part = take_prefix(
++                    &d.delta,
++                    remaining.min(MAX_ITEM_BYTES.saturating_sub(m.preview.len())),
++                );
++                m.preview.push_str(part);
++                m.stamp.truncated |= part.len() != d.delta.len();
++                if m.published.is_some() {
++                    vec![EventMsg::AgentMessageContentDelta(d)]
++                } else {
++                    Vec::new()
++                }
++            }
++            EventMsg::ItemCompleted(mut e) => {
++                let TurnItem::AgentMessage(item) = &mut e.item else {
++                    return vec![EventMsg::ItemCompleted(e)];
++                };
++                let mut output = Vec::new();
++                if !self.pending.iter().any(|m| m.item.id == item.id) {
++                    // Done-only streams still have an explicit first public event.
++                    let mut seed = item.clone();
++                    set_text(&mut seed, String::new());
++                    seed.phase = None;
++                    output.extend(self.start(
++                        sess,
++                        turn,
++                        ItemStartedEvent {
++                            thread_id: e.thread_id,
++                            turn_id: e.turn_id.clone(),
++                            item: TurnItem::AgentMessage(seed),
++                            started_at_ms: e.completed_at_ms,
++                        },
++                    ));
++                }
++                let i = self
++                    .pending
++                    .iter()
++                    .position(|m| m.item.id == item.id)
++                    .expect("just reserved");
++                let mut m = self.pending.remove(i);
++                let body = text(item);
++                let visible = take_prefix(
++                    &body,
++                    MAX_ITEM_BYTES.min(MAX_PENDING_BYTES.saturating_sub(self.bytes())),
++                );
++                m.preview = visible.to_owned();
++                m.stamp.truncated |= visible.len() != body.len();
++                m.done_ms = Some(e.completed_at_ms);
++                if let Some(phase) = m.published {
++                    item.phase = Some(phase);
++                    item.publication = Some(m.stamp);
++                    output.push(EventMsg::ItemCompleted(e));
++                } else {
++                    m.item = item.clone();
++                    set_text(&mut m.item, String::new());
++                    if self.completing.as_ref().is_some_and(|(id, phase)| id == &item.id && phase.is_some()) {
++                        let phase = item.phase.clone();
++                        output.extend(self.held_events(m, phase, Source::Provider, e.completed_at_ms, turn, sess));
++                    } else if item.phase == Some(MessagePhase::Commentary) {
++                        let source = if m.provider_phase.is_some() {
++                            Source::Provider
++                        } else {
++                            Source::Declaration
++                        };
++                        output.extend(self.held_events(
++                            m,
++                            Some(MessagePhase::Commentary),
++                            source,
++                            e.completed_at_ms,
++                            turn,
++                            sess,
++                        ));
++                    } else {
++                        self.pending.insert(i, m);
++                    }
++                }
++                self.completing = None;
++                output
++            }
++            msg @ (EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)) => {
++                let reason = if matches!(msg, EventMsg::TurnAborted(_)) {
++                    Source::Interrupted
++                } else if succeeded {
++                    Source::TurnCommit
++                } else {
++                    Source::Failed
++                };
++                let mut events = self.resolve_held(
++                    sess,
++                    turn,
++                    false,
++                    Some(reason),
++                    chrono::Utc::now().timestamp_millis(),
++                );
++                events.push(msg);
++                events
++            }
++            msg => vec![msg],
++        }
++    }
++}
++
++pub(crate) async fn dispatch(sess: &Session, turn: &TurnContext, msg: EventMsg) {
++    let success =
++        !matches!(msg, EventMsg::TurnComplete(_)) || turn.terminal_error.lock().await.is_none();
++    let cell = state(turn);
++    let mut state = cell.lock().await;
++    for event in state.route(sess, turn, msg, success) {
++        sess.send_event_direct(turn, event).await;
++    }
++}
++
++pub(crate) async fn begin_attempt(sess: &Session, turn: &TurnContext) {
++    if !enabled(turn) {
++        return;
++    }
++    let cell = state(turn);
++    let mut state = cell.lock().await;
++    for event in state.resolve_held(
++        sess,
++        turn,
++        false,
++        Some(Source::Superseded),
++        chrono::Utc::now().timestamp_millis(),
++    ) {
++        sess.send_event_direct(turn, event).await;
++    }
++    state.selected = None;
++    state.completing = None;
++    // The final bounded answer-only request cannot be replaced by another recovery.
++    state.purpose = if super::answer_completion::last_delivery_attempt(turn) {
++        Purpose::Delivery
++    } else if turn
++        .developer_instructions
++        .as_deref()
++        .is_some_and(|s| s.lines().any(|l| l == "[yijie-public-progress-only-v2]"))
++    {
++        Purpose::Progress
++    } else {
++        Purpose::Mixed
++    };
++}
++
++pub(crate) async fn observe_done(turn: &TurnContext, id: String, provider_phase: Option<MessagePhase>) {
++    if enabled(turn) {
++        state(turn).lock().await.completing = Some((id, provider_phase));
++    }
++}
++
++pub(crate) async fn before_work(sess: &Session, turn: &TurnContext) {
++    if !enabled(turn) {
++        return;
++    }
++    let cell = state(turn);
++    let mut state = cell.lock().await;
++    for event in state.resolve_held(
++        sess,
++        turn,
++        true,
++        None,
++        chrono::Utc::now().timestamp_millis(),
++    ) {
++        sess.send_event_direct(turn, event).await;
++    }
++}
++
++pub(crate) async fn select(turn: &TurnContext, id: Option<String>) {
++    if enabled(turn) {
++        state(turn).lock().await.selected = id;
++    }
++}
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -297,6 +297,7 @@
+         match sampling_request_result {
+             Ok((sampling_request_output, sampling_request_input)) => {
+                 let SamplingRequestResult {
++                    last_agent_message_id,
+                     needs_follow_up: model_needs_follow_up,
+                     independent_provider_work,
+                     last_agent_message: sampling_request_last_agent_message,
+@@ -485,6 +486,7 @@
+                         }
+                     }
+                     if stop_outcome.should_stop {
++                        super::publication::select(&turn_context, last_agent_message_id).await;
+                         break;
+                     }
+                     if run_legacy_after_agent_hook(
+@@ -497,6 +499,7 @@
+                     {
+                         return Ok(None);
+                     }
++                    super::publication::select(&turn_context, last_agent_message_id).await;
+                     break;
+                 }
+                 continue;
+@@ -1446,6 +1449,7 @@
+ 
+ #[derive(Debug)]
+ struct SamplingRequestResult {
++    last_agent_message_id: Option<String>,
+     independent_provider_work: bool,
+     needs_follow_up: bool,
+     last_agent_message: Option<String>,
+@@ -1896,6 +1900,7 @@
+                     id: agent_message_id.clone(),
+                     content: Vec::new(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 })
+             });
+@@ -2081,6 +2086,10 @@
+     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+         FuturesOrdered::new();
+     let mut needs_follow_up = false;
++    let strict = super::publication::enabled(&turn_context);
++    super::publication::begin_attempt(&sess, &turn_context).await;
++    let mut hosted_work = std::collections::HashSet::new();
++    let mut last_agent_message_id = None;
+     let mut independent_provider_work = false;
+     let mut last_agent_message: Option<String> = None;
+     let mut active_item: Option<TurnItem> = None;
+@@ -2095,6 +2104,7 @@
+     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
+     let mut public_message_stream =
+         super::public_messages::StreamAdapter::new(super::public_messages::enabled(&turn_context));
++    public_message_stream.defer_declared_start = strict;
+     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+     let defer_streamed_turn_items_for_contributors =
+         !sess.services.extensions.turn_item_contributors().is_empty();
+@@ -2161,6 +2171,21 @@
+             .record_responses(&handle_responses, &event);
+         record_turn_ttft_metric(&turn_context, &event).await;
+ 
++        if strict
++            && let ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item) =
++                &event
++            && matches!(
++                item,
++                ResponseItem::WebSearchCall { .. }
++                    | ResponseItem::ImageGenerationCall { .. }
++                    | ResponseItem::ToolSearchCall { .. }
++                    | ResponseItem::LocalShellCall { .. }
++            )
++            && let Some(id) = item.id()
++            && hosted_work.insert(id.to_owned())
++        {
++            super::publication::before_work(&sess, &turn_context).await;
++        }
+         match event {
+             ResponseEvent::Created => {}
+             ResponseEvent::OutputItemDone(mut item) => {
+@@ -2172,7 +2197,7 @@
+                         | ResponseItem::LocalShellCall { .. }
+                         | ResponseItem::ToolSearchCall { .. }
+                 );
+-                if turn_context.item_ids_enabled() {
++                if strict || turn_context.item_ids_enabled() {
+                     assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                 }
+                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
+@@ -2258,11 +2283,13 @@
+                 }
+                 if let Some(agent_message) = output_result.last_agent_message {
+                     last_agent_message = Some(agent_message);
++                    last_agent_message_id = output_result.last_agent_message_id;
+                 }
+                 needs_follow_up |= output_result.needs_follow_up;
+                 // todo: remove before stabilizing multi-agent v2
+                 if preempt_for_mailbox_mail && sess.input_queue.has_pending_mailbox_items().await {
+                     break Ok(SamplingRequestResult {
++                        last_agent_message_id,
+                         independent_provider_work,
+                         needs_follow_up: true,
+                         last_agent_message,
+@@ -2270,7 +2297,7 @@
+                 }
+             }
+             ResponseEvent::OutputItemAdded(mut item) => {
+-                if turn_context.item_ids_enabled() {
++                if strict || turn_context.item_ids_enabled() {
+                     assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
+                 }
+                 if let ResponseItem::CustomToolCall {
+@@ -2435,6 +2462,7 @@
+                     needs_follow_up = true;
+                 }
+                 break Ok(SamplingRequestResult {
++                    last_agent_message_id,
+                     independent_provider_work,
+                     needs_follow_up,
+                     last_agent_message,
+diff --git a/core/src/stream_events_utils.rs b/core/src/stream_events_utils.rs
+--- a/core/src/stream_events_utils.rs
++++ b/core/src/stream_events_utils.rs
+@@ -228,6 +228,7 @@
+ 
+ #[derive(Default)]
+ pub(crate) struct OutputItemResult {
++    pub last_agent_message_id: Option<String>,
+     pub last_agent_message: Option<String>,
+     pub needs_follow_up: bool,
+     pub tool_future: Option<InFlightFuture<'static>>,
+@@ -330,6 +331,7 @@
+     match ToolRouter::build_tool_call(item.clone()) {
+         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
+         Ok(Some(call)) => {
++            crate::session::publication::before_work(&ctx.sess, &ctx.turn_context).await;
+             ctx.sess
+                 .input_queue
+                 .accept_mailbox_delivery_for_current_turn(
+@@ -376,6 +378,12 @@
+                 .as_ref()
+                 .map(|finalized| finalized.facts.clone());
+             if let Some(finalized_turn_item) = finalized_turn_item {
++                if let ResponseItem::Message { role, phase, .. } = &item && role == "assistant" {
++                    crate::session::publication::observe_done(&ctx.turn_context, finalized_turn_item.turn_item.id(), phase.clone()).await;
++                }
++                if finalized_turn_item.facts.last_agent_message.is_some() {
++                    output.last_agent_message_id = Some(finalized_turn_item.turn_item.id());
++                }
+                 if previously_active_item.is_none() {
+                     ctx.sess
+                         .emit_turn_item_started(&ctx.turn_context, &finalized_turn_item.turn_item)
+diff --git a/core/src/thread_manager_tests.rs b/core/src/thread_manager_tests.rs
+--- a/core/src/thread_manager_tests.rs
++++ b/core/src/thread_manager_tests.rs
+@@ -1499,6 +1499,7 @@
+         RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+             message: "done".to_string(),
+             phase: None,
++            publication: None,
+             memory_citation: None,
+         })),
+     ]);
+diff --git a/core/src/turn_timing_tests.rs b/core/src/turn_timing_tests.rs
+--- a/core/src/turn_timing_tests.rs
++++ b/core/src/turn_timing_tests.rs
+@@ -64,6 +64,7 @@
+                 id: "msg-1".to_string(),
+                 content: Vec::new(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }))
+             .await
+@@ -75,6 +76,7 @@
+                 id: "msg-2".to_string(),
+                 content: Vec::new(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }))
+             .await,
+diff --git a/exec/src/event_processor_with_human_output_tests.rs b/exec/src/event_processor_with_human_output_tests.rs
+--- a/exec/src/event_processor_with_human_output_tests.rs
++++ b/exec/src/event_processor_with_human_output_tests.rs
+@@ -247,6 +247,7 @@
+             id: "msg-1".to_string(),
+             text: "first".to_string(),
+             phase: None,
++            publication: None,
+             memory_citation: None,
+         },
+         ThreadItem::Plan {
+@@ -257,6 +258,7 @@
+             id: "msg-2".to_string(),
+             text: "second".to_string(),
+             phase: None,
++            publication: None,
+             memory_citation: None,
+         },
+     ]);
+@@ -315,6 +317,7 @@
+                     id: "msg-1".to_string(),
+                     text: "final answer".to_string(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 }],
+                 status: TurnStatus::Completed,
+@@ -363,6 +366,7 @@
+                     id: "msg-1".to_string(),
+                     text: "final answer".to_string(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 }],
+                 status: TurnStatus::Completed,
+diff --git a/exec/src/event_processor_with_jsonl_output_tests.rs b/exec/src/event_processor_with_jsonl_output_tests.rs
+--- a/exec/src/event_processor_with_jsonl_output_tests.rs
++++ b/exec/src/event_processor_with_jsonl_output_tests.rs
+@@ -17,6 +17,7 @@
+                 id: "msg-1".to_string(),
+                 text: "partial answer".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-1".to_string(),
+diff --git a/exec/src/lib_tests.rs b/exec/src/lib_tests.rs
+--- a/exec/src/lib_tests.rs
++++ b/exec/src/lib_tests.rs
+@@ -363,6 +363,7 @@
+                     id: "msg-1".to_string(),
+                     text: "hello".to_string(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 }],
+                 status: codex_app_server_protocol::TurnStatus::Completed,
+@@ -393,6 +394,7 @@
+             id: "msg-1".to_string(),
+             text: "hello".to_string(),
+             phase: None,
++            publication: None,
+             memory_citation: None,
+         }])
+     );
+diff --git a/exec/tests/event_processor_with_json_output.rs b/exec/tests/event_processor_with_json_output.rs
+--- a/exec/tests/event_processor_with_json_output.rs
++++ b/exec/tests/event_processor_with_json_output.rs
+@@ -300,6 +300,7 @@
+                 id: "message-1".to_string(),
+                 text: "hello".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-1".to_string(),
+@@ -917,6 +918,7 @@
+                 id: "msg-1".to_string(),
+                 text: "hello".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-1".to_string(),
+@@ -952,6 +954,7 @@
+                 id: "msg-1".to_string(),
+                 text: "hello".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-1".to_string(),
+@@ -1299,6 +1302,7 @@
+                     id: "msg-1".to_string(),
+                     text: "final answer".to_string(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 }],
+                 status: TurnStatus::Completed,
+@@ -1422,6 +1426,7 @@
+                 id: "msg-stale".to_string(),
+                 text: "stale answer".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-1".to_string(),
+@@ -1440,6 +1445,7 @@
+                     id: "msg-1".to_string(),
+                     text: "final answer".to_string(),
+                     phase: None,
++                    publication: None,
+                     memory_citation: None,
+                 }],
+                 status: TurnStatus::Completed,
+@@ -1472,6 +1478,7 @@
+                 id: "msg-streamed".to_string(),
+                 text: "streamed answer".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-1".to_string(),
+@@ -1518,6 +1525,7 @@
+                 id: "msg-1".to_string(),
+                 text: "partial answer".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-1".to_string(),
+diff --git a/external-agent-sessions/src/export.rs b/external-agent-sessions/src/export.rs
+--- a/external-agent-sessions/src/export.rs
++++ b/external-agent-sessions/src/export.rs
+@@ -117,6 +117,7 @@
+                     AgentMessageEvent {
+                         message: message.text.clone(),
+                         phase: None,
++                        publication: None,
+                         memory_citation: None,
+                     },
+                 )));
+@@ -138,6 +139,7 @@
+     RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+         message: EXTERNAL_SESSION_IMPORTED_MARKER.to_string(),
+         phase: None,
++        publication: None,
+         memory_citation: None,
+     }))
+ }
+@@ -227,6 +229,7 @@
+                 id: "item-4".into(),
+                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             }
+         );
+@@ -259,6 +262,7 @@
+                 id: "item-3".into(),
+                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             })
+         );
+diff --git a/protocol/src/items.rs b/protocol/src/items.rs
+--- a/protocol/src/items.rs
++++ b/protocol/src/items.rs
+@@ -112,6 +112,44 @@
+     Text { text: String },
+ }
+ 
++/// Durable source of a published Yijie message, shared by live and rebuilt views.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
++#[serde(rename_all = "snake_case")]
++pub enum PublicPhaseSource {
++    Provider,
++    Declaration,
++    SubsequentWork,
++    TurnCommit,
++    ProgressStep,
++    FinalStep,
++    Interrupted,
++    Failed,
++    Superseded,
++    DisplayLimit,
++}
++
++impl PublicPhaseSource {
++    pub fn is_undelivered(self) -> bool {
++        matches!(
++            self,
++            Self::Interrupted | Self::Failed | Self::Superseded | Self::DisplayLimit
++        )
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++pub struct PublicMessagePublication {
++    pub item_id: String,
++    pub order: u32,
++    pub source: PublicPhaseSource,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub after_item_id: Option<String>,
++    #[serde(default)]
++    pub truncated: bool,
++}
++
+ #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
+ /// Assistant-authored message payload used in turn-item streams.
+ ///
+@@ -119,6 +157,9 @@
+ /// should use it when present, but retain legacy completion semantics when it
+ /// is `None`.
+ pub struct AgentMessageItem {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub publication: Option<PublicMessagePublication>,
+     pub id: String,
+     pub content: Vec<AgentMessageContent>,
+     /// Optional phase metadata carried through from `ResponseItem::Message`.
+@@ -613,6 +654,7 @@
+ impl AgentMessageItem {
+     pub fn new(content: &[AgentMessageContent]) -> Self {
+         Self {
++            publication: None,
+             id: new_item_id(),
+             content: content.to_vec(),
+             phase: None,
+diff --git a/protocol/src/legacy_events.rs b/protocol/src/legacy_events.rs
+--- a/protocol/src/legacy_events.rs
++++ b/protocol/src/legacy_events.rs
+@@ -102,6 +102,7 @@
+                 AgentMessageContent::Text { text } => EventMsg::AgentMessage(AgentMessageEvent {
+                     message: text.clone(),
+                     phase: self.phase.clone(),
++                    publication: self.publication.clone(),
+                     memory_citation: self.memory_citation.clone(),
+                 }),
+             })
+diff --git a/protocol/src/protocol.rs b/protocol/src/protocol.rs
+--- a/protocol/src/protocol.rs
++++ b/protocol/src/protocol.rs
+@@ -2266,6 +2266,9 @@
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+ pub struct AgentMessageEvent {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub publication: Option<crate::items::PublicMessagePublication>,
+     pub message: String,
+     #[serde(default)]
+     pub phase: Option<MessagePhase>,
+diff --git a/rollout/src/recorder_tests.rs b/rollout/src/recorder_tests.rs
+--- a/rollout/src/recorder_tests.rs
++++ b/rollout/src/recorder_tests.rs
+@@ -446,6 +446,7 @@
+             AgentMessageEvent {
+                 message: "buffered-event".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+         ))])
+@@ -533,6 +534,7 @@
+             AgentMessageEvent {
+                 message: "buffered-before-persist".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+         ))])
+@@ -579,6 +581,7 @@
+         AgentMessageEvent {
+             message: "queued-after-writer-error".to_string(),
+             phase: None,
++            publication: None,
+             memory_citation: None,
+         },
+     ))]);
+diff --git a/thread-store/src/local/mod.rs b/thread-store/src/local/mod.rs
+--- a/thread-store/src/local/mod.rs
++++ b/thread-store/src/local/mod.rs
+@@ -522,6 +522,7 @@
+                 RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                     message: "commentary".to_string(),
+                     phase: Some(MessagePhase::Commentary),
++                    publication: None,
+                     memory_citation: None,
+                 })),
+                 RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+diff --git a/tui/src/app/agent_status_feed.rs b/tui/src/app/agent_status_feed.rs
+--- a/tui/src/app/agent_status_feed.rs
++++ b/tui/src/app/agent_status_feed.rs
+@@ -190,6 +190,7 @@
+         ThreadItem::ExitedReviewMode { .. } => return Some("Exited review mode".to_string()),
+         ThreadItem::ContextCompaction { .. } => return Some("Compacted context".to_string()),
+         ThreadItem::UserMessage { .. }
++        | ThreadItem::UnpublishedText { .. }
+         | ThreadItem::HookPrompt { .. }
+         | ThreadItem::Sleep { .. } => return None,
+     };
+diff --git a/tui/src/app/agent_status_feed_tests.rs b/tui/src/app/agent_status_feed_tests.rs
+--- a/tui/src/app/agent_status_feed_tests.rs
++++ b/tui/src/app/agent_status_feed_tests.rs
+@@ -34,6 +34,7 @@
+                 id: "message-1".to_string(),
+                 text: "Finished checking the focused TUI tests.".to_string(),
+                 phase: None,
++                publication: None,
+                 memory_citation: None,
+             },
+             thread_id: "thread-child".to_string(),
+diff --git a/tui/src/app/tests.rs b/tui/src/app/tests.rs
+--- a/tui/src/app/tests.rs
++++ b/tui/src/app/tests.rs
+@@ -5333,6 +5333,7 @@
+                             id: "assistant-2".to_string(),
+                             text: "done".to_string(),
+                             phase: None,
++                            publication: None,
+                             memory_citation: None,
+                         },
+                     ],
+diff --git a/tui/src/app_server_session.rs b/tui/src/app_server_session.rs
+--- a/tui/src/app_server_session.rs
++++ b/tui/src/app_server_session.rs
+@@ -2501,6 +2501,7 @@
+                             id: "assistant-1".to_string(),
+                             text: "assistant reply".to_string(),
+                             phase: None,
++                            publication: None,
+                             memory_citation: None,
+                         },
+                     ],
+diff --git a/tui/src/chatwidget/replay.rs b/tui/src/chatwidget/replay.rs
+--- a/tui/src/chatwidget/replay.rs
++++ b/tui/src/chatwidget/replay.rs
+@@ -80,6 +80,7 @@
+                 id,
+                 text,
+                 phase,
++                publication,
+                 memory_citation,
+             } => {
+                 self.on_agent_message_item_completed(
+@@ -87,6 +88,7 @@
+                         id,
+                         content: vec![AgentMessageContent::Text { text }],
+                         phase,
++                        publication,
+                         memory_citation: memory_citation.map(|citation| {
+                             codex_protocol::memory_citation::MemoryCitation {
+                                 entries: citation
+@@ -170,7 +172,7 @@
+             ThreadItem::ContextCompaction { .. } => {
+                 self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+             }
+-            ThreadItem::HookPrompt { .. } => {}
++            ThreadItem::HookPrompt { .. } | ThreadItem::UnpublishedText { .. } => {}
+             ThreadItem::CollabAgentToolCall {
+                 id,
+                 tool,
+diff --git a/tui/src/chatwidget/tests/app_server.rs b/tui/src/chatwidget/tests/app_server.rs
+--- a/tui/src/chatwidget/tests/app_server.rs
++++ b/tui/src/chatwidget/tests/app_server.rs
+@@ -545,6 +545,7 @@
+                 id: "msg-1".to_string(),
+                 text: "Yes. What do you need?".to_string(),
+                 phase: Some(MessagePhase::FinalAnswer),
++                publication: None,
+                 memory_citation: None,
+             },
+         }),
+diff --git a/tui/src/chatwidget/tests/helpers.rs b/tui/src/chatwidget/tests/helpers.rs
+--- a/tui/src/chatwidget/tests/helpers.rs
++++ b/tui/src/chatwidget/tests/helpers.rs
+@@ -763,6 +763,7 @@
+             id: item_id.to_string(),
+             text: text.into(),
+             phase: Some(MessagePhase::FinalAnswer),
++            publication: None,
+             memory_citation: None,
+         },
+         "turn-1".to_string(),
+@@ -911,6 +912,7 @@
+                 id: item_id.to_string(),
+                 text: text.to_string(),
+                 phase,
++                publication: None,
+                 memory_citation: None,
+             },
+         }),
+diff --git a/tui/src/chatwidget/tests/plan_mode.rs b/tui/src/chatwidget/tests/plan_mode.rs
+--- a/tui/src/chatwidget/tests/plan_mode.rs
++++ b/tui/src/chatwidget/tests/plan_mode.rs
+@@ -860,6 +860,7 @@
+                 id: "msg-plan".to_string(),
+                 text: "Plan details".to_string(),
+                 phase: Some(MessagePhase::FinalAnswer),
++                publication: None,
+                 memory_citation: None,
+             }],
+             status: AppServerTurnStatus::Completed,
+@@ -898,6 +899,7 @@
+                 id: "msg-plan-replay".to_string(),
+                 text: "Plan details".to_string(),
+                 phase: Some(MessagePhase::FinalAnswer),
++                publication: None,
+                 memory_citation: None,
+             }],
+             status: AppServerTurnStatus::Completed,
+diff --git a/tui/src/resume_picker.rs b/tui/src/resume_picker.rs
+--- a/tui/src/resume_picker.rs
++++ b/tui/src/resume_picker.rs
+@@ -5796,6 +5796,7 @@
+                         id: String::from("agent-1"),
+                         text: String::from("hello from assistant"),
+                         phase: None,
++                        publication: None,
+                         memory_citation: None,
+                     },
+                     ThreadItem::Plan {
+diff --git a/tui/src/thread_transcript.rs b/tui/src/thread_transcript.rs
+--- a/tui/src/thread_transcript.rs
++++ b/tui/src/thread_transcript.rs
+@@ -228,6 +228,7 @@
+             vec!["context compacted".dim().into()]
+         }
+         ThreadItem::UserMessage { .. }
++        | ThreadItem::UnpublishedText { .. }
+         | ThreadItem::AgentMessage { .. }
+         | ThreadItem::Plan { .. }
+         | ThreadItem::Reasoning { .. }

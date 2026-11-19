@@ -189,3 +189,7 @@ FEAT-168 adds an independently opt-in local Host image candidate on the native-p
 ## FEAT-170 原生 tool_search（2026-11-08）
 
 0023 在0022之后新增受管Kimi function传输与既有CodeMode调用适配，检索/缓存/目录/执行仍复用原生。补齐线程搜索字段、完整定义历史和外部上下文保护；默认native路径及固定上游不变。独立候选fac52ad79cc7e0a379fc597a7ecfcee573205d38a60c9d0ed3a2e96871ab0f45，stable schema树不变；见[实现与验证边界](docs/tool-search.md)。未提交/发布，不覆盖原制品。
+
+### FEAT-167 普通会话公开消息
+
+chat-models/0028-public-message-publication.patch 叠加在 0027 之后。它修改配对 Runtime 的公开投影和 app-server 可选元数据，保留上游响应及模型上下文。新客户端协商 publication 2。Contracts 固定内容寻址产物和 canonical app-server schema 树。重建使用 scripts/build-native-skill-marketplace.sh。

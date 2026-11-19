@@ -139,3 +139,7 @@ The native image executor can request one Host-managed generation on the existin
 ## FEAT-170 原生 tool_search（2026-11-08）
 
 0023 在0022之后新增受管Kimi function传输与既有CodeMode调用适配，检索/缓存/目录/执行仍复用原生。补齐线程搜索字段、完整定义历史和外部上下文保护；默认native路径及固定上游不变。独立候选fac52ad79cc7e0a379fc597a7ecfcee573205d38a60c9d0ed3a2e96871ab0f45，stable schema树不变；见[实现与验证边界](docs/tool-search.md)。未提交/发布，不覆盖原制品。
+
+## 2026-11-20 普通会话的公开消息阶段
+
+FEAT-167 新增可重放补丁 0028。配对的 Host 为 MiniMax-M3 和 Kimi K3.1 Pro 普通／专家根会话启用公开消息发布。原生阶段、完整条目的有效声明、同一采样步骤的后续工具调用，以及整轮最终采用的条目 ID 构成判定依据。待判定正文保存在发布缓冲区，真实工具、采样和中断仍走原执行路径。首次公开的消息带阶段、原生 ID、顺序和来源；冷读重用该身份。中断、失败和被替代的待定文字使用有界的 unpublishedText 条目。canonical 构建入口为 scripts/build-native-skill-marketplace.sh。
