@@ -193,3 +193,7 @@ FEAT-168 adds an independently opt-in local Host image candidate on the native-p
 ### FEAT-167 普通会话公开消息
 
 chat-models/0028-public-message-publication.patch 叠加在 0027 之后。它修改配对 Runtime 的公开投影和 app-server 可选元数据，保留上游响应及模型上下文。新客户端协商 publication 2。Contracts 固定内容寻址产物和 canonical app-server schema 树。重建使用 scripts/build-native-skill-marketplace.sh。
+
+## 2026-11-21 同线程模型切换
+
+本地候选在 0028 之后重放 `0029-resume-after-terminal-error.patch`。上游版本与 app-server wire 保持原有定义。此项 `contract-impact = semantic`，修复 `thread/resume` 在已解除订阅的失败终态上应用配置的行为。Host 继续核对同一线程、模型、供应商及推理档位的原生回执。回退可重新选用上一个内容寻址的本地候选及其配对来源记录。

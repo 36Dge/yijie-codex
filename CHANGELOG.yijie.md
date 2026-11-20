@@ -143,3 +143,7 @@ The native image executor can request one Host-managed generation on the existin
 ## 2026-11-20 普通会话的公开消息阶段
 
 FEAT-167 新增可重放补丁 0028。配对的 Host 为 MiniMax-M3 和 Kimi K3.1 Pro 普通／专家根会话启用公开消息发布。原生阶段、完整条目的有效声明、同一采样步骤的后续工具调用，以及整轮最终采用的条目 ID 构成判定依据。待判定正文保存在发布缓冲区，真实工具、采样和中断仍走原执行路径。首次公开的消息带阶段、原生 ID、顺序和来源；冷读重用该身份。中断、失败和被替代的待定文字使用有界的 unpublishedText 条目。canonical 构建入口为 scripts/build-native-skill-marketplace.sh。
+
+## 2026-11-21 失败轮次后切换模型
+
+补丁 0029 修正已结束但状态为 `systemError` 的线程重新加载配置时返回旧模型的问题。无订阅者、无运行中的轮次、待审批、待输入和后台终端时，复用已有的正常关闭及同线程恢复逻辑。已保存的失败轮次保留。

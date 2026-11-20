@@ -1,0 +1,20 @@
+diff --git a/app-server/src/request_processors/thread_processor.rs b/app-server/src/request_processors/thread_processor.rs
+--- a/app-server/src/request_processors/thread_processor.rs
++++ b/app-server/src/request_processors/thread_processor.rs
+@@ -3093,8 +3093,14 @@
+                 let is_running =
+                     matches!(existing_thread.agent_status().await, AgentStatus::Running);
+ 
+-                if !has_subscribers && matches!(loaded_status, ThreadStatus::Idle) && !is_running {
+-                    // A loaded idle thread is only a cache entry. Shut it down
++                // SystemError also identifies a settled turn. The status tracker
++                // gives running work and pending approvals/input precedence.
++                let can_reconfigure = matches!(loaded_status, ThreadStatus::Idle)
++                    || (matches!(loaded_status, ThreadStatus::SystemError)
++                        && existing_thread.list_background_terminals().await.is_empty());
++
++                if !has_subscribers && can_reconfigure && !is_running {
++                    // A detached, settled thread is only a cache entry. Shut it down
+                     // before removing it so cold resume cannot duplicate a
+                     // thread that timed out during shutdown.
+                     match wait_for_thread_shutdown(&existing_thread).await {
