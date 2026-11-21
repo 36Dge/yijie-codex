@@ -1,0 +1,352 @@
+diff --git a/core/src/session/public_messages.rs b/core/src/session/public_messages.rs
+--- a/core/src/session/public_messages.rs
++++ b/core/src/session/public_messages.rs
+@@ -156,7 +156,8 @@
+ pub(crate) struct StreamAdapter {
+     enabled: bool,
+     pending: Option<PendingMessage>,
+-    ready: VecDeque<ResponseEvent>,
++    ready: VecDeque<(ResponseEvent, bool)>,
++    preview_declared: bool,
+     last_declared_commentary: bool,
+     pub(crate) defer_declared_start: bool,
+     body_parser: Option<StandaloneMarkerParser>,
+@@ -168,13 +169,14 @@
+             enabled,
+             pending: None,
+             ready: VecDeque::new(),
++            preview_declared: false,
+             last_declared_commentary: false,
+             defer_declared_start: false,
+             body_parser: None,
+         }
+     }
+ 
+-    pub(crate) fn pop(&mut self) -> Option<ResponseEvent> {
++    pub(crate) fn pop(&mut self) -> Option<(ResponseEvent, bool)> {
+         self.ready.pop_front()
+     }
+ 
+@@ -191,6 +193,7 @@
+             PrefixResult::Plain(text) => (None, text.to_owned(), false),
+             PrefixResult::Envelope { phase, body } => (phase, body.to_owned(), true),
+         };
++        self.preview_declared = phase.is_some();
+         self.body_parser = framed.then(|| StandaloneMarkerParser::new(&DECLARATIONS));
+         let Some(pending) = self.pending.take() else {
+             return;
+@@ -198,7 +201,7 @@
+         // Start once the header is known. All visible text continues through the
+         // pre-existing assistant text parser and native delta notification.
+         self.ready
+-            .push_back(ResponseEvent::OutputItemAdded(with_public_text(
++            .push_back((ResponseEvent::OutputItemAdded(with_public_text(
+                 &pending.added,
+                 if self.defer_declared_start {
+                     None
+@@ -206,32 +209,39 @@
+                     phase
+                 },
+                 "",
+-            )));
++            )), false));
+         self.push_body(body);
+     }
+ 
+     fn push_body(&mut self, text: String) {
+-        let text = self.body_parser.as_mut().map_or_else(
+-            || text.clone(),
+-            |parser| parser.push_str(&text).visible_text,
+-        );
++        let text = if let Some(parser) = &mut self.body_parser {
++            let parsed = parser.push_str(&text);
++            if !parsed.extracted.is_empty() {
++                self.preview_declared = false;
++            }
++            parsed.visible_text
++        } else {
++            text
++        };
+         if !text.is_empty() {
+-            self.ready.push_back(ResponseEvent::OutputTextDelta(text));
++            self.ready.push_back((ResponseEvent::OutputTextDelta(text), self.preview_declared));
+         }
+     }
+ 
+     fn finish_body(&mut self) {
+         if let Some(mut parser) = self.body_parser.take() {
+-            let tail = parser.finish().visible_text;
+-            if !tail.is_empty() {
+-                self.ready.push_back(ResponseEvent::OutputTextDelta(tail));
+-            }
+-        }
++            let tail = parser.finish();
++            if !tail.visible_text.is_empty() {
++                self.ready.push_back((ResponseEvent::OutputTextDelta(tail.visible_text),
++                    self.preview_declared && tail.extracted.is_empty()));
++            }
++        }
++        self.preview_declared = false;
+     }
+ 
+     pub(crate) fn push(&mut self, event: ResponseEvent) {
+         if !self.enabled {
+-            self.ready.push_back(event);
++            self.ready.push_back((event, false));
+             return;
+         }
+         match event {
+@@ -245,7 +255,7 @@
+                     });
+                     self.flush_prefix(false);
+                 } else {
+-                    self.ready.push_back(ResponseEvent::OutputItemAdded(item));
++                    self.ready.push_back((ResponseEvent::OutputItemAdded(item), false));
+                 }
+             }
+             ResponseEvent::OutputTextDelta(delta) => {
+@@ -277,14 +287,14 @@
+                 self.finish_body();
+                 // IMPORTANT: done stays raw for native history and next input.
+                 // Only handle_output_item_done's public projection is normalized.
+-                self.ready.push_back(ResponseEvent::OutputItemDone(item));
++                self.ready.push_back((ResponseEvent::OutputItemDone(item), false));
+             }
+             event @ ResponseEvent::Completed { .. } => {
+                 self.flush_prefix(true);
+                 self.finish_body();
+-                self.ready.push_back(event);
+-            }
+-            other => self.ready.push_back(other),
++                self.ready.push_back((event, false));
++            }
++            other => self.ready.push_back((other, false)),
+         }
+     }
+ }
+@@ -307,7 +317,7 @@
+         let mut starts = Vec::new();
+         let mut deltas = String::new();
+         let mut ends = Vec::new();
+-        while let Some(event) = adapter.pop() {
++        while let Some((event, _)) = adapter.pop() {
+             match event {
+                 ResponseEvent::OutputItemAdded(item) => starts.push(item),
+                 ResponseEvent::OutputTextDelta(delta) => deltas.push_str(&delta),
+@@ -316,6 +326,20 @@
+             }
+         }
+         (starts, deltas, ends)
++    }
++
++    #[test]
++    fn declared_preview_requires_a_complete_header_and_stops_after_conflict() {
++        let mut adapter = StreamAdapter::new(true);
++        adapter.defer_declared_start = true;
++        adapter.push(ResponseEvent::OutputItemAdded(message("", None)));
++        adapter.push(ResponseEvent::OutputTextDelta(HYPHEN_FINAL[..12].into()));
++        assert!(adapter.pop().is_none());
++        adapter.push(ResponseEvent::OutputTextDelta(format!("{}\n第一段。", &HYPHEN_FINAL[12..])));
++        assert!(matches!(adapter.pop(), Some((ResponseEvent::OutputItemAdded(_), false))));
++        assert!(matches!(adapter.pop(), Some((ResponseEvent::OutputTextDelta(body), true)) if body == "第一段。"));
++        adapter.push(ResponseEvent::OutputTextDelta(format!("\n{COMMENTARY}\n后续文字")));
++        assert!(matches!(adapter.pop(), Some((ResponseEvent::OutputTextDelta(body), false)) if body.contains("后续文字")));
+     }
+ 
+     #[test]
+@@ -455,7 +479,7 @@
+         let mut disabled = StreamAdapter::new(false);
+         disabled.push(ResponseEvent::OutputTextDelta(COMMENTARY.into()));
+         assert!(
+-            matches!(disabled.pop(), Some(ResponseEvent::OutputTextDelta(text)) if text == COMMENTARY)
++            matches!(disabled.pop(), Some((ResponseEvent::OutputTextDelta(text), false)) if text == COMMENTARY)
+         );
+     }
+ 
+diff --git a/protocol/src/protocol.rs b/protocol/src/protocol.rs
+--- a/protocol/src/protocol.rs
++++ b/protocol/src/protocol.rs
+@@ -1824,6 +1824,9 @@
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
+ pub struct AgentMessageContentDeltaEvent {
++    /// Present only for an explicitly negotiated transient public-text preview.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub preview_offset: Option<u32>,
+     pub thread_id: String,
+     pub turn_id: String,
+     pub item_id: String,
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -1748,6 +1748,7 @@
+                 maybe_emit_pending_agent_message_start(sess, turn_context, state, item_id).await;
+ 
+                 let event = AgentMessageContentDeltaEvent {
++                    preview_offset: None,
+                     thread_id: sess.thread_id.to_string(),
+                     turn_id: turn_context.sub_id.clone(),
+                     item_id: item_id.to_string(),
+@@ -1802,6 +1803,7 @@
+         return;
+     }
+     let event = AgentMessageContentDeltaEvent {
++        preview_offset: None,
+         thread_id: sess.thread_id.to_string(),
+         turn_id: turn_context.sub_id.clone(),
+         item_id: item_id.to_string(),
+@@ -2105,6 +2107,7 @@
+     let mut public_message_stream =
+         super::public_messages::StreamAdapter::new(super::public_messages::enabled(&turn_context));
+     public_message_stream.defer_declared_start = strict;
++    let preview_enabled = strict && super::publication::preview_enabled(&turn_context);
+     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+     let defer_streamed_turn_items_for_contributors =
+         !sess.services.extensions.turn_item_contributors().is_empty();
+@@ -2128,7 +2131,7 @@
+         if cancellation_token.is_cancelled() {
+             break Err(CodexErr::TurnAborted);
+         }
+-        let event = if let Some(event) = public_message_stream.pop() {
++        let (event, declared_text) = if let Some(event) = public_message_stream.pop() {
+             event
+         } else {
+             let event = match stream
+@@ -2478,6 +2481,9 @@
+                     let item_id = active.id();
+                     if matches!(active, TurnItem::AgentMessage(_)) {
+                         let parsed = assistant_message_stream_parsers.parse_delta(&item_id, &delta);
++                        if preview_enabled && declared_text {
++                            super::publication::send_preview(&sess, &turn_context, &item_id, &parsed.visible_text).await;
++                        }
+                         emit_streamed_assistant_text_delta(
+                             &sess,
+                             &turn_context,
+@@ -2488,6 +2494,7 @@
+                         .await;
+                     } else {
+                         let event = AgentMessageContentDeltaEvent {
++                            preview_offset: None,
+                             thread_id: sess.thread_id.to_string(),
+                             turn_id: turn_context.sub_id.clone(),
+                             item_id,
+diff --git a/core/src/session/publication.rs b/core/src/session/publication.rs
+--- a/core/src/session/publication.rs
++++ b/core/src/session/publication.rs
+@@ -130,6 +130,7 @@
+                 let part = take_prefix(rest, CHUNK_BYTES);
+                 events.push(EventMsg::AgentMessageContentDelta(
+                     AgentMessageContentDeltaEvent {
++                        preview_offset: None,
+                         thread_id: sess.thread_id.to_string(),
+                         turn_id: turn.sub_id.clone(),
+                         item_id: m.item.id.clone(),
+@@ -450,3 +451,28 @@
+         state(turn).lock().await.selected = id;
+     }
+ }
++
++/// The client must opt into both immutable publication and live previews.
++pub(crate) fn preview_enabled(turn: &TurnContext) -> bool {
++    turn.developer_instructions.as_deref().is_some_and(|text|
++        text.lines().any(|line| line == "[yijie-public-preview-v1]"))
++}
++
++/// Preview only the same bounded, parsed body that the publication gate is
++/// holding. A provider phase or an assigned step is already streaming normally.
++pub(crate) async fn send_preview(sess: &Session, turn: &TurnContext, id: &str, delta: &str) {
++    if delta.is_empty() { return; }
++    let cell = state(turn);
++    let state = cell.lock().await;
++    let Some(candidate) = state.pending.iter().find(|candidate|
++        candidate.item.id == id && candidate.published.is_none()) else { return; };
++    let offset = candidate.preview.len();
++    let visible = take_prefix(delta, MAX_ITEM_BYTES.saturating_sub(offset)
++        .min(MAX_PENDING_BYTES.saturating_sub(state.bytes())));
++    if !visible.is_empty() {
++        sess.send_event_direct(turn, EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
++            thread_id: sess.thread_id.to_string(), turn_id: turn.sub_id.clone(),
++            item_id: id.to_owned(), delta: visible.to_owned(), preview_offset: Some(offset as u32),
++        })).await;
++    }
++}
+diff --git a/app-server-protocol/src/protocol/v2/item.rs b/app-server-protocol/src/protocol/v2/item.rs
+--- a/app-server-protocol/src/protocol/v2/item.rs
++++ b/app-server-protocol/src/protocol/v2/item.rs
+@@ -1375,6 +1375,19 @@
+     pub thread_id: String,
+     pub turn_id: String,
+     pub item_id: String,
++    pub delta: String,
++}
++
++/// Transient, consecutive UTF-8 body bytes for a declared public message.
++/// The formal item lifecycle and history are authoritative.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct AgentMessagePreviewDeltaNotification {
++    pub thread_id: String,
++    pub turn_id: String,
++    pub item_id: String,
++    pub offset: u32,
+     pub delta: String,
+ }
+ 
+diff --git a/app-server-protocol/src/protocol/common.rs b/app-server-protocol/src/protocol/common.rs
+--- a/app-server-protocol/src/protocol/common.rs
++++ b/app-server-protocol/src/protocol/common.rs
+@@ -1657,6 +1657,7 @@
+     ItemCompleted => "item/completed" (v2::ItemCompletedNotification),
+     /// This event is internal-only. Used by Codex Cloud.
+     RawResponseItemCompleted => "rawResponseItem/completed" (v2::RawResponseItemCompletedNotification),
++    AgentMessagePreviewDelta => "item/agentMessage/previewDelta" (v2::AgentMessagePreviewDeltaNotification),
+     AgentMessageDelta => "item/agentMessage/delta" (v2::AgentMessageDeltaNotification),
+     /// EXPERIMENTAL - proposed plan streaming deltas for plan items.
+     PlanDelta => "item/plan/delta" (v2::PlanDeltaNotification),
+diff --git a/app-server-protocol/src/protocol/event_mapping.rs b/app-server-protocol/src/protocol/event_mapping.rs
+--- a/app-server-protocol/src/protocol/event_mapping.rs
++++ b/app-server-protocol/src/protocol/event_mapping.rs
+@@ -3,6 +3,7 @@
+ use crate::protocol::item_builders::build_command_execution_end_item;
+ use crate::protocol::item_builders::convert_patch_changes;
+ use crate::protocol::v2::AgentMessageDeltaNotification;
++use crate::protocol::v2::AgentMessagePreviewDeltaNotification;
+ use crate::protocol::v2::CollabAgentState;
+ use crate::protocol::v2::CollabAgentTool;
+ use crate::protocol::v2::CollabAgentToolCallStatus;
+@@ -354,6 +355,12 @@
+                 turn_id,
+                 item,
+                 completed_at_ms: end_event.completed_at_ms,
++            })
++        }
++        EventMsg::AgentMessageContentDelta(event) if event.preview_offset.is_some() => {
++            ServerNotification::AgentMessagePreviewDelta(AgentMessagePreviewDeltaNotification {
++                thread_id, turn_id, item_id: event.item_id, delta: event.delta,
++                offset: event.preview_offset.expect("matched preview offset"),
+             })
+         }
+         EventMsg::AgentMessageContentDelta(event) => {
+diff --git a/tui/src/app/app_server_event_targets.rs b/tui/src/app/app_server_event_targets.rs
+--- a/tui/src/app/app_server_event_targets.rs
++++ b/tui/src/app/app_server_event_targets.rs
+@@ -90,6 +90,7 @@
+         ServerNotification::RawResponseItemCompleted(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::AgentMessagePreviewDelta(notification) => Some(notification.thread_id.as_str()),
+         ServerNotification::AgentMessageDelta(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+diff --git a/tui/src/chatwidget/protocol.rs b/tui/src/chatwidget/protocol.rs
+--- a/tui/src/chatwidget/protocol.rs
++++ b/tui/src/chatwidget/protocol.rs
+@@ -73,6 +73,7 @@
+             ServerNotification::ItemCompleted(notification) => {
+                 self.handle_item_completed_notification(notification, replay_kind);
+             }
++            ServerNotification::AgentMessagePreviewDelta(_) => {},
+             ServerNotification::AgentMessageDelta(notification) => {
+                 self.on_agent_message_delta(notification.delta);
+             }

@@ -197,3 +197,8 @@ chat-models/0028-public-message-publication.patch 叠加在 0027 之后。它修
 ## 2026-11-21 同线程模型切换
 
 本地候选在 0028 之后重放 `0029-resume-after-terminal-error.patch`。上游版本与 app-server wire 保持原有定义。此项 `contract-impact = semantic`，修复 `thread/resume` 在已解除订阅的失败终态上应用配置的行为。Host 继续核对同一线程、模型、供应商及推理档位的原生回执。回退可重新选用上一个内容寻址的本地候选及其配对来源记录。
+
+The local chat-model candidate adds 0030 for negotiated transient public-text
+previews. It reuses the existing streamed declaration and assistant text parsers
+for ordinary MiniMax-M3 and Kimi turns. Formal publication and saved history
+remain controlled by 0028. Rebuild through scripts/build-native-skill-marketplace.sh.

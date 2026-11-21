@@ -9,6 +9,11 @@ PluginStore, configuration, Skill loading and refresh machinery. See
 
 ## Unreleased
 
+- Ordinary MiniMax and Kimi turns may negotiate live declared public-text previews
+  with the paired desktop. Preview deltas have stable item identity and UTF-8 byte
+  offsets. The final public phase, history and turn completion continue through
+  the existing publication rules.
+
 - FEAT-171: add the optional native `cooperative_only` process lifecycle policy
   and a separate content-addressed build. Retain live command ownership and
   output through normal stop; no force-kill fallback in this profile. Reuse
