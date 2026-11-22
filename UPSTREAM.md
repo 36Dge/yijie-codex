@@ -1,5 +1,12 @@
 # Upstream
 
+2026-11-22 FEAT-157 appends `0032-native-market-approval.patch` after the
+0031 market turn admission overlay on `rust-v0.144.6`. The canonical
+`scripts/build-native-skill-marketplace.sh` build produces 276 stable
+app-server schemas. The approval adapter uses the existing MCP elicitation
+wire, Guardian and native tool approval configuration. The scoped owner
+callback requires Market Broker Control 0.10.0 and a paired Host and Desktop.
+
 2026-11-13 FEAT-174 appends the authorized 0025 native local Skill marketplace
 policy/state/refresh overlay after 0024. The fixed upstream and canonical source
 remain unchanged. Local-only source admission and explicit refresh reuse native

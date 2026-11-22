@@ -9,6 +9,12 @@ PluginStore, configuration, Skill loading and refresh machinery. See
 
 ## Unreleased
 
+- FEAT-157 connects registered market calls to native MCP approval, Guardian,
+  and confirmed full access. Session grants use the existing approval store
+  across same-thread reconfiguration. Durable tool grants use native
+  configuration, including cold reload and revocation. Each call still
+  requires an acknowledgement from its owner before execution.
+
 - Ordinary MiniMax and Kimi turns may negotiate live declared public-text previews
   with the paired desktop. Preview deltas have stable item identity and UTF-8 byte
   offsets. The final public phase, history and turn completion continue through

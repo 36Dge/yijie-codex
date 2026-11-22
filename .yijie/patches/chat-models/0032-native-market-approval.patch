@@ -1,0 +1,404 @@
+diff --git a/app-server/src/request_processors/thread_processor.rs b/app-server/src/request_processors/thread_processor.rs
+--- a/app-server/src/request_processors/thread_processor.rs
++++ b/app-server/src/request_processors/thread_processor.rs
+@@ -404,6 +404,8 @@
+     /// The optional stored thread contains the history-bearing probe that cold
+     /// resume can reuse instead of reading the rollout again.
+     NotRunning(Option<Box<StoredThread>>),
++    /// A matching, settled thread was normally shut down for reconfiguration.
++    Reconfigured(Arc<CodexThread>),
+ }
+ 
+ impl ThreadRequestProcessor {
+@@ -2788,7 +2790,7 @@
+                 return Ok(());
+             }
+         };
+-        let stored_thread_from_running_probe = match self
++        let (stored_thread_from_running_probe, reconfigured_thread) = match self
+             .resume_running_thread(
+                 &request_id,
+                 &params,
+@@ -2798,7 +2800,8 @@
+             .await
+         {
+             Ok(RunningThreadResumeResult::Handled) => return Ok(()),
+-            Ok(RunningThreadResumeResult::NotRunning(stored_thread)) => stored_thread,
++            Ok(RunningThreadResumeResult::NotRunning(stored_thread)) => (stored_thread, None),
++            Ok(RunningThreadResumeResult::Reconfigured(previous)) => (None, Some(previous)),
+             Err(error) => {
+                 self.outgoing.send_error(request_id, error).await;
+                 return Ok(());
+@@ -2914,6 +2917,9 @@
+                 session_configured,
+                 ..
+             }) => {
++                if let Some(previous) = reconfigured_thread {
++                    codex_thread.inherit_market_session_approvals(&previous).await;
++                }
+                 if let Err(err) = Self::set_app_server_client_info(
+                     codex_thread.as_ref(),
+                     app_server_client_name,
+@@ -3191,7 +3197,7 @@
+                             self.finalize_thread_teardown(existing_thread_id).await;
+                             // Shutdown can flush newer rollout items, so reload the
+                             // stored thread before starting the replacement session.
+-                            return Ok(RunningThreadResumeResult::NotRunning(None));
++                            return Ok(RunningThreadResumeResult::Reconfigured(existing_thread));
+                         }
+                         ThreadShutdownResult::SubmitFailed => {
+                             warn!("failed to submit Shutdown to thread {existing_thread_id}");
+diff --git a/codex-mcp/src/elicitation.rs b/codex-mcp/src/elicitation.rs
+--- a/codex-mcp/src/elicitation.rs
++++ b/codex-mcp/src/elicitation.rs
+@@ -193,6 +193,16 @@
+                     });
+                 }
+ 
++                // The product Gateway needs a separate owner acknowledgement even
++                // when native full access normally resolves an empty form here.
++                if server_name == "yijie_market" && elicitation.meta()
++                    .and_then(|m| m.get("yijieKind")).and_then(serde_json::Value::as_str)
++                    == Some("gateway_native_approval_v1") {
++                    let reviewer = reviewer.as_ref().context("market approval owner unavailable")?;
++                    return reviewer.review(ElicitationReviewRequest {
++                        server_name, request_id: id, elicitation,
++                    }).await?.context("market approval not handled");
++                }
+                 let approval_policy = approval_policy
+                     .lock()
+                     .map(|policy| *policy)
+diff --git a/core/src/codex_thread.rs b/core/src/codex_thread.rs
+--- a/core/src/codex_thread.rs
++++ b/core/src/codex_thread.rs
+@@ -198,6 +198,19 @@
+         }
+     }
+ 
++    /// An idle, unsubscribed thread may be re-created solely to change its per-turn
++    /// MCP configuration. Keep its scoped market decisions in the native store.
++    pub async fn inherit_market_session_approvals(&self, previous: &Self) {
++        if self.codex.session.thread_id() != previous.codex.session.thread_id()
++            || std::ptr::eq(self, previous)
++        {
++            return;
++        }
++        let previous = previous.codex.session.services.tool_approvals.lock().await;
++        self.codex.session.services.tool_approvals.lock().await
++            .inherit_session_approvals(&previous, crate::mcp_tool_call::is_market_approval_key);
++    }
++
+     pub async fn submit(&self, op: Op) -> CodexResult<String> {
+         self.codex.submit(op).await
+     }
+diff --git a/core/src/mcp_tool_call.rs b/core/src/mcp_tool_call.rs
+--- a/core/src/mcp_tool_call.rs
++++ b/core/src/mcp_tool_call.rs
+@@ -1217,7 +1217,7 @@
+         .is_some_and(|suffix| suffix.starts_with('_'))
+ }
+ 
+-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ struct McpToolApprovalKey {
+     server: String,
+     connector_id: Option<String>,
+@@ -2043,6 +2043,64 @@
+     remember_mcp_tool_approval(sess, key).await;
+ }
+ 
++pub(crate) fn is_market_approval_key(serialized: &str) -> bool {
++    let Ok(key) = serde_json::from_str::<McpToolApprovalKey>(serialized) else {
++        return false;
++    };
++    key.server == "yijie_market" && key.connector_id.as_deref()
++        .and_then(|id| id.strip_prefix("yijie-market-"))
++        .is_some_and(|scope| scope.len() == 64 && scope.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
++}
++
++fn market_approval_key(scope: &str, tool: &str) -> McpToolApprovalKey {
++    McpToolApprovalKey { server: "yijie_market".to_owned(),
++        connector_id: Some(format!("yijie-market-{scope}")), tool_name: tool.to_owned() }
++}
++
++pub(crate) fn market_persist_options(turn: &TurnContext, scope: Option<&str>, tool: &str) -> Vec<&'static str> {
++    let key = scope.map(|s| market_approval_key(s, tool));
++    let options = mcp_tool_approval_prompt_options(key.as_ref(), key.as_ref(),
++        turn.config.features.enabled(Feature::ToolCallMcpElicitation));
++    let mut result = Vec::new();
++    if options.allow_session_remember { result.push(MCP_TOOL_APPROVAL_PERSIST_SESSION); }
++    if options.allow_persistent_approval { result.push(MCP_TOOL_APPROVAL_PERSIST_ALWAYS); }
++    result
++}
++
++pub(crate) async fn market_remembered(sess: &Session, scope: &str, tool: &str) -> Option<&'static str> {
++    let key = market_approval_key(scope, tool);
++    // Config edits made in another thread (including withdrawal) apply here.
++    sess.reload_user_config_layer().await;
++    let config = sess.get_config().await;
++    let user = config.config_layer_stack.effective_user_config();
++    let setting = user.as_ref().and_then(|v| v.get("apps"))
++        .and_then(|v| v.get(key.connector_id.as_deref()?))
++        .and_then(|v| v.get("tools")).and_then(|v| v.get(tool))
++        .and_then(|v| v.get("approval_mode")).and_then(|v| v.as_str());
++    if setting == Some("approve") { return Some("native_always"); }
++    mcp_tool_approval_is_remembered(sess, &key).await.then_some("native_session")
++}
++
++pub(crate) async fn remember_market_choice(sess: &Session, turn: &TurnContext, scope: &str, tool: &str,
++    response: ElicitationResponse) -> &'static str {
++    let key = market_approval_key(scope, tool);
++    match parse_mcp_tool_approval_elicitation_response(Some(response), "") {
++        McpToolApprovalDecision::AcceptAndRemember => {
++            if let Some(app) = &key.connector_id && persist_codex_app_tool_approval(&turn.config, app, tool).await.is_ok()
++                && market_remembered(sess, scope, tool).await == Some("native_always") {
++                return "stored_always";
++            }
++            remember_mcp_tool_approval(sess, key).await;
++            "stored_session"
++        }
++        McpToolApprovalDecision::AcceptForSession => {
++            remember_mcp_tool_approval(sess, key).await;
++            "stored_session"
++        }
++        _ => "not_stored",
++    }
++}
++
+ async fn persist_codex_app_tool_approval(
+     config: &Config,
+     connector_id: &str,
+diff --git a/core/src/session/market_approval.rs b/core/src/session/market_approval.rs
+new file mode 100644
+--- /dev/null
++++ b/core/src/session/market_approval.rs
+@@ -0,0 +1,191 @@
++//! Bind the registered market call to Codex's existing MCP reviewer and storage.
++//! The Host reads the frozen review over its private Worker pipe. Every accept,
++//! including a memory hit, needs a second, call-specific owner acknowledgement.
++use super::*;
++use codex_mcp::{McpPermissionPromptAutoApproveContext, mcp_permission_prompt_is_auto_approved};
++use codex_protocol::approvals::ElicitationRequest;
++use serde::Deserialize;
++use serde_json::{Value as Json, json};
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++struct Review {
++    tool: String,
++    title: String,
++    arguments: Json,
++    scope: Option<String>,
++    remaining_ms: u64,
++}
++
++fn decline() -> ElicitationResponse {
++    ElicitationResponse {
++        action: ElicitationAction::Decline,
++        content: None,
++        meta: None,
++    }
++}
++
++async fn owner(
++    session: &Session,
++    turn: &TurnContext,
++    reference: &str,
++    phase: &str,
++    scope: Option<&str>,
++    persist: &[&str],
++) -> ElicitationResponse {
++    let mut meta = json!({"yijieKind":"gateway_native_approval_v1",
++        "yijieMarketCallRef":reference,"yijieNativePhase":phase});
++    if let Some(scope) = scope {
++        meta["yijieScope"] = json!(scope);
++    }
++    if !persist.is_empty() {
++        meta["persist"] = json!(persist);
++    }
++    let result = session
++        .request_mcp_server_elicitation(
++            turn,
++            "yijie_market".to_owned(),
++            rmcp::model::NumberOrString::String(format!("market-{reference}-{phase}").into()),
++            ElicitationRequest::Form {
++                meta: Some(meta),
++                message: "连接器调用".to_owned(),
++                requested_schema: json!({"type":"object","properties":{}}),
++            },
++        )
++        .await;
++    if !result.sent {
++        return decline();
++    }
++    result.response.unwrap_or_else(decline)
++}
++
++pub(super) async fn review(
++    session: Arc<Session>,
++    request: &ElicitationReviewRequest,
++) -> anyhow::Result<Option<ElicitationResponse>> {
++    let Some(meta) = request.elicitation.meta() else {
++        return Ok(None);
++    };
++    if request.server_name != "yijie_market"
++        || meta.get("yijieKind").and_then(Json::as_str) != Some("gateway_native_approval_v1")
++    {
++        return Ok(None);
++    }
++    let Some(reference) = meta.get("yijieMarketCallRef").and_then(Json::as_str) else {
++        return Ok(Some(decline()));
++    };
++    if uuid::Uuid::parse_str(reference).is_err()
++        || meta.len() != 2
++        || !matches!(&request.elicitation, Elicitation::Mcp(rmcp::model::CreateElicitationRequestParams::FormElicitationParams { requested_schema, .. }) if requested_schema.properties.is_empty())
++    {
++        return Ok(Some(decline()));
++    }
++    let Some((turn, cancel)) = session.active_turn_context_and_cancellation_token().await else {
++        return Ok(Some(decline()));
++    };
++    let response = tokio::select! {
++        biased;
++        _ = cancel.cancelled() => decline(),
++        result = handle(&session, &turn, reference, request) => result?,
++    };
++    Ok(Some(response))
++}
++
++async fn handle(
++    session: &Arc<Session>,
++    turn: &Arc<TurnContext>,
++    reference: &str,
++    request: &ElicitationReviewRequest,
++) -> anyhow::Result<ElicitationResponse> {
++    let facts = owner(session, turn, reference, "inspect", None, &[]).await;
++    if facts.action != ElicitationAction::Accept {
++        return Ok(decline());
++    }
++    let review: Review = serde_json::from_value(facts.content.unwrap_or(Json::Null))?;
++    if !review.arguments.is_object() || review.remaining_ms == 0 || review.remaining_ms > 60_000 {
++        return Ok(decline());
++    }
++    if let Some(key) = &review.scope
++        && (key.len() != 64
++            || !key
++                .bytes()
++                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
++    {
++        return Ok(decline());
++    }
++    let select = async {
++        let scope = review.scope.as_deref();
++        if let Some(key) = scope {
++            if mcp_permission_prompt_is_auto_approved(
++                turn.approval_policy.value(),
++                &turn.permission_profile(),
++                McpPermissionPromptAutoApproveContext::default(),
++            ) {
++                return Ok(owner(session, turn, reference, "native_full", scope, &[]).await);
++            }
++            let mut guardian = request.clone();
++            if let Elicitation::Mcp(
++                rmcp::model::CreateElicitationRequestParams::FormElicitationParams { meta, .. },
++            ) = &mut guardian.elicitation
++            {
++                *meta = Some(Meta(serde_json::from_value(json!({
++                    "codex_request_type":"approval_request","codex_approval_kind":"mcp_tool_call",
++                    "tool_name":review.tool,"tool_title":review.title,"tool_params":review.arguments
++                }))?));
++            }
++            if let Some(result) =
++                review_guardian_mcp_elicitation(Arc::clone(session), guardian).await?
++            {
++                let phase = if result.action == ElicitationAction::Accept {
++                    "native_auto"
++                } else {
++                    "native_auto_reject"
++                };
++                let ack = owner(session, turn, reference, phase, scope, &[]).await;
++                return Ok(if ack.action == ElicitationAction::Accept {
++                    result
++                } else {
++                    decline()
++                });
++            }
++            if let Some(source) =
++                crate::mcp_tool_call::market_remembered(session, key, &review.tool).await
++            {
++                return Ok(owner(session, turn, reference, source, scope, &[]).await);
++            }
++        }
++        let offers = crate::mcp_tool_call::market_persist_options(turn, scope, &review.tool);
++        let answer = owner(session, turn, reference, "user", scope, &offers).await;
++        if answer.action == ElicitationAction::Accept
++            && let Some(key) = scope
++            && let Some(requested) = answer
++                .meta
++                .as_ref()
++                .and_then(|m| m.get("persist"))
++                .and_then(Json::as_str)
++        {
++            if !offers.contains(&requested) {
++                return Ok(decline());
++            }
++            let applied = crate::mcp_tool_call::remember_market_choice(
++                session,
++                turn,
++                key,
++                &review.tool,
++                answer.clone(),
++            )
++            .await;
++            let ack = owner(session, turn, reference, applied, scope, &[]).await;
++            if ack.action != ElicitationAction::Accept {
++                return Ok(decline());
++            }
++        }
++        Ok::<_, anyhow::Error>(answer)
++    };
++    Ok(tokio::time::timeout(
++        std::time::Duration::from_millis(review.remaining_ms),
++        select,
++    )
++    .await
++    .unwrap_or_else(|_| Ok(decline()))?)
++}
+diff --git a/core/src/session/mcp.rs b/core/src/session/mcp.rs
+--- a/core/src/session/mcp.rs
++++ b/core/src/session/mcp.rs
+@@ -1,3 +1,6 @@
++#[path = "market_approval.rs"]
++mod market_approval;
++
+ use super::*;
+ use crate::mcp::McpRuntimeProjection;
+ use codex_exec_server::ResolvedSelectedCapabilityRoot;
+@@ -71,6 +74,9 @@
+             let Some(session) = session.upgrade() else {
+                 return Ok(None);
+             };
++            if let Some(response) = market_approval::review(Arc::clone(&session), &request).await? {
++                return Ok(Some(response));
++            }
+             review_guardian_mcp_elicitation(session, request).await
+         })
+     }
+diff --git a/core/src/tools/sandboxing.rs b/core/src/tools/sandboxing.rs
+--- a/core/src/tools/sandboxing.rs
++++ b/core/src/tools/sandboxing.rs
+@@ -45,6 +45,14 @@
+ }
+ 
+ impl ApprovalStore {
++    pub(crate) fn inherit_session_approvals(&mut self, previous: &Self, accepts: impl Fn(&str) -> bool) {
++        for (key, decision) in &previous.map {
++            if matches!(decision, ReviewDecision::ApprovedForSession) && accepts(key) {
++                self.map.insert(key.clone(), decision.clone());
++            }
++        }
++    }
++
+     pub fn get<K>(&self, key: &K) -> Option<ReviewDecision>
+     where
+         K: Serialize,
