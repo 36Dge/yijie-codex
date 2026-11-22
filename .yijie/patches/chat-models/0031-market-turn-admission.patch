@@ -1,0 +1,107 @@
+diff --git a/core/src/mcp_tool_call.rs b/core/src/mcp_tool_call.rs
+--- a/core/src/mcp_tool_call.rs
++++ b/core/src/mcp_tool_call.rs
+@@ -109,6 +109,38 @@
+ const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
+ const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
+ 
++// The dedicated Gateway clears supplier metadata before attaching this closed
++// marker. Only this turn's market server can stop its own future calls.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum MarketTurnStop {
++    Expired,
++    Revoked,
++}
++
++impl MarketTurnStop {
++    fn from_gateway(server: &str, result: &CallToolResult) -> Option<Self> {
++        if server != "yijie_market" || result.is_error != Some(true) {
++            return None;
++        }
++        match result.meta.as_ref()?.get("yijie.market.turnStop")?.as_str()? {
++            "lease_expired" => Some(Self::Expired),
++            "lease_revoked" => Some(Self::Revoked),
++            _ => None,
++        }
++    }
++
++    fn message(self) -> &'static str {
++        match self {
++            Self::Expired => "本轮市场连接器授权已到期。请停止本轮所有市场工具调用，向用户说明原因，并用现有证据继续。",
++            Self::Revoked => "本轮市场连接器授权已撤销。请停止本轮所有市场工具调用，向用户说明原因，并用现有证据继续。",
++        }
++    }
++}
++
++pub(crate) fn market_turn_stop(turn: &TurnContext) -> Option<&'static str> {
++    turn.extension_data.get::<MarketTurnStop>().map(|stop| stop.message())
++}
++
+ /// Handles the specified tool call and dispatches the appropriate MCP tool-call
+ /// item lifecycle events to the `Session`.
+ pub(crate) async fn handle_mcp_tool_call(
+@@ -196,14 +228,15 @@
+         .as_ref()
+         .and_then(|metadata| metadata.connector_name.clone());
+ 
+-    if server == CODEX_APPS_MCP_SERVER_NAME && !app_tool_policy.enabled {
++    let market_stop = (server == "yijie_market").then(|| market_turn_stop(turn_context)).flatten();
++    if market_stop.is_some() || (server == CODEX_APPS_MCP_SERVER_NAME && !app_tool_policy.enabled) {
+         let result = notify_mcp_tool_call_skip(
+             sess.as_ref(),
+             turn_context.as_ref(),
+             &call_id,
+             invocation,
+             item_metadata.clone(),
+-            "MCP tool call blocked by app configuration".to_string(),
++            market_stop.unwrap_or("MCP tool call blocked by app configuration").to_string(),
+             /*already_started*/ false,
+         )
+         .await;
+@@ -597,6 +630,9 @@
+         )
+         .await
+         .map_err(|e| format!("tool call error: {e:?}"))?;
++    if let Some(stop) = MarketTurnStop::from_gateway(&invocation.server, &result) {
++        turn_context.extension_data.get_or_init(|| stop);
++    }
+     let result = sanitize_mcp_tool_result_for_model(
+         turn_context
+             .model_info
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -1220,7 +1220,12 @@
+     let turn_context = Arc::clone(&step_context.turn);
+     let router = built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?;
+ 
+-    let base_instructions = sess.get_base_instructions().await;
++    let mut base_instructions = sess.get_base_instructions().await;
++    if let Some(message) = crate::mcp_tool_call::market_turn_stop(&turn_context) {
++        // Code Mode may have consumed the result without printing its text.
++        base_instructions.text.push('\n');
++        base_instructions.text.push_str(message);
++    }
+ 
+     let tool_runtime = ToolCallRuntime::new(
+         Arc::clone(&router),
+@@ -1426,12 +1431,18 @@
+             .instrument(trace_span!("built_tools.load_discoverable_tools"))
+             .await
+         };
+-    let mcp_tool_exposure = build_mcp_tool_exposure(
++    let mut mcp_tool_exposure = build_mcp_tool_exposure(
+         all_mcp_tools,
+         connectors.as_deref(),
+         &turn_context.config,
+         search_tool_enabled(turn_context),
+     );
++    if crate::mcp_tool_call::market_turn_stop(turn_context).is_some() {
++        mcp_tool_exposure.direct_tools.retain(|tool| tool.server_name != "yijie_market");
++        if let Some(tools) = &mut mcp_tool_exposure.deferred_tools {
++            tools.retain(|tool| tool.server_name != "yijie_market");
++        }
++    }
+     let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
+     let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;
+     Ok(Arc::new(ToolRouter::from_context(
