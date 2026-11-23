@@ -1,5 +1,12 @@
 # Upstream
 
+2026-11-23 adds `0033-native-mcp-call-receipt.patch` to the local market adapter.
+The ordinary native MCP tool-call policy evaluates the original annotations,
+tool configuration, hooks, session choices and reviewer. A private per-call owner
+receipt binds its outcome to the registered tool and arguments at dispatch.
+The candidate is built by `scripts/build-native-skill-marketplace.sh`.
+
+
 2026-11-22 FEAT-157 appends `0032-native-market-approval.patch` after the
 0031 market turn admission overlay on `rust-v0.144.6`. The canonical
 `scripts/build-native-skill-marketplace.sh` build produces 276 stable

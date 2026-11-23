@@ -1,0 +1,483 @@
+diff --git a/core/src/mcp_tool_call.rs b/core/src/mcp_tool_call.rs
+--- a/core/src/mcp_tool_call.rs
++++ b/core/src/mcp_tool_call.rs
+@@ -92,7 +92,9 @@
+ use tracing::field::Empty;
+ use url::Url;
+ 
++mod market_registration;
+ mod telemetry;
++use market_registration::Registration as MarketRegistration;
+ 
+ use telemetry::McpCallMetricOutcome;
+ use telemetry::emit_mcp_call_metrics;
+@@ -266,7 +283,26 @@
+     )
+     .await;
+ 
+-    if let Some(decision) = maybe_request_mcp_tool_approval(
++    let market = match MarketRegistration::prepare(&sess, turn_context, &invocation).await {
++        Ok(binding) => binding,
++        Err(message) => {
++            let result = notify_mcp_tool_call_skip(
++                &sess,
++                turn_context,
++                &call_id,
++                invocation,
++                item_metadata,
++                message.to_owned(),
++                true,
++            )
++            .await;
++            return HandledMcpToolCall {
++                result: CallToolResult::from_result(result),
++                tool_input: arguments_value.unwrap_or_else(|| serde_json::json!({})),
++            };
++        }
++    };
++    let mut decision = maybe_request_scoped_mcp_tool_approval(
+         &sess,
+         step_context,
+         &call_id,
+@@ -274,9 +310,21 @@
+         &hook_tool_name,
+         metadata.as_ref(),
+         approval_mode,
++        market.as_ref(),
+     )
+-    .await
++    .await;
++    if let Some(binding) = &market
++        && !binding.finish(&sess, turn_context, decision.as_ref()).await
++        && !matches!(
++            decision,
++            Some(McpToolApprovalDecision::Decline { .. } | McpToolApprovalDecision::Cancel)
++        )
+     {
++        decision = Some(McpToolApprovalDecision::Decline {
++            message: Some("market owner did not acknowledge the native decision".into()),
++        });
++    }
++    if let Some(decision) = decision {
+         let result = match decision {
+             McpToolApprovalDecision::Accept
+             | McpToolApprovalDecision::AcceptForSession
+@@ -288,32 +336,33 @@
+                     invocation,
+                     metadata.as_ref(),
+                     item_metadata,
++                    market.as_ref(),
+                 )
+                 .await;
+             }
+             McpToolApprovalDecision::Decline { message } => {
+                 let message = message.unwrap_or_else(|| "user rejected MCP tool call".to_string());
+-                notify_mcp_tool_call_skip(
++                market_registration::notify_denial(
+                     sess.as_ref(),
+                     turn_context.as_ref(),
+                     &call_id,
+                     invocation,
+                     item_metadata.clone(),
+                     message,
+-                    /*already_started*/ true,
++                    market.as_ref(),
+                 )
+                 .await
+             }
+             McpToolApprovalDecision::Cancel => {
+                 let message = "user cancelled MCP tool call".to_string();
+-                notify_mcp_tool_call_skip(
++                market_registration::notify_denial(
+                     sess.as_ref(),
+                     turn_context.as_ref(),
+                     &call_id,
+                     invocation,
+                     item_metadata.clone(),
+                     message,
+-                    /*already_started*/ true,
++                    market.as_ref(),
+                 )
+                 .await
+             }
+@@ -345,6 +394,7 @@
+         invocation,
+         metadata.as_ref(),
+         item_metadata,
++        market.as_ref(),
+     )
+     .await
+ }
+@@ -399,6 +449,7 @@
+     invocation: McpInvocation,
+     metadata: Option<&McpToolApprovalMetadata>,
+     item_metadata: McpToolCallItemMetadata,
++    market: Option<&MarketRegistration>,
+ ) -> HandledMcpToolCall {
+     let turn_context = step_context.turn.as_ref();
+     let manager = step_context.mcp.manager();
+@@ -427,8 +478,11 @@
+     let result = async {
+         let result = async {
+             let rewritten_arguments = rewrite?;
+-            let request_meta =
++            let mut request_meta =
+                 build_mcp_tool_call_request_meta(turn_context, &server, call_id, metadata);
++            if let Some(binding) = market {
++                binding.attach(&mut request_meta);
++            }
+             execute_mcp_tool_call(
+                 sess,
+                 step_context,
+@@ -1236,6 +1290,7 @@
+     }
+ }
+ 
++#[cfg(test)]
+ async fn maybe_request_mcp_tool_approval(
+     sess: &Arc<Session>,
+     step_context: &Arc<StepContext>,
+@@ -1244,6 +1299,30 @@
+     hook_tool_name: &HookToolName,
+     metadata: Option<&McpToolApprovalMetadata>,
+     approval_mode: AppToolApproval,
++) -> Option<McpToolApprovalDecision> {
++    maybe_request_scoped_mcp_tool_approval(
++        sess,
++        step_context,
++        call_id,
++        invocation,
++        hook_tool_name,
++        metadata,
++        approval_mode,
++        None,
++    )
++    .await
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn maybe_request_scoped_mcp_tool_approval(
++    sess: &Arc<Session>,
++    step_context: &Arc<StepContext>,
++    call_id: &str,
++    invocation: &McpInvocation,
++    hook_tool_name: &HookToolName,
++    metadata: Option<&McpToolApprovalMetadata>,
++    approval_mode: AppToolApproval,
++    market: Option<&MarketRegistration>,
+ ) -> Option<McpToolApprovalDecision> {
+     let turn_context = &step_context.turn;
+     let manager = step_context.mcp.manager();
+@@ -1255,9 +1334,24 @@
+             tool_approval_mode: Some(approval_mode),
+         },
+     ) {
++        if let Some(binding) = market
++            && mcp_permission_prompt_is_auto_approved(
++                turn_context.approval_policy.value(),
++                &turn_context.permission_profile(),
++                McpPermissionPromptAutoApproveContext::default(),
++            )
++        {
++            binding.mark("native_full");
++        }
+         return None;
+     }
+ 
++    if let Some(binding) = market
++        && approval_mode == AppToolApproval::Auto
++        && binding.remembered(sess).await
++    {
++        return Some(McpToolApprovalDecision::Accept);
++    }
+     let annotations = metadata.and_then(|metadata| metadata.annotations.as_ref());
+     if !requires_mcp_tool_approval_for_mode(annotations, approval_mode) {
+         return None;
+@@ -1269,6 +1363,10 @@
+     } else {
+         persistent_mcp_tool_approval_key(invocation, metadata, approval_mode)
+     };
++    let session_approval_key =
++        session_approval_key.map(|key| market.map_or(key, MarketRegistration::key));
++    let persistent_approval_key =
++        persistent_approval_key.map(|key| market.map_or(key, MarketRegistration::key));
+     if let Some(key) = session_approval_key.as_ref()
+         && mcp_tool_approval_is_remembered(sess, key).await
+     {
+@@ -1316,6 +1414,18 @@
+         )
+         .await;
+         let decision = mcp_tool_approval_decision_from_guardian(sess, &review_id, decision).await;
++        if let Some(binding) = market {
++            binding.mark(
++                if matches!(
++                    decision,
++                    McpToolApprovalDecision::Decline { .. } | McpToolApprovalDecision::Cancel
++                ) {
++                    "native_auto_reject"
++                } else {
++                    "native_auto"
++                },
++            );
++        }
+         apply_mcp_tool_approval_decision(
+             sess,
+             turn_context,
+@@ -1333,6 +1443,19 @@
+         tool_call_mcp_elicitation_enabled,
+     );
+     let question_id = format!("{MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX}_{call_id}");
++    if tool_call_mcp_elicitation_enabled && let Some(binding) = market {
++        return Some(
++            binding
++                .ask(
++                    sess,
++                    turn_context,
++                    prompt_options,
++                    approval_mode,
++                    &question_id,
++                )
++                .await,
++        );
++    }
+     let rendered_template = render_mcp_tool_approval_template(
+         &invocation.server,
+         metadata.and_then(|metadata| metadata.connector_id.as_deref()),
+diff --git a/core/src/mcp_tool_call/market_registration.rs b/core/src/mcp_tool_call/market_registration.rs
+new file mode 100644
+--- /dev/null
++++ b/core/src/mcp_tool_call/market_registration.rs
+@@ -0,0 +1,233 @@
++//! Transport binding for the Host-owned MCP gateway. Policy, hooks, Guardian
++//! and the available user decisions belong to the ordinary MCP tool-call path.
++use super::*;
++use serde_json::json;
++use std::sync::OnceLock;
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub(super) struct Registration {
++    call_ref: String,
++    scope: String,
++    tool: String,
++    #[serde(skip)]
++    source: OnceLock<&'static str>,
++    #[serde(skip)]
++    dispatch: OnceLock<String>,
++    #[serde(skip)]
++    denied_meta: OnceLock<JsonValue>,
++}
++
++async fn exchange(
++    session: &Session,
++    turn: &TurnContext,
++    id: String,
++    meta: JsonValue,
++) -> Option<ElicitationResponse> {
++    let out = session
++        .request_mcp_server_elicitation(
++            turn,
++            "yijie_market".into(),
++            rmcp::model::RequestId::String(id.into()),
++            ElicitationRequest::Form {
++                meta: Some(meta),
++                message: "连接器调用".into(),
++                requested_schema: json!({"type":"object","properties":{}}),
++            },
++        )
++        .await;
++    out.sent.then_some(out.response).flatten()
++}
++
++impl Registration {
++    pub(super) async fn prepare(
++        sess: &Session,
++        turn: &TurnContext,
++        invocation: &McpInvocation,
++    ) -> Result<Option<Self>, &'static str> {
++        let owned = invocation.server == "yijie_market" && turn.config.mcp_servers.get()
++            .get(&invocation.server).is_some_and(|cfg| matches!(&cfg.transport,
++                codex_config::McpServerTransportConfig::StreamableHttp { http_headers:Some(headers), .. }
++                if headers.get("X-Yijie-Native-Dispatch").is_some_and(|v| v=="2")));
++        if !owned {
++            return Ok(None);
++        }
++        let operation = uuid::Uuid::new_v4().to_string();
++        let args =
++            serde_json::to_string(&invocation.arguments).map_err(|_| "invalid MCP arguments")?;
++        let response = exchange(sess,turn,format!("market-register-{operation}"),
++            json!({"yijieKind":"native_market_register_v2","operationId":operation,"toolName":invocation.tool,"argumentsJson":args})).await;
++        let data = response
++            .filter(|r| r.action == ElicitationAction::Accept)
++            .and_then(|r| r.content)
++            .ok_or("market call registration unavailable")?;
++        let binding: Self =
++            serde_json::from_value(data).map_err(|_| "invalid market call registration")?;
++        if uuid::Uuid::parse_str(&binding.call_ref).is_err()
++            || binding.scope.len() != 64
++            || !binding
++                .scope
++                .bytes()
++                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++            || binding.tool.is_empty()
++        {
++            return Err("invalid market call scope");
++        }
++        Ok(Some(binding))
++    }
++
++    async fn owner(
++        &self,
++        sess: &Session,
++        turn: &TurnContext,
++        phase: &str,
++        persist: &[&str],
++        dispatch: Option<&str>,
++    ) -> Option<ElicitationResponse> {
++        let mut meta = json!({"yijieKind":"gateway_native_approval_v1","yijieMarketCallRef":self.call_ref,
++            "yijieNativePhase":phase,"yijieScope":self.scope});
++        if let Some(proof) = dispatch {
++            meta["dispatchRef"] = json!(proof);
++        }
++        if !persist.is_empty() {
++            meta["persist"] = json!(persist);
++        }
++        exchange(
++            sess,
++            turn,
++            format!("market-{}-{phase}", self.call_ref),
++            meta,
++        )
++        .await
++    }
++
++    pub(super) fn mark(&self, phase: &'static str) {
++        let _ = self.source.set(phase);
++    }
++    pub(super) fn key(&self) -> McpToolApprovalKey {
++        market_approval_key(&self.scope, &self.tool)
++    }
++    pub(super) async fn remembered(&self, sess: &Session) -> bool {
++        if let Some(source) = market_remembered(sess, &self.scope, &self.tool).await {
++            self.mark(source);
++            true
++        } else {
++            false
++        }
++    }
++    pub(super) async fn ask(
++        &self,
++        sess: &Session,
++        turn: &TurnContext,
++        options: McpToolApprovalPromptOptions,
++        approval_mode: AppToolApproval,
++        question_id: &str,
++    ) -> McpToolApprovalDecision {
++        let mut offers = Vec::new();
++        if options.allow_session_remember {
++            offers.push(MCP_TOOL_APPROVAL_PERSIST_SESSION);
++        }
++        if options.allow_persistent_approval {
++            offers.push(MCP_TOOL_APPROVAL_PERSIST_ALWAYS);
++        }
++        let answer = self.owner(sess, turn, "user", &offers, None).await;
++        let decision = normalize_approval_decision_for_mode(
++            parse_mcp_tool_approval_elicitation_response(answer.clone(), question_id),
++            approval_mode,
++        );
++        if let Some(answer) = answer
++            && matches!(
++                decision,
++                McpToolApprovalDecision::AcceptAndRemember
++                    | McpToolApprovalDecision::AcceptForSession
++            )
++        {
++            let persist = answer
++                .meta
++                .as_ref()
++                .and_then(|m| m.get("persist"))
++                .and_then(JsonValue::as_str);
++            if !persist.is_some_and(|p| offers.contains(&p)) {
++                return McpToolApprovalDecision::Cancel;
++            }
++            let applied = remember_market_choice(sess, turn, &self.scope, &self.tool, answer).await;
++            if !self
++                .owner(sess, turn, applied, &[], None)
++                .await
++                .is_some_and(|r| r.action == ElicitationAction::Accept)
++            {
++                return McpToolApprovalDecision::Cancel;
++            }
++        }
++        decision
++    }
++    pub(super) async fn finish(
++        &self,
++        sess: &Session,
++        turn: &TurnContext,
++        decision: Option<&McpToolApprovalDecision>,
++    ) -> bool {
++        let denied = matches!(
++            decision,
++            Some(McpToolApprovalDecision::Decline { .. } | McpToolApprovalDecision::Cancel)
++        );
++        let phase = self.source.get().copied().unwrap_or(if denied {
++            "native_runtime_reject"
++        } else {
++            "native_runtime"
++        });
++        let proof = (!denied).then(|| uuid::Uuid::new_v4().to_string());
++        let acknowledgement = self
++            .owner(sess, turn, phase, &[], proof.as_deref())
++            .await
++            .filter(|r| r.action == ElicitationAction::Accept);
++        let acknowledged = acknowledgement.is_some();
++        if denied && let Some(meta) = acknowledgement.and_then(|r| r.content) {
++            let receipt = &meta["yijie.market.call"];
++            if receipt["callRef"].as_str() == Some(self.call_ref.as_str())
++                && receipt["admissionConsumed"] == false
++            {
++                let _ = self.denied_meta.set(meta);
++            }
++        }
++        if acknowledged && let Some(proof) = proof {
++            return self.dispatch.set(proof).is_ok();
++        }
++        acknowledged
++    }
++    pub(super) fn attach(&self, meta: &mut Option<JsonValue>) {
++        let meta = meta.get_or_insert_with(|| json!({}));
++        meta["yijieMarketCallRef"] = json!(self.call_ref);
++        meta["yijieMarketDispatch"] = json!(self.dispatch.get());
++    }
++}
++
++// A rejected call does not reach tools/call. Record the actual owner's refusal
++// on the failed native Item, while returning the original native tool error.
++pub(super) async fn notify_denial(
++    sess: &Session,
++    turn: &TurnContext,
++    id: &str,
++    invocation: McpInvocation,
++    item: McpToolCallItemMetadata,
++    message: String,
++    market: Option<&Registration>,
++) -> Result<CallToolResult, String> {
++    if let Some(meta) = market.and_then(|r| r.denied_meta.get()) {
++        let mut denied = CallToolResult::from_error_text(message.clone());
++        denied.meta = Some(meta.clone());
++        notify_mcp_tool_call_completed(
++            sess,
++            turn,
++            id,
++            invocation,
++            item,
++            Duration::ZERO,
++            truncate_mcp_tool_result_for_event(&Ok(denied)),
++        )
++        .await;
++        Err(message)
++    } else {
++        notify_mcp_tool_call_skip(sess, turn, id, invocation, item, message, true).await
++    }
++}

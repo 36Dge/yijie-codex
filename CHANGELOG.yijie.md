@@ -1,5 +1,10 @@
 # Yijie Changelog
 
+## 2026-11-23
+
+市场工具与普通 MCP 调用共用原生审批决策。受管网关在发送前核对同一请求的凭据引用、轮次、参数和一次性回执。
+
+
 2026-11-13 FEAT-174 appends the authorized 0025 native local Skill marketplace
 policy/state/refresh overlay after 0024. The fixed upstream and canonical source
 remain unchanged. Local-only source admission and explicit refresh reuse native
