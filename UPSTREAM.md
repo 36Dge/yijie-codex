@@ -1,5 +1,7 @@
 # Upstream
 
+2026-11-24 · FEAT-175 · `0036-hosted-search-followup.patch` follows the scoped Fetch and answer-context overlays on `rust-v0.144.6`. In opted-in Kimi ordinary chat, a completed hosted search moves the next sampling request into evidence review. A native function can name a missing fact and a targeted query to make the existing hosted capability available for one more sampling request. The canonical build is `scripts/build-native-skill-marketplace.sh`. The previous artifact and its matching consumer pins support rollback after normal shutdown.
+
 2026-11-23 adds `0033-native-mcp-call-receipt.patch` to the local market adapter.
 The ordinary native MCP tool-call policy evaluates the original annotations,
 tool configuration, hooks, session choices and reviewer. A private per-call owner

@@ -13,7 +13,7 @@ def reviewed_patches(patch_dir, profile="input-only"):
         "0029-resume-after-terminal-error.patch", "0030-declared-public-preview.patch",
         "0031-market-turn-admission.patch", "0032-native-market-approval.patch",
         "0033-native-mcp-call-receipt.patch", "0034-scoped-page-fetch.patch",
-        "0035-fetch-answer-context.patch",
+        "0035-fetch-answer-context.patch", "0036-hosted-search-followup.patch",
     )]
     if any(not patch.is_file() or patch.is_symlink() for patch in patches):
         raise SystemExit("Reviewed local Runtime patch unavailable")

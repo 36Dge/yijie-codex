@@ -1,0 +1,541 @@
+--- a/core/src/session/answer_completion.rs
++++ b/core/src/session/answer_completion.rs
+@@ -57,7 +57,8 @@
+     let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+     for item in items {
+         match item {
+-            ResponseItem::Message { role, content, .. } if role == "user" => {
++            ResponseItem::Message { role, content, .. }
++                if role == "user" && crate::context_manager::is_user_turn_boundary(item) => {
+                 let request = content
+                     .iter()
+                     .filter_map(|part| match part {
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -1178,13 +1178,15 @@
+     mut base_instructions: BaseInstructions,
+ ) -> Prompt {
+     crate::tools::search_progress::fetch_answer::prepare(turn_context, &mut input, &mut base_instructions);
++    let mut tools = if super::answer_completion::finalizing(turn_context) {
++        Vec::new()
++    } else {
++        router.model_visible_specs()
++    };
++    crate::tools::search_progress::hosted::prepare(turn_context, &mut tools, &mut input, &mut base_instructions);
+     Prompt {
+         input,
+-        tools: if super::answer_completion::finalizing(turn_context) {
+-            Vec::new()
+-        } else {
+-            router.model_visible_specs()
+-        },
++        tools,
+         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+         base_instructions,
+         output_schema: turn_context.final_output_json_schema.clone(),
+@@ -1254,6 +1256,13 @@
+             turn_context.as_ref(),
+             base_instructions.clone(),
+         );
++        step_context
++            .search_progress
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .gap_offered = crate::tools::search_progress::hosted::enabled(&turn_context)
++            && prompt.tools.iter().any(|spec| spec.name() == crate::tools::search_progress::hosted::GAP_TOOL);
++        crate::tools::search_progress::hosted::sampling_started(&turn_context);
+         let err = match try_run_sampling_request(
+             tool_runtime.clone(),
+             Arc::clone(&sess),
+@@ -2200,9 +2209,12 @@
+         match event {
+             ResponseEvent::Created => {}
+             ResponseEvent::OutputItemDone(mut item) => {
+-                if let ResponseItem::WebSearchCall {action,..} = &item {
+-                    if matches!(action, Some(codex_protocol::models::WebSearchAction::Search {..})) {
++                if let ResponseItem::WebSearchCall { status, action, .. } = &item {
++                    if let Some(action @ codex_protocol::models::WebSearchAction::Search { .. }) = action {
+                         tool_runtime.observe_hosted_search();
++                        if status.as_deref() == Some("completed") {
++                            crate::tools::search_progress::hosted::observe(&turn_context, action);
++                        }
+                     } else {
+                         independent_provider_work = true;
+                     }
+--- a/core/src/tools/registry.rs
++++ b/core/src/tools/registry.rs
+@@ -489,7 +489,10 @@
+         let deep = tool.deep_search_receipts();
+         let cell = crate::tools::code_mode::is_exec_tool_name(&invocation.tool_name);
+         let goal = invocation.tool_name.name == "get_goal" && invocation.tool_name.namespace.is_none();
+-        if !cell && !goal {
++        let gap_request = invocation.tool_name.namespace.is_none()
++            && invocation.tool_name.name == crate::tools::search_progress::hosted::GAP_TOOL
++            && crate::tools::search_progress::hosted::enabled(&invocation.turn);
++        if !cell && !goal && !gap_request {
+             invocation
+                 .step_context
+                 .search_progress
+--- /dev/null
++++ b/core/src/tools/search_progress/hosted.rs
+@@ -0,0 +1,355 @@
++//! Kimi decides whether to search on the server before generating any local
++//! tool call. Offer that capability again only for a concrete outstanding fact.
++use super::History;
++use crate::function_tool::FunctionCallError;
++use crate::session::{answer_completion, public_messages, turn_context::TurnContext};
++use crate::tools::context::{FunctionToolOutput, ToolInvocation, ToolPayload, boxed_tool_output};
++use crate::tools::handlers::parse_arguments;
++use crate::tools::registry::{CoreToolRuntime, ToolExecutor};
++use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem, WebSearchAction};
++use codex_tools::{JsonSchema, ResponsesApiTool, ToolName, ToolSpec};
++use serde::Deserialize;
++use std::collections::{BTreeMap, VecDeque};
++use std::sync::{Mutex, PoisonError};
++
++pub(crate) const GAP_TOOL: &str = "request_followup_search";
++const MAX_KEYS: usize = 256;
++const USE_RESULTS: &str = "\nWhen hosted search supplies evidence in this response, check it against each part of the user's request. Once the opening has been delivered and the evidence covers the request, give the complete sourced final_answer in this response. Do not defer it to announce a finding, poll goal status, discover a duplicate retrieval route or recheck the same facts. If a further step is necessary, retain the concrete facts and sources already established.";
++const REVIEW: &str = "\nReview the evidence already obtained against the user's requested deliverable. If sufficient, start with [[yijie-public-message-v1:final_answer]] on its own line and deliver the complete answer now. The opening and previous progress were already sent. A source title or URL by itself does not establish what the page says. If a specific required fact is missing, read a relevant known page or request one focused follow-up search for that gap. When an available result includes source chunks, use them before fetching the same material again. Continue other genuinely unfinished work normally. Do not repeat a progress update or use another search route to reconfirm known facts.";
++const ALREADY_TRIED: &str = "This gap or query was already tried. Use its result, read a relevant source, or report the remaining uncertainty in your answer.";
++
++#[derive(PartialEq)]
++struct EvidenceNeed {
++    fact: String,
++    site: Option<String>,
++}
++
++#[derive(Default)]
++pub(super) struct State {
++    pub(super) searched: bool,
++    /// Exactly one subsequent provider sampling request may offer hosted search.
++    pending: Option<(EvidenceNeed, String)>,
++    gaps: VecDeque<EvidenceNeed>,
++    queries: VecDeque<String>,
++    pub(super) last_progress: Option<String>,
++    pub(super) empty_poll: bool,
++}
++
++fn normalized(value: &str) -> String {
++    value
++        .split_whitespace()
++        .collect::<Vec<_>>()
++        .join(" ")
++        .to_lowercase()
++}
++
++// Bound bookkeeping without placing a lifetime limit on distinct research needs.
++fn remember<T: PartialEq>(values: &mut VecDeque<T>, value: T) {
++    if !values.contains(&value) {
++        if values.len() == MAX_KEYS {
++            values.pop_front();
++        }
++        values.push_back(value);
++    }
++}
++
++impl State {
++    fn observe(&mut self, action: &WebSearchAction) {
++        let WebSearchAction::Search { query, queries, .. } = action else {
++            return;
++        };
++        self.searched = true;
++        self.begin_request();
++        for value in query.iter().chain(queries.iter().flatten()) {
++            if value.len() <= 4096 {
++                remember(&mut self.queries, normalized(value));
++            }
++        }
++    }
++
++    fn request(&mut self, gap: &Gap) -> Result<(), &'static str> {
++        if !self.searched || self.pending.is_some() {
++            return Err("A further search decision is not needed in this step.");
++        }
++        if [&gap.missing_fact, &gap.query]
++            .iter()
++            .any(|s| s.trim().is_empty() || s.len() > 1024)
++        {
++            return Err("Specify the missing fact and a concise query targeting it.");
++        }
++        let query = normalized(&gap.query);
++        // A lookup at a different named source can still resolve the same gap.
++        let source = query
++            .split_whitespace()
++            .find_map(|s| s.strip_prefix("site:").filter(|site| !site.is_empty()))
++            .map(str::to_owned);
++        let fact = EvidenceNeed {
++            fact: normalized(&gap.missing_fact),
++            site: source,
++        };
++        if self.gaps.contains(&fact) || self.queries.contains(&query) {
++            return Err(ALREADY_TRIED);
++        }
++        self.pending = Some((fact, query));
++        Ok(())
++    }
++
++    fn begin_request(&mut self) {
++        if let Some((fact, query)) = self.pending.take() {
++            remember(&mut self.gaps, fact);
++            remember(&mut self.queries, query);
++        }
++    }
++
++    pub(super) fn reviewing(&self) -> bool {
++        self.searched && self.pending.is_none()
++    }
++
++    pub(super) fn reconsider(&mut self) {
++        self.pending = None;
++    }
++
++    fn prepare(
++        &self,
++        specs: &mut Vec<ToolSpec>,
++        input: &mut Vec<ResponseItem>,
++        instructions: &mut BaseInstructions,
++    ) {
++        let review = self.reviewing();
++        specs.retain(|spec| match spec {
++            ToolSpec::WebSearch { .. } => !review,
++            ToolSpec::Function(f) if f.name == GAP_TOOL => review,
++            _ => true,
++        });
++        if review {
++            input.push(ResponseItem::Message {
++                id: None,
++                role: "developer".into(),
++                content: vec![ContentItem::InputText {
++                    text: REVIEW.trim().into(),
++                }],
++                phase: None,
++                internal_chat_message_metadata_passthrough: None,
++            });
++        } else {
++            instructions.text.push_str(USE_RESULTS);
++        }
++    }
++}
++
++pub(crate) fn enabled(turn: &TurnContext) -> bool {
++    turn.model_info.slug == "kimi-k3.1-pro"
++        && public_messages::enabled(turn)
++        && !turn.session_source.is_non_root_agent()
++        && !turn.dynamic_tools.iter().any(|s| matches!(s, codex_protocol::dynamic_tools::DynamicToolSpec::Function(f) if f.name == GAP_TOOL))
++        && turn
++            .developer_instructions
++            .as_deref()
++            .is_some_and(|s| s.contains(answer_completion::MARKER))
++}
++
++fn with_state<T>(turn: &TurnContext, f: impl FnOnce(&mut State) -> T) -> T {
++    let state = turn
++        .extension_data
++        .get_or_init(|| Mutex::new(History::default()));
++    f(&mut state.lock().unwrap_or_else(PoisonError::into_inner).hosted)
++}
++
++pub(crate) fn observe(turn: &TurnContext, action: &WebSearchAction) {
++    if enabled(turn) {
++        with_state(turn, |state| state.observe(action));
++    }
++}
++
++pub(crate) fn prepare(
++    turn: &TurnContext,
++    specs: &mut Vec<ToolSpec>,
++    input: &mut Vec<ResponseItem>,
++    instructions: &mut BaseInstructions,
++) {
++    // These two specs are registered together only when the original provider,
++    // mode and permission configuration offers hosted search.
++    if enabled(turn)
++        && specs
++            .iter()
++            .any(|s| matches!(s, ToolSpec::WebSearch { .. }))
++        && specs
++            .iter()
++            .any(|s| matches!(s, ToolSpec::Function(f) if f.name == GAP_TOOL))
++    {
++        with_state(turn, |state| state.prepare(specs, input, instructions));
++    }
++}
++
++pub(crate) fn sampling_started(turn: &TurnContext) {
++    if enabled(turn) {
++        with_state(turn, State::begin_request);
++    }
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Gap {
++    missing_fact: String,
++    query: String,
++}
++
++pub(crate) struct RequestFollowup;
++
++impl ToolExecutor<ToolInvocation> for RequestFollowup {
++    fn tool_name(&self) -> ToolName {
++        ToolName::plain(GAP_TOOL)
++    }
++
++    fn spec(&self) -> ToolSpec {
++        let fields = BTreeMap::from([
++            ("missing_fact".into(), JsonSchema::string(Some("Which specific part of the user's request is still unsupported by the available evidence?".into()))),
++            ("query".into(), JsonSchema::string(Some("A targeted lookup that would resolve that gap. For an untried source on the same missing fact, include site:domain.".into()))),
++        ]);
++        ToolSpec::Function(ResponsesApiTool {
++            name: GAP_TOOL.into(),
++            description: "Request hosted search in the next step only for a missing fact. If the material already covers the user's request, answer now. Do not call to recheck results or announce progress.".into(),
++            strict: true,
++            defer_loading: None,
++            parameters: JsonSchema::object(fields, Some(vec!["missing_fact".into(), "query".into()]), Some(false.into())),
++            output_schema: None,
++        })
++    }
++
++    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
++        Box::pin(async move {
++            let ToolPayload::Function { arguments } = &invocation.payload else {
++                return Err(FunctionCallError::RespondToModel(
++                    "Expected a missing fact and query.".into(),
++                ));
++            };
++            if !invocation
++                .step_context
++                .search_progress
++                .lock()
++                .unwrap_or_else(PoisonError::into_inner)
++                .gap_offered
++            {
++                return Err(FunctionCallError::RespondToModel(
++                    "Follow-up search was not offered in this sampling step.".into(),
++                ));
++            }
++            let gap: Gap = parse_arguments(arguments)?;
++            let decision = with_state(&invocation.turn, |state| state.request(&gap));
++            if let Err(reason) = decision {
++                invocation
++                    .step_context
++                    .search_progress
++                    .lock()
++                    .unwrap_or_else(PoisonError::into_inner)
++                    .refused_gap = true;
++                return Err(FunctionCallError::RespondToModel(reason.into()));
++            }
++            Ok(boxed_tool_output(FunctionToolOutput::from_text(
++                format!(
++                    "The next request may use hosted search for this missing fact. Answer as soon as the results cover it.\n{}",
++                    serde_json::json!({"missing_fact": gap.missing_fact, "query": gap.query})
++                ),
++                Some(true),
++            )))
++        })
++    }
++}
++impl CoreToolRuntime for RequestFollowup {}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn evidence_review_keeps_other_tools_and_does_not_modify_the_actual_history() {
++        let web = crate::tools::hosted_spec::create_web_search_tool(
++            crate::tools::hosted_spec::WebSearchToolOptions {
++                web_search_mode: Some(codex_protocol::config_types::WebSearchMode::Live),
++                web_search_config: None,
++                web_search_tool_type: codex_protocol::openai_models::WebSearchToolType::Text,
++            },
++        )
++        .unwrap();
++        let ToolSpec::Function(mut independent) = RequestFollowup.spec() else {
++            unreachable!()
++        };
++        independent.name = "ordinary_work".into();
++        let specs = vec![web, RequestFollowup.spec(), ToolSpec::Function(independent)];
++        let mut state = State::default();
++        for expected_review in [false, true, false] {
++            let mut offered = specs.clone();
++            let mut input = Vec::new();
++            let mut prompt = BaseInstructions {
++                text: String::new(),
++            };
++            state.prepare(&mut offered, &mut input, &mut prompt);
++            let names: Vec<_> = offered.iter().map(ToolSpec::name).collect();
++            assert!(names.contains(&"ordinary_work"));
++            assert_eq!(names.contains(&GAP_TOOL), expected_review);
++            assert_eq!(names.contains(&"web_search"), !expected_review);
++            assert_eq!(input.len(), usize::from(expected_review));
++            if state.searched {
++                state
++                    .request(&Gap {
++                        missing_fact: "population".into(),
++                        query: "city census".into(),
++                    })
++                    .unwrap();
++            } else {
++                state.observe(&WebSearchAction::Search {
++                    query: None,
++                    queries: None,
++                    sources: None,
++                });
++            }
++        }
++    }
++
++    #[test]
++    fn followup_requires_new_evidence_need_and_one_search_opportunity() {
++        let gap = Gap {
++            missing_fact: "last day's forecast".into(),
++            query: "City A November 30".into(),
++        };
++        let mut state = State::default();
++        assert!(state.request(&gap).is_err());
++        let first = WebSearchAction::Search {
++            query: Some("City A week".into()),
++            queries: None,
++            sources: None,
++        };
++        state.observe(&first);
++        assert!(
++            state
++                .request(&Gap {
++                    missing_fact: gap.missing_fact.clone(),
++                    query: " CITY A   week ".into()
++                })
++                .is_err()
++        );
++        assert!(state.request(&gap).is_ok());
++        assert!(!state.reviewing());
++        assert!(state.request(&gap).is_err());
++        state.observe(&first);
++        assert!(state.reviewing());
++        assert!(state.request(&gap).is_err());
++        assert!(
++            state
++                .request(&Gap {
++                    missing_fact: gap.missing_fact.clone(),
++                    query: "city November 30 site:example.org".into()
++                })
++                .is_ok()
++        );
++        state.reconsider();
++        assert!(state.reviewing());
++        assert!(
++            state
++                .request(&Gap {
++                    missing_fact: "City B forecast".into(),
++                    query: "City B November 30".into()
++                })
++                .is_ok()
++        );
++    }
++}
+--- a/core/src/tools/search_progress.rs
++++ b/core/src/tools/search_progress.rs
+@@ -2,6 +2,7 @@
+ //! Compare the material actually exposed at the outer tool boundary. A script
+ //! that extracts fresh chunks or produces another deliverable stays ordinary.
+ pub(crate) mod fetch_answer;
++pub(crate) mod hosted;
+ use std::collections::HashMap;
+ use std::sync::Mutex;
+ use std::sync::PoisonError;
+@@ -23,9 +24,12 @@
+     fetch: bool,
+     output_id: Option<String>,
+     empty_goal: bool,
++    pub(crate) gap_offered: bool,
++    refused_gap: bool,
+ }
+ #[derive(Default)]
+ pub(crate) struct History {
++    hosted: hosted::State,
+     delivered: HashMap<String, Value>,
+     correction_sent: bool,
+     fetch_correction: bool,
+@@ -104,7 +108,7 @@
+     }
+ 
+     pub(crate) fn output(&mut self, response: ResponseInputItem) {
+-        if self.other || self.previews.is_empty() {
++        if self.other || (self.previews.is_empty() && !self.empty_goal) {
+             self.other = true;
+             return;
+         }
+@@ -142,6 +146,20 @@
+             || body.len() > 65536
+         {
+             self.other = true;
++            return;
++        }
++        if self.previews.is_empty() && self.empty_goal {
++            // A Code Mode cell may print other material alongside a goal read.
++            // Only the unmodified, empty local status is a no-op for this check.
++            let printed = serde_json::from_str::<Value>(body.trim()).ok();
++            let value = match printed.as_ref() {
++                Some(Value::Array(values)) if values.len() == 1 => values.first(),
++                other => other,
++            };
++            self.other = !value.and_then(Value::as_object).is_some_and(|o| {
++                o.get("goal") == Some(&Value::Null)
++                    && o.iter().all(|(k, v)| matches!(k.as_str(), "goal" | "remainingTokens" | "completionBudgetReport") && v.is_null())
++            });
+             return;
+         }
+         for line in body.lines().map(str::trim).filter(|v| !v.is_empty()) {
+@@ -183,7 +201,23 @@
+         false
+     }
+     fn decide_step(&self, history: &mut History, commentary: Option<&str>) -> Next {
+-        if self.hosted_search && !self.fetch && !history.fetch_correction {
++        if history.hosted.searched {
++            let repeated = commentary.is_some() && history.hosted.last_progress.as_deref() == commentary;
++            if let Some(text) = commentary {
++                history.hosted.last_progress = (text.len() <= 16_384).then(|| text.to_owned());
++            }
++            if self.gap_offered && (self.expected > 0 || self.other) {
++                // A sibling operation in the same batch may already have filled the gap.
++                history.hosted.reconsider();
++            }
++            let no_work = self.expected == 0 && !self.other && history.hosted.reviewing();
++            let repeated_poll = history.hosted.empty_poll && self.empty_goal;
++            history.hosted.empty_poll = no_work && self.empty_goal;
++            if self.gap_offered && no_work && (self.refused_gap || repeated || repeated_poll) {
++                return Next::Finish;
++            }
++        }
++        if self.hosted_search && !self.fetch && !history.fetch_correction && !history.hosted.searched {
+             return Next::Ordinary;
+         }
+         if history.fetch_correction
+--- a/core/src/tools/spec_plan.rs
++++ b/core/src/tools/spec_plan.rs
+@@ -642,6 +642,14 @@
+ 
+ #[instrument(level = "trace", skip_all)]
+ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
++    for spec in hosted_model_tool_specs(context) {
++        if matches!(spec, ToolSpec::WebSearch { .. })
++            && crate::tools::search_progress::hosted::enabled(&context.step_context.turn)
++        {
++            planned_tools.add_with_exposure(crate::tools::search_progress::hosted::RequestFollowup, ToolExposure::DirectModelOnly);
++        }
++        planned_tools.add_hosted_spec(spec);
++    }
+     add_shell_tools(context, planned_tools);
+     add_mcp_resource_tools(context, planned_tools);
+     add_core_utility_tools(context, planned_tools);
+@@ -649,9 +657,6 @@
+     add_mcp_runtime_tools(context, planned_tools);
+     add_extension_tools(context, planned_tools);
+     add_dynamic_tools(context, planned_tools);
+-    for spec in hosted_model_tool_specs(context) {
+-        planned_tools.add_hosted_spec(spec);
+-    }
+ }
+ 
+ fn standalone_web_search_enabled(turn_context: &TurnContext) -> bool {
