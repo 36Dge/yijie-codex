@@ -1,0 +1,192 @@
+--- a/core/src/tools/handlers/mcp.rs
++++ b/core/src/tools/handlers/mcp.rs
+@@ -157,6 +157,10 @@
+             && self.tool_info.tool.name == "kimi_web_search_pro"
+         {
+             crate::tools::web_search_preview::preview(&result.tool_input, &result.result)
++        } else if self.tool_info.tool.name == "kimi_web_fetch" && self.deep_search_receipts() {
++            // Expose the business result once in default serialization. Explicit
++            // Code Mode access to content and structuredContent stays available.
++            result.result.structured_content.clone()
+         } else {
+             None
+         };
+@@ -186,13 +190,13 @@
+                 .tool
+                 .meta
+                 .as_ref()
+-                .and_then(|m| m.get("ai.yijie/searchReceiptVersion"))
++                .and_then(|m| m.get(if self.tool_info.tool.name == "kimi_web_fetch" { "ai.yijie/fetchReceiptVersion" } else { "ai.yijie/searchReceiptVersion" }))
+                 .and_then(Value::as_u64)
+                 == Some(2)
+     }
+     fn coalesces_pending_calls(&self) -> bool {
+         self.tool_info.server_name == "yijie_web"
+-            && self.tool_info.tool.name == "kimi_web_search_pro"
++            && matches!(self.tool_info.tool.name.as_ref(), "kimi_web_search_pro" | "kimi_web_fetch")
+             && self
+                 .tool_info
+                 .tool
+--- a/core/src/tools/search_progress.rs
++++ b/core/src/tools/search_progress.rs
+@@ -18,11 +18,16 @@
+     previews: Vec<(String, bool, Value)>,
+     printed: Vec<Value>,
+     other: bool,
++    pub(crate) hosted_search: bool,
++    fetch: bool,
++    empty_goal: bool,
+ }
+ #[derive(Default)]
+ pub(crate) struct History {
+     delivered: HashMap<String, Value>,
+     correction_sent: bool,
++    fetch_correction: bool,
++    last_commentary: Option<String>,
+ }
+ #[derive(Debug, PartialEq, Eq)]
+ pub(crate) enum Next {
+@@ -41,7 +46,8 @@
+     }
+ 
+     pub(crate) fn receive(&mut self, meta: Option<&Value>, preview: Option<&Value>) {
+-        let Some(fact) = meta.and_then(|v| v.get("ai.yijie/deep-search-receipt")) else {
++        let fetch_fact = meta.and_then(|v| v.get("ai.yijie/fetch-receipt"));
++        let Some(fact) = fetch_fact.or_else(|| meta.and_then(|v| v.get("ai.yijie/deep-search-receipt"))) else {
+             return;
+         };
+         let Some(view) = preview else { return };
+@@ -64,7 +70,20 @@
+             return;
+         }
+         let repeated = matches!(fact["relation"].as_str(), Some("joined" | "reused"));
++        self.fetch |= fetch_fact.is_some();
+         self.previews.push((id.to_owned(), repeated, view.clone()));
++    }
++
++    pub(crate) fn observe_goal(&mut self, response: ResponseInputItem) {
++        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
++            self.other = true;
++            return;
++        };
++        let empty = output.body.to_text().as_deref()
++            .and_then(|s| serde_json::from_str::<Value>(s).ok())
++            .is_some_and(|v| v.get("goal") == Some(&Value::Null));
++        self.empty_goal |= empty;
++        self.other |= !empty;
+     }
+ 
+     pub(crate) fn output(&mut self, response: ResponseInputItem) {
+@@ -141,6 +160,22 @@
+         }
+         false
+     }
++    fn decide_step(&self, history: &mut History, commentary: Option<&str>) -> Next {
++        if self.hosted_search && !self.fetch && !history.fetch_correction {
++            return Next::Ordinary;
++        }
++        if history.fetch_correction && self.expected == 0 && !self.other
++            && (self.empty_goal || commentary.is_some() && commentary == history.last_commentary.as_deref()) {
++            return Next::Finish;
++        }
++        let decision = self.advance(history);
++        if self.fetch && decision == Next::Correct {
++            history.fetch_correction = true;
++            history.last_commentary = commentary.map(str::to_owned);
++        }
++        decision
++    }
++
+     fn advance(&self, history: &mut History) -> Next {
+         if self.other
+             || self.previews.is_empty()
+@@ -179,13 +214,13 @@
+         Next::Correct
+     }
+ }
+-pub(crate) fn advance(step: &Mutex<Step>, turn: &TurnContext) -> Next {
++pub(crate) fn advance(step: &Mutex<Step>, turn: &TurnContext, commentary: Option<&str>) -> Next {
+     let history = turn
+         .extension_data
+         .get_or_init(|| Mutex::new(History::default()));
+     step.lock()
+         .unwrap_or_else(PoisonError::into_inner)
+-        .advance(&mut history.lock().unwrap_or_else(PoisonError::into_inner))
++        .decide_step(&mut history.lock().unwrap_or_else(PoisonError::into_inner), commentary)
+ }
+ /// Before withdrawing turn tools, honor independent work already in flight.
+ pub(crate) async fn work_is_settled(session: &Session) -> bool {
+@@ -236,7 +271,7 @@
+             expected: 1,
+             previews: vec![(id.into(), repeated, p.clone())],
+             printed: vec![p],
+-            other: false,
++            ..Default::default()
+         }
+     }
+     #[test]
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -396,7 +396,7 @@
+                         .is_some_and(|v| v.contains(super::answer_completion::MARKER))
+                 {
+                     use crate::tools::search_progress::{Next, advance};
+-                    match advance(&step_context.search_progress, &turn_context) {
++                    match advance(&step_context.search_progress, &turn_context, sampling_request_last_agent_message.as_deref()) {
+                         Next::Correct => {
+                             sess.record_conversation_items(
+                                 &turn_context,
+@@ -2203,11 +2203,13 @@
+         match event {
+             ResponseEvent::Created => {}
+             ResponseEvent::OutputItemDone(mut item) => {
+-                // Hosted actions do not enter the local tool registry.
++                if matches!(&item, ResponseItem::WebSearchCall { .. }) {
++                    tool_runtime.observe_hosted_search();
++                }
++                // Other independent provider work still prevents whole-turn finalization.
+                 independent_provider_work |= matches!(
+                     &item,
+-                    ResponseItem::WebSearchCall { .. }
+-                        | ResponseItem::ImageGenerationCall { .. }
++                    ResponseItem::ImageGenerationCall { .. }
+                         | ResponseItem::LocalShellCall { .. }
+                         | ResponseItem::ToolSearchCall { .. }
+                 );
+--- a/core/src/tools/registry.rs
++++ b/core/src/tools/registry.rs
+@@ -488,7 +488,8 @@
+ 
+         let deep = tool.deep_search_receipts();
+         let cell = crate::tools::code_mode::is_exec_tool_name(&invocation.tool_name);
+-        if !cell {
++        let goal = invocation.tool_name.name == "get_goal" && invocation.tool_name.namespace.is_none();
++        if !cell && !goal {
+             invocation
+                 .step_context
+                 .search_progress
+@@ -730,6 +731,10 @@
+                         });
+                     }
+                 }
++                if goal {
++                    invocation.step_context.search_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
++                        .observe_goal(result.result.to_response_item(&result.call_id, &result.payload));
++                }
+                 if (cell || deep)
+                     && invocation.source == crate::tools::context::ToolCallSource::Direct
+                 {
+--- a/core/src/tools/parallel.rs
++++ b/core/src/tools/parallel.rs
+@@ -62,6 +62,11 @@
+             tracker,
+             parallel_execution: Arc::new(RwLock::new(())),
+         }
++    }
++
++    pub(crate) fn observe_hosted_search(&self) {
++        self.step_context.search_progress.lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner).hosted_search = true;
+     }
+ 
+     pub(crate) fn create_diff_consumer(
