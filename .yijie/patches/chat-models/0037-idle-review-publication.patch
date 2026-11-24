@@ -1,0 +1,513 @@
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -1809,6 +1809,11 @@
+     }
+ 
+     pub(super) async fn send_event_direct(&self, turn_context: &TurnContext, msg: EventMsg) {
++        if let EventMsg::ItemCompleted(event) = &msg
++            && let TurnItem::AgentMessage(message) = &event.item
++        {
++            crate::tools::search_progress::hosted::published(turn_context, message);
++        }
+         let legacy_source = msg.clone();
+         if let EventMsg::Error(error) = &legacy_source
+             && error
+--- /dev/null
++++ b/core/src/session/public_messages/review.rs
+@@ -0,0 +1,249 @@
++//! Replay provider messages to the ordinary stream only after they can be
++//! distinguished from the last progress update already sent to this user.
++use super::{
++    PendingMessage, PrefixResult, StreamAdapter, assistant_text, prefix, project_item,
++    with_public_text,
++};
++use crate::client_common::ResponseEvent;
++use codex_protocol::models::{MessagePhase, ResponseItem};
++
++use std::sync::Arc;
++
++pub(crate) struct ReviewStream {
++    pub(crate) published: Vec<Arc<str>>,
++    decision: bool,
++    pending: Option<PendingMessage>,
++    forwarded: bool,
++}
++
++pub(crate) fn body(text: &str) -> String {
++    text.trim().replace("\r\n", "\n").replace('\r', "\n")
++}
++
++impl ReviewStream {
++    pub(crate) fn new(published: Vec<Arc<str>>, decision: bool) -> Self {
++        Self {
++            published,
++            decision,
++            pending: None,
++            forwarded: false,
++        }
++    }
++
++    fn could_repeat(&self, message: &PendingMessage) -> bool {
++        let ResponseItem::Message { phase: native, .. } = &message.added else {
++            return false;
++        };
++        if native.as_ref() == Some(&MessagePhase::FinalAnswer) {
++            return false;
++        }
++        let (phase, text) = match prefix(&message.prefix, false) {
++            PrefixResult::Pending => return true,
++            PrefixResult::Envelope { phase, body } => {
++                (native.as_ref().or(phase.as_ref()).cloned(), body)
++            }
++            PrefixResult::Plain(text) => (native.clone(), text),
++        };
++        phase == Some(MessagePhase::Commentary) && {
++            let prefix = body(text);
++            self.published
++                .iter()
++                .any(|prior| prior.starts_with(&prefix))
++        }
++    }
++
++    fn release_if_new(&mut self, public: &mut StreamAdapter) {
++        if !self.decision
++            && self.pending.as_ref().is_some_and(|m| !self.could_repeat(m))
++            && let Some(m) = self.pending.take()
++        {
++            self.forwarded = true;
++            public.push(ResponseEvent::OutputItemAdded(with_public_text(
++                &m.added, None, &m.prefix,
++            )));
++        }
++    }
++
++    fn private_or_repeated(&self, item: &ResponseItem) -> bool {
++        let projected = project_item(true, item);
++        let Some(text) = assistant_text(&projected) else {
++            return false;
++        };
++        let ResponseItem::Message { phase, .. } = projected else {
++            return false;
++        };
++        if phase == Some(MessagePhase::Commentary) {
++            let body = body(&text);
++            if self.published.iter().any(|prior| prior.as_ref() == body) {
++                return true;
++            }
++        }
++        // The control reply is private even if the provider assigns it a phase.
++        // A real, explicitly declared final or changed progress is still usable.
++        self.decision
++            && (phase.is_none()
++                || serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| {
++                    v.as_object()
++                        .is_some_and(|object| object.contains_key("next"))
++                }))
++    }
++
++    /// A returned item is persisted unchanged as provider output. It never
++    /// creates a native public start, preview, delta or completed message.
++    pub(crate) fn push(
++        &mut self,
++        event: ResponseEvent,
++        public: &mut StreamAdapter,
++    ) -> Option<ResponseItem> {
++        if !self.decision && self.published.is_empty() {
++            public.push(event);
++            return None;
++        }
++        match event {
++            ResponseEvent::OutputItemAdded(item) => {
++                self.forwarded = false;
++                self.pending = None;
++                if let Some(text) = assistant_text(&item) {
++                    self.pending = Some(PendingMessage {
++                        added: item,
++                        prefix: text,
++                    });
++                    self.release_if_new(public);
++                } else {
++                    public.push(ResponseEvent::OutputItemAdded(item));
++                }
++            }
++            ResponseEvent::OutputTextDelta(_) if self.decision => {}
++            ResponseEvent::OutputTextDelta(delta) if self.pending.is_some() => {
++                if let Some(pending) = &mut self.pending {
++                    // For a long ambiguous prefix the authoritative done item
++                    // supplies the complete text without building a second copy.
++                    if pending.prefix.len() < 16_384 {
++                        pending.prefix.push_str(&delta);
++                        self.release_if_new(public);
++                    }
++                }
++            }
++            ResponseEvent::OutputItemDone(item) => {
++                self.pending = None;
++                let already_streamed = std::mem::take(&mut self.forwarded);
++                if !already_streamed && self.private_or_repeated(&item) {
++                    return Some(item);
++                }
++                public.push(ResponseEvent::OutputItemDone(item));
++            }
++            other => public.push(other),
++        }
++        None
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_protocol::models::ContentItem;
++    fn message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
++        ResponseItem::Message {
++            id: Some("review-item".into()),
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText { text: text.into() }],
++            phase,
++            internal_chat_message_metadata_passthrough: None,
++        }
++    }
++    const COMMENT: &str = "[[yijie-public-message-v1:commentary]]\n";
++    #[test]
++    fn identical_declared_progress_never_starts_and_a_changed_tail_is_streamed_in_full() {
++        let mut public = StreamAdapter::new(true);
++        let mut review = ReviewStream::new(vec!["earlier".into(), "forecast".into()], false);
++        for tail in ["", " tomorrow"] {
++            assert!(
++                review
++                    .push(
++                        ResponseEvent::OutputItemAdded(message("", None)),
++                        &mut public
++                    )
++                    .is_none()
++            );
++            for prefix in [
++                "[[yijie-public-",
++                "message-v1:commentary]]\n",
++                "fore",
++                "cast",
++            ] {
++                assert!(
++                    review
++                        .push(ResponseEvent::OutputTextDelta(prefix.into()), &mut public)
++                        .is_none()
++                );
++                assert!(public.pop().is_none());
++            }
++            if !tail.is_empty() {
++                assert!(
++                    review
++                        .push(ResponseEvent::OutputTextDelta(tail.into()), &mut public)
++                        .is_none()
++                );
++                assert!(matches!(
++                    public.pop(),
++                    Some((ResponseEvent::OutputItemAdded(_), _))
++                ));
++                assert!(
++                    matches!(public.pop(), Some((ResponseEvent::OutputTextDelta(t),_)) if t=="forecast tomorrow")
++                );
++            }
++            let raw = message(&format!("{COMMENT}forecast{tail}"), None);
++            let withheld = review.push(ResponseEvent::OutputItemDone(raw.clone()), &mut public);
++            if tail.is_empty() {
++                assert_eq!(withheld, Some(raw));
++                assert!(public.pop().is_none());
++            } else {
++                assert!(withheld.is_none());
++                assert!(matches!(
++                    public.pop(),
++                    Some((ResponseEvent::OutputItemDone(_), _))
++                ));
++            }
++        }
++    }
++    #[test]
++    fn private_decision_and_provider_repeat_stay_private_but_a_final_keeps_its_identity() {
++        let mut review = ReviewStream::new(vec!["forecast".into()], true);
++        let mut public = StreamAdapter::new(true);
++        for (text, phase) in [
++            (r#"{"next":"answer"}"#, Some(MessagePhase::FinalAnswer)),
++            ("forecast", Some(MessagePhase::Commentary)),
++        ] {
++            let raw = message(text, phase);
++            assert_eq!(
++                review.push(ResponseEvent::OutputItemDone(raw.clone()), &mut public),
++                Some(raw)
++            );
++            assert!(public.pop().is_none());
++        }
++        let answer_json = message(r#"{"weather":"clear"}"#, Some(MessagePhase::FinalAnswer));
++        assert!(
++            review
++                .push(
++                    ResponseEvent::OutputItemDone(answer_json.clone()),
++                    &mut public
++                )
++                .is_none()
++        );
++        assert!(
++            matches!(public.pop(), Some((ResponseEvent::OutputItemDone(actual), _)) if actual == answer_json)
++        );
++        let final_item = message("forecast", Some(MessagePhase::FinalAnswer));
++        assert!(
++            review
++                .push(
++                    ResponseEvent::OutputItemDone(final_item.clone()),
++                    &mut public
++                )
++                .is_none()
++        );
++        assert!(
++            matches!(public.pop(),Some((ResponseEvent::OutputItemDone(actual),_)) if actual==final_item)
++        );
++    }
++}
+--- a/core/src/session/public_messages.rs
++++ b/core/src/session/public_messages.rs
+@@ -3,6 +3,8 @@
+ //! Only the public Item/delta projection consumes the transport declaration.
+ //! This adapter supplies an explicit continuation fact to the existing turn
+ //! loop; it owns no requests, tools, timers, budgets or recovery loop.
++pub(crate) mod review;
++
+ use std::collections::VecDeque;
+ 
+ use codex_protocol::config_types::ModeKind;
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -1183,13 +1183,13 @@
+     } else {
+         router.model_visible_specs()
+     };
+-    crate::tools::search_progress::hosted::prepare(turn_context, &mut tools, &mut input, &mut base_instructions);
++    let review_schema = crate::tools::search_progress::hosted::prepare(turn_context, &mut tools, &mut input, &mut base_instructions);
+     Prompt {
+         input,
+         tools,
+         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+         base_instructions,
+-        output_schema: turn_context.final_output_json_schema.clone(),
++        output_schema: turn_context.final_output_json_schema.clone().or(review_schema),
+         output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
+             &turn_context.session_source,
+         ),
+@@ -2124,6 +2124,9 @@
+     let mut public_message_stream =
+         super::public_messages::StreamAdapter::new(super::public_messages::enabled(&turn_context));
+     public_message_stream.defer_declared_start = strict;
++    let mut review_stream = crate::tools::search_progress::hosted::review_stream(
++        &turn_context, prompt.output_schema.as_ref(),
++    );
+     let preview_enabled = strict && super::publication::preview_enabled(&turn_context);
+     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+     let defer_streamed_turn_items_for_contributors =
+@@ -2171,7 +2174,19 @@
+                     ));
+                 }
+             };
+-            public_message_stream.push(event);
++            if matches!(&event, ResponseEvent::OutputItemAdded(ResponseItem::Message { role, .. })
++                | ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. }) if role == "assistant")
++            {
++                review_stream.published = crate::tools::search_progress::hosted::published_progress(&turn_context);
++            }
++            if let Some(raw) = review_stream.push(event, &mut public_message_stream) {
++                // Audit and model history keep the provider's original item.
++                // This private item does not establish a public delivery or defer pending mail.
++                sess.record_conversation_items(&turn_context, std::slice::from_ref(&raw)).await;
++                tool_runtime.observe_withheld_review();
++                needs_follow_up = true;
++                continue;
++            }
+             let Some(event) = public_message_stream.pop() else {
+                 continue;
+             };
+--- a/core/src/tools/parallel.rs
++++ b/core/src/tools/parallel.rs
+@@ -62,6 +62,12 @@
+             tracker,
+             parallel_execution: Arc::new(RwLock::new(())),
+         }
++    }
++
++    pub(crate) fn observe_withheld_review(&self) {
++        self.step_context.search_progress.lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .withheld_review = true;
+     }
+ 
+     pub(crate) fn observe_hosted_search(&self) {
+--- a/core/src/tools/search_progress/hosted.rs
++++ b/core/src/tools/search_progress/hosted.rs
+@@ -16,6 +16,7 @@
+ const MAX_KEYS: usize = 256;
+ const USE_RESULTS: &str = "\nWhen hosted search supplies evidence in this response, check it against each part of the user's request. Once the opening has been delivered and the evidence covers the request, give the complete sourced final_answer in this response. Do not defer it to announce a finding, poll goal status, discover a duplicate retrieval route or recheck the same facts. If a further step is necessary, retain the concrete facts and sources already established.";
+ const REVIEW: &str = "\nReview the evidence already obtained against the user's requested deliverable. If sufficient, start with [[yijie-public-message-v1:final_answer]] on its own line and deliver the complete answer now. The opening and previous progress were already sent. A source title or URL by itself does not establish what the page says. If a specific required fact is missing, read a relevant known page or request one focused follow-up search for that gap. When an available result includes source chunks, use them before fetching the same material again. Continue other genuinely unfinished work normally. Do not repeat a progress update or use another search route to reconfirm known facts.";
++const IDLE_DECISION: &str = "The user has received the progress update. The status check found no active goal. Choose the next action privately. If evidence is sufficient, or no useful retrieval remains, return the structured answer decision so the next step can deliver the supported answer. If a required fact is missing, use an available tool to read a relevant known source or request a focused search for that fact. Continue any independent work that is still needed.";
+ const ALREADY_TRIED: &str = "This gap or query was already tried. Use its result, read a relevant source, or report the remaining uncertainty in your answer.";
+ 
+ #[derive(PartialEq)]
+@@ -32,7 +33,7 @@
+     offered_need: Option<EvidenceNeed>,
+     gaps: VecDeque<EvidenceNeed>,
+     queries: VecDeque<String>,
+-    pub(super) last_progress: Option<String>,
++    published_progress: VecDeque<std::sync::Arc<str>>,
+     pub(super) empty_poll: bool,
+ }
+ 
+@@ -119,8 +120,9 @@
+         specs: &mut Vec<ToolSpec>,
+         input: &mut Vec<ResponseItem>,
+         instructions: &mut BaseInstructions,
+-    ) {
++    ) -> bool {
+         let review = self.reviewing();
++        let private_decision = review && self.empty_poll && !self.published_progress.is_empty();
+         specs.retain(|spec| match spec {
+             ToolSpec::WebSearch { .. } => !review,
+             ToolSpec::Function(f) if f.name == GAP_TOOL => review,
+@@ -131,7 +133,12 @@
+                 id: None,
+                 role: "developer".into(),
+                 content: vec![ContentItem::InputText {
+-                    text: REVIEW.trim().into(),
++                    text: if private_decision {
++                        IDLE_DECISION
++                    } else {
++                        REVIEW.trim()
++                    }
++                    .into(),
+                 }],
+                 phase: None,
+                 internal_chat_message_metadata_passthrough: None,
+@@ -139,6 +146,7 @@
+         } else {
+             instructions.text.push_str(USE_RESULTS);
+         }
++        private_decision
+     }
+ }
+ 
+@@ -171,7 +179,7 @@
+     specs: &mut Vec<ToolSpec>,
+     input: &mut Vec<ResponseItem>,
+     instructions: &mut BaseInstructions,
+-) {
++) -> Option<serde_json::Value> {
+     // These two specs are registered together only when the original provider,
+     // mode and permission configuration offers hosted search.
+     if enabled(turn)
+@@ -181,9 +189,78 @@
+         && specs
+             .iter()
+             .any(|s| matches!(s, ToolSpec::Function(f) if f.name == GAP_TOOL))
++        && with_state(turn, |state| state.prepare(specs, input, instructions))
+     {
+-        with_state(turn, |state| state.prepare(specs, input, instructions));
+-    }
++        return Some(decision_schema());
++    }
++    None
++}
++
++fn decision_schema() -> serde_json::Value {
++    serde_json::json!({
++        "type": "object",
++        "properties": {"next": {"type": "string", "enum": ["answer"]}},
++        "required": ["next"],
++        "additionalProperties": false
++    })
++}
++
++pub(crate) fn review_stream(
++    turn: &TurnContext,
++    schema: Option<&serde_json::Value>,
++) -> public_messages::review::ReviewStream {
++    let decision = enabled(turn) && schema.is_some_and(|value| *value == decision_schema());
++    public_messages::review::ReviewStream::new(published_progress(turn), decision)
++}
++
++pub(crate) fn published_progress(turn: &TurnContext) -> Vec<std::sync::Arc<str>> {
++    if !enabled(turn) {
++        return Vec::new();
++    }
++    with_state(turn, |state| {
++        if state.searched {
++            state.published_progress.iter().cloned().collect()
++        } else {
++            Vec::new()
++        }
++    })
++}
++
++pub(crate) fn published(turn: &TurnContext, message: &codex_protocol::items::AgentMessageItem) {
++    use codex_protocol::items::AgentMessageContent;
++    use codex_protocol::models::MessagePhase;
++    if message.phase != Some(MessagePhase::Commentary) || !enabled(turn) {
++        return;
++    }
++    let text: String = message
++        .content
++        .iter()
++        .map(|part| match part {
++            AgentMessageContent::Text { text } => text.as_str(),
++        })
++        .collect();
++    let body = public_messages::review::body(&text);
++    // Match full published text only. Keep the same bounded text budget as
++    // native publication and never mistake a truncated prefix for equality.
++    const BUDGET: usize = 2 * 1024 * 1024;
++    if body.is_empty()
++        || body.len() > BUDGET
++        || message.publication.as_ref().is_some_and(|p| p.truncated)
++    {
++        return;
++    }
++    with_state(turn, |state| {
++        let seen = &mut state.published_progress;
++        if seen.iter().any(|s| s.as_ref() == body) {
++            return;
++        }
++        let mut bytes: usize = seen.iter().map(|s| s.len()).sum();
++        while seen.len() >= MAX_KEYS || bytes + body.len() > BUDGET {
++            let Some(old) = seen.pop_front() else { break };
++            bytes -= old.len();
++        }
++        seen.push_back(body.into());
++    });
+ }
+ 
+ pub(crate) fn sampling_started(turn: &TurnContext) {
+--- a/core/src/tools/search_progress.rs
++++ b/core/src/tools/search_progress.rs
+@@ -25,6 +25,7 @@
+     output_id: Option<String>,
+     empty_goal: bool,
+     pub(crate) gap_offered: bool,
++    pub(crate) withheld_review: bool,
+     refused_gap: bool,
+ }
+ #[derive(Default)]
+@@ -202,10 +203,6 @@
+     }
+     fn decide_step(&self, history: &mut History, commentary: Option<&str>) -> Next {
+         if history.hosted.searched {
+-            let repeated = commentary.is_some() && history.hosted.last_progress.as_deref() == commentary;
+-            if let Some(text) = commentary {
+-                history.hosted.last_progress = (text.len() <= 16_384).then(|| text.to_owned());
+-            }
+             if self.gap_offered && (self.expected > 0 || self.other) {
+                 // A sibling operation in the same batch may already have filled the gap.
+                 history.hosted.reconsider();
+@@ -213,7 +210,7 @@
+             let no_work = self.expected == 0 && !self.other && history.hosted.reviewing();
+             let repeated_poll = history.hosted.empty_poll && self.empty_goal;
+             history.hosted.empty_poll = no_work && self.empty_goal;
+-            if self.gap_offered && no_work && (self.refused_gap || repeated || repeated_poll) {
++            if self.gap_offered && no_work && (self.refused_gap || self.withheld_review || repeated_poll) {
+                 return Next::Finish;
+             }
+         }
