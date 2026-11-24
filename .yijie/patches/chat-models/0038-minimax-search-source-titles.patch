@@ -1,0 +1,1463 @@
+diff --git a/analytics/src/analytics_client_tests.rs b/analytics/src/analytics_client_tests.rs
+--- a/analytics/src/analytics_client_tests.rs
++++ b/analytics/src/analytics_client_tests.rs
+@@ -386,6 +386,7 @@
+     codex_error_info: Option<codex_app_server_protocol::CodexErrorInfo>,
+ ) -> ServerNotification {
+     ServerNotification::TurnCompleted(TurnCompletedNotification {
++        web_search_source_titles: None,
+         thread_id: thread_id.to_string(),
+         turn: Turn {
+             id: turn_id.to_string(),
+diff --git a/app-server/src/bespoke_event_handling.rs b/app-server/src/bespoke_event_handling.rs
+--- a/app-server/src/bespoke_event_handling.rs
++++ b/app-server/src/bespoke_event_handling.rs
+@@ -1214,6 +1214,7 @@
+ }
+ 
+ struct TurnCompletionMetadata {
++    web_search_source_titles: Option<Vec<codex_protocol::items::WebSearchSourceTitle>>,
+     status: TurnStatus,
+     error: Option<TurnError>,
+     started_at: Option<i64>,
+@@ -1228,6 +1229,7 @@
+     outgoing: &ThreadScopedOutgoingMessageSender,
+ ) {
+     let notification = TurnCompletedNotification {
++        web_search_source_titles: turn_completion_metadata.web_search_source_titles,
+         thread_id: conversation_id.to_string(),
+         turn: Turn {
+             id: event_turn_id,
+@@ -1424,6 +1426,7 @@
+         conversation_id,
+         event_turn_id,
+         TurnCompletionMetadata {
++            web_search_source_titles: turn_complete_event.web_search_source_titles,
+             status,
+             error,
+             started_at: turn_summary.started_at,
+@@ -1448,6 +1451,7 @@
+         conversation_id,
+         event_turn_id,
+         TurnCompletionMetadata {
++            web_search_source_titles: None,
+             status: TurnStatus::Interrupted,
+             error: None,
+             started_at: turn_summary.started_at,
+@@ -2191,6 +2195,7 @@
+ 
+     fn turn_complete_event(turn_id: &str) -> TurnCompleteEvent {
+         TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: turn_id.to_string(),
+             last_agent_message: None,
+             completed_at: Some(TEST_TURN_COMPLETED_AT),
+diff --git a/app-server/src/in_process.rs b/app-server/src/in_process.rs
+--- a/app-server/src/in_process.rs
++++ b/app-server/src/in_process.rs
+@@ -893,6 +893,7 @@
+     fn guaranteed_delivery_helpers_cover_terminal_server_notifications() {
+         assert!(server_notification_requires_delivery(
+             &ServerNotification::TurnCompleted(TurnCompletedNotification {
++                web_search_source_titles: None,
+                 thread_id: "thread-1".to_string(),
+                 turn: Turn {
+                     id: "turn-1".to_string(),
+diff --git a/app-server-client/src/lib.rs b/app-server-client/src/lib.rs
+--- a/app-server-client/src/lib.rs
++++ b/app-server-client/src/lib.rs
+@@ -1216,6 +1216,7 @@
+ 
+     fn turn_completed_notification() -> ServerNotification {
+         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread".to_string(),
+             turn: codex_app_server_protocol::Turn {
+                 id: "turn".to_string(),
+@@ -2136,6 +2137,7 @@
+             &InProcessServerEvent::ServerNotification(
+                 codex_app_server_protocol::ServerNotification::TurnCompleted(
+                     codex_app_server_protocol::TurnCompletedNotification {
++                        web_search_source_titles: None,
+                         thread_id: "thread".to_string(),
+                         turn: codex_app_server_protocol::Turn {
+                             id: "turn".to_string(),
+diff --git a/app-server-protocol/src/protocol/thread_history.rs b/app-server-protocol/src/protocol/thread_history.rs
+--- a/app-server-protocol/src/protocol/thread_history.rs
++++ b/app-server-protocol/src/protocol/thread_history.rs
+@@ -492,6 +492,11 @@
+             return;
+         }
+ 
++        if let Some(rows) = publication.as_ref().and_then(|p| p.web_search_source_titles.as_deref())
++            && let Some(turn_id) = self.current_turn.as_ref().map(|turn| turn.id.clone())
++        {
++            self.apply_search_titles(&turn_id, rows);
++        }
+         let id = publication
+             .as_ref()
+             .map(|p| p.item_id.clone())
+@@ -598,6 +603,11 @@
+     }
+ 
+     fn handle_item_completed(&mut self, payload: &ItemCompletedEvent) {
++        if let codex_protocol::items::TurnItem::AgentMessage(msg) = &payload.item
++            && let Some(rows) = msg.publication.as_ref().and_then(|p| p.web_search_source_titles.as_deref())
++        {
++            self.apply_search_titles(&payload.turn_id, rows);
++        }
+         self.handle_materialized_item_lifecycle(&payload.turn_id, &payload.item);
+     }
+ 
+@@ -641,6 +651,36 @@
+                 self.upsert_item_in_turn_id(turn_id, item);
+             }
+         }
++    }
++
++    fn apply_search_titles(&mut self, turn_id: &str, rows: &[codex_protocol::items::WebSearchSourceTitle]) {
++        use codex_extension_items::web_search::{WebSearchAction, WebSearchSource};
++        let items = if let Some(turn) = self.current_turn.as_mut().filter(|t| t.id == turn_id) {
++            &mut turn.items
++        } else if let Some(turn) = self.turns.iter_mut().find(|t| t.id == turn_id) {
++            &mut turn.items
++        } else {
++            return;
++        };
++        let mut changed = Vec::new();
++        for item in items {
++            let ThreadItem::WebSearch(search) = item else { continue };
++            let Some(WebSearchAction::Search { sources: Some(sources), .. }) = &mut search.action else { continue };
++            let mut updated = false;
++            for source in sources {
++                if let WebSearchSource::Url { url, title } = source
++                    && title.as_deref().is_none_or(str::is_empty)
++                    && let Some(row) = rows.iter().find(|r| r.search_item_id == search.id && r.url == *url)
++                {
++                    *title = Some(row.title.clone());
++                    updated = true;
++                }
++            }
++            if updated && self.active_change_set.is_some() {
++                changed.push(item.clone());
++            }
++        }
++        for item in changed { self.record_changed_item(turn_id.to_owned(), item); }
+     }
+ 
+     fn handle_web_search_begin(&mut self, payload: &WebSearchBeginEvent) {
+@@ -1252,6 +1292,9 @@
+     }
+ 
+     fn handle_turn_complete(&mut self, payload: &TurnCompleteEvent) {
++        if let Some(rows) = payload.web_search_source_titles.as_deref() {
++            self.apply_search_titles(&payload.turn_id, rows);
++        }
+         let mark_completed = |turn: &mut PendingTurn| {
+             if matches!(turn.status, TurnStatus::Completed | TurnStatus::InProgress) {
+                 turn.status = TurnStatus::Completed;
+@@ -1794,6 +1837,7 @@
+                 review_output: None,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-1".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1852,6 +1896,7 @@
+                 completed_at_ms: 0,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-1".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1954,6 +1999,7 @@
+                 started_at_ms: 0,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn_id.to_string(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -2005,6 +2051,7 @@
+                 completed_at_ms: 1_000,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn_id.to_string(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -2057,6 +2104,7 @@
+                 completed_at_ms: 1_000,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn_id.to_string(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -2120,6 +2168,7 @@
+                 completed_at_ms: 1_000,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn_id.to_string(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -2188,6 +2237,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn_id.to_string(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -2268,6 +2318,7 @@
+                 saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
+             })),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-image".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -2631,6 +2682,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3201,6 +3253,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3243,6 +3296,7 @@
+                 status: CoreExecCommandStatus::Completed,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-b".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3299,6 +3353,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3341,6 +3396,7 @@
+                 status: CoreExecCommandStatus::Completed,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-b".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3529,6 +3585,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3551,6 +3608,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3564,6 +3622,7 @@
+                 memory_citation: None,
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-b".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3602,6 +3661,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3668,6 +3728,7 @@
+                 window_id: None,
+             }),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-compact".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3900,6 +3961,7 @@
+             }
+             items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
+                 TurnCompleteEvent {
++                    web_search_source_titles: None,
+                     turn_id: id.into(),
+                     last_agent_message: None,
+                     completed_at: None,
+@@ -3973,6 +4035,7 @@
+                 ..Default::default()
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -4038,6 +4101,7 @@
+                 }),
+             }),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -4093,6 +4157,7 @@
+             })),
+             RolloutItem::ResponseItem(hook_prompt),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -4174,6 +4239,7 @@
+                 internal_chat_message_metadata_passthrough: None,
+             }),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -4341,6 +4407,7 @@
+         )));
+         let complete_changes = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: Some(20),
+@@ -4423,6 +4490,7 @@
+                 collaboration_mode_kind: Default::default(),
+             })),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "turn-a".into(),
+                 last_agent_message: None,
+                 completed_at: Some(20),
+diff --git a/app-server-protocol/src/protocol/v2/turn.rs b/app-server-protocol/src/protocol/v2/turn.rs
+--- a/app-server-protocol/src/protocol/v2/turn.rs
++++ b/app-server-protocol/src/protocol/v2/turn.rs
+@@ -390,6 +390,9 @@
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+ pub struct TurnCompletedNotification {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub web_search_source_titles: Option<Vec<codex_protocol::items::WebSearchSourceTitle>>,
+     pub thread_id: String,
+     pub turn: Turn,
+ }
+diff --git a/codex-api/src/common.rs b/codex-api/src/common.rs
+--- a/codex-api/src/common.rs
++++ b/codex-api/src/common.rs
+@@ -75,6 +75,7 @@
+     Created,
+     SafetyBuffering(SafetyBuffering),
+     OutputItemDone(ResponseItem),
++    WebSearchSourceTitles(Vec<codex_protocol::items::WebSearchSourceTitle>),
+     OutputItemAdded(ResponseItem),
+     /// Emitted when the server includes `OpenAI-Model` on the stream response.
+     /// This can differ from the requested model when backend safety routing applies.
+diff --git a/codex-api/src/sse/responses/search_titles.rs b/codex-api/src/sse/responses/search_titles.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-api/src/sse/responses/search_titles.rs
+@@ -0,0 +1,185 @@
++//! Match titles to a provider-confirmed search membership inside one Responses stream.
++use super::ResponsesStreamEvent;
++use codex_protocol::items::WebSearchSourceTitle;
++use serde_json::Value;
++use std::collections::BTreeMap;
++
++#[derive(Default)]
++pub(super) struct ResponseTitles {
++    minimax: bool,
++    calls: BTreeMap<String, Vec<String>>,
++    citations: BTreeMap<String, Option<String>>,
++}
++
++const MAX_CALLS: usize = 32;
++const MAX_SOURCES: usize = 32;
++const MAX_UPDATES: usize = 128;
++
++impl ResponseTitles {
++    pub(super) fn observe(
++        &mut self,
++        event: &ResponsesStreamEvent,
++    ) -> Option<Vec<WebSearchSourceTitle>> {
++        let response = event.response.as_ref();
++        if let Some(model) = response
++            .and_then(|v| v.get("model"))
++            .and_then(Value::as_str)
++        {
++            self.minimax = model == "MiniMax-M3";
++        }
++        if !self.minimax {
++            return None;
++        }
++        match event.kind.as_str() {
++            "response.output_item.done" => {
++                if let Some(item) = &event.item {
++                    self.capture(item);
++                }
++            }
++            "response.completed" => {
++                if let Some(items) = response
++                    .and_then(|r| r.get("output"))
++                    .and_then(Value::as_array)
++                {
++                    for item in items {
++                        self.capture(item);
++                    }
++                }
++                let mut updates = Vec::new();
++                for (id, urls) in &self.calls {
++                    for url in urls {
++                        if let Some(Some(title)) = self.citations.get(url) {
++                            updates.push(WebSearchSourceTitle {
++                                search_item_id: id.clone(),
++                                url: url.clone(),
++                                title: title.clone(),
++                            });
++                            if updates.len() == MAX_UPDATES {
++                                return Some(updates);
++                            }
++                        }
++                    }
++                }
++                if !updates.is_empty() {
++                    return Some(updates);
++                }
++            }
++            _ => {}
++        }
++        None
++    }
++
++    fn capture(&mut self, item: &Value) {
++        match item.get("type").and_then(Value::as_str) {
++            Some("web_search_call")
++                if item.pointer("/action/type").and_then(Value::as_str) == Some("search") =>
++            {
++                let Some(id) = item
++                    .get("id")
++                    .and_then(Value::as_str)
++                    .filter(|s| !s.is_empty() && s.len() <= 512)
++                else {
++                    return;
++                };
++                let Some(rows) = item.pointer("/action/sources").and_then(Value::as_array) else {
++                    return;
++                };
++                if self.calls.len() >= MAX_CALLS && !self.calls.contains_key(id) {
++                    return;
++                }
++                let mut urls = Vec::new();
++                for row in rows.iter().take(MAX_SOURCES) {
++                    if row.get("type").and_then(Value::as_str) == Some("url")
++                        && row
++                            .get("title")
++                            .and_then(Value::as_str)
++                            .is_none_or(str::is_empty)
++                        && let Some(url) = row
++                            .get("url")
++                            .and_then(Value::as_str)
++                            .filter(|s| !s.is_empty() && s.len() <= 2048)
++                        && !urls.iter().any(|old| old == url)
++                    {
++                        urls.push(url.to_owned());
++                    }
++                }
++                self.calls.insert(id.to_owned(), urls);
++            }
++            Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
++                let Some(parts) = item.get("content").and_then(Value::as_array) else {
++                    return;
++                };
++                for part in parts {
++                    if part.get("type").and_then(Value::as_str) != Some("output_text") {
++                        continue;
++                    }
++                    let Some(rows) = part.get("annotations").and_then(Value::as_array) else {
++                        continue;
++                    };
++                    for row in rows {
++                        if row.get("type").and_then(Value::as_str) != Some("url_citation") {
++                            continue;
++                        }
++                        let Some(url) = row
++                            .get("url")
++                            .and_then(Value::as_str)
++                            .filter(|s| !s.is_empty() && s.len() <= 2048)
++                        else {
++                            continue;
++                        };
++                        let Some(title) = row
++                            .get("title")
++                            .and_then(Value::as_str)
++                            .map(str::trim)
++                            .filter(|s| !s.is_empty() && s.len() <= 2048)
++                        else {
++                            continue;
++                        };
++                        if let Some(old) = self.citations.get_mut(url) {
++                            if old.as_deref() != Some(title) {
++                                *old = None;
++                            }
++                        } else if self.citations.len() < MAX_CALLS * MAX_SOURCES {
++                            self.citations
++                                .insert(url.to_owned(), Some(title.to_owned()));
++                        }
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    fn search(id: &str, urls: &[&str]) -> Value {
++        json!({"type":"web_search_call","id":id,"action":{"type":"search","sources":urls.iter().map(|url| json!({"type":"url","url":url})).collect::<Vec<_>>()}})
++    }
++
++    #[test]
++    fn titles_require_exact_membership_and_agreement_within_a_response() {
++        let mut state = ResponseTitles::default();
++        let shared = "https://example.org/both";
++        let first = "https://example.org/first";
++        let last = "https://example.org/last";
++        let untouched = "https://example.org/other";
++        let cite = |url: &str, title: &str| json!({"type":"url_citation","url":url,"title":title});
++        let msg = json!({"type":"message","role":"assistant","content":[{"type":"output_text","annotations":[cite(shared,"Both"),cite(first,"First"),cite(last,"Title A"),cite(last,"Title B"),cite(untouched,"Other")]}]});
++        let event=serde_json::from_value(json!({"type":"response.completed","response":{"model":"MiniMax-M3","output":[search("s1",&[first,shared]),search("s2",&[shared,last]),msg]}})).unwrap();
++        let rows = state.observe(&event).unwrap();
++        assert_eq!(
++            rows.iter()
++                .map(|r| (r.search_item_id.as_str(), r.url.as_str(), r.title.as_str()))
++                .collect::<Vec<_>>(),
++            vec![
++                ("s1", first, "First"),
++                ("s1", shared, "Both"),
++                ("s2", shared, "Both")
++            ]
++        );
++    }
++}
+diff --git a/codex-api/src/sse/responses.rs b/codex-api/src/sse/responses.rs
+--- a/codex-api/src/sse/responses.rs
++++ b/codex-api/src/sse/responses.rs
+@@ -30,6 +30,8 @@
+ const OPENAI_MODEL_HEADER: &str = "openai-model";
+ const REQUEST_ID_HEADER: &str = "x-request-id";
+ const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
++
++mod search_titles;
+ 
+ pub fn spawn_response_stream(
+     stream_response: StreamResponse,
+@@ -501,6 +503,7 @@
+     let mut response_error: Option<ApiError> = None;
+     let mut last_server_model: Option<String> = None;
+     let mut deferred_arguments = DeferredFunctionArguments::default();
++    let mut search_titles = search_titles::ResponseTitles::default();
+ 
+     loop {
+         let start = Instant::now();
+@@ -588,6 +591,11 @@
+             }
+         };
+         for event in events {
++            if let Some(updates) = search_titles.observe(&event)
++                && tx_event.send(Ok(ResponseEvent::WebSearchSourceTitles(updates))).await.is_err()
++            {
++                return;
++            }
+             match process_responses_event(event) {
+                 Ok(Some(event)) => {
+                     let is_completed = matches!(event, ResponseEvent::Completed { .. });
+diff --git a/core/src/agent/control/residency_tests.rs b/core/src/agent/control/residency_tests.rs
+--- a/core/src/agent/control/residency_tests.rs
++++ b/core/src/agent/control/residency_tests.rs
+@@ -158,6 +158,7 @@
+         .send_event(
+             turn.as_ref(),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn.sub_id.clone(),
+                 last_agent_message: Some("done".to_string()),
+                 completed_at: None,
+diff --git a/core/src/agent/control_tests.rs b/core/src/agent/control_tests.rs
+--- a/core/src/agent/control_tests.rs
++++ b/core/src/agent/control_tests.rs
+@@ -348,6 +348,7 @@
+ #[tokio::test]
+ async fn on_event_updates_status_from_task_complete() {
+     let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
++        web_search_source_titles: None,
+         turn_id: "turn-1".to_string(),
+         last_agent_message: Some("done".to_string()),
+         completed_at: None,
+@@ -2024,6 +2025,7 @@
+         .send_event(
+             tester_turn.as_ref(),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: tester_turn.sub_id.clone(),
+                 last_agent_message: Some("done".to_string()),
+                 completed_at: None,
+@@ -2111,6 +2113,7 @@
+         .send_event(
+             tester_turn.as_ref(),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: tester_turn.sub_id.clone(),
+                 last_agent_message: Some("done".to_string()),
+                 completed_at: None,
+diff --git a/core/src/agent/status.rs b/core/src/agent/status.rs
+--- a/core/src/agent/status.rs
++++ b/core/src/agent/status.rs
+@@ -52,6 +52,7 @@
+ 
+     fn complete() -> EventMsg {
+         EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: "local-turn".into(),
+             last_agent_message: None,
+             completed_at: None,
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -901,9 +901,9 @@
+         } else {
+             Vec::new()
+         };
+-        // Kimi executes built-in search server-side; include its actual source
+-        // metadata without creating another tool or modifying assistant text.
+-        if model_info.slug == "kimi-k3.1-pro"
++        // Both managed providers expose per-call source URLs through this opt-in.
++        if (model_info.slug == "kimi-k3.1-pro"
++            || (model_info.slug == "MiniMax-M3" && provider.name == "MiniMax"))
+             && tools.as_ref().is_some_and(|tools| {
+                 tools.iter().any(|tool| {
+                     tool.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
+diff --git a/core/src/client_tests.rs b/core/src/client_tests.rs
+--- a/core/src/client_tests.rs
++++ b/core/src/client_tests.rs
+@@ -919,7 +919,7 @@
+         });
+     }
+     let provider = codex_api::Provider {
+-        name: "Kimi".to_string(),
++        name: if model == "MiniMax-M3" { "MiniMax" } else { "Kimi" }.to_string(),
+         base_url: "http://127.0.0.1:1/v1".to_string(),
+         query_params: None,
+         headers: Default::default(),
+@@ -984,7 +984,7 @@
+ 
+ #[test]
+ fn feat164_sources_are_not_added_to_no_search_or_other_models() {
+-    for (model, search) in [("kimi-k3.1-pro", false), ("MiniMax-M3", true)] {
++    for (model, search) in [("kimi-k3.1-pro", false), ("MiniMax-M3", false), ("other", true)] {
+         let request = feat164_request(model, search).expect("active model request");
+         assert_eq!(request.model, model);
+         assert!(
+@@ -1006,3 +1006,9 @@
+     let minimax = feat164_request("MiniMax-M3", false).expect("MiniMax request");
+     assert_eq!(minimax.include, ["reasoning.encrypted_content"]);
+ }
++
++#[test]
++fn minimax_hosted_search_includes_per_call_sources() {
++    let request = feat164_request("MiniMax-M3", true).expect("M3 request");
++    assert_eq!(request.include, ["reasoning.encrypted_content", "web_search_call.action.sources"]);
++}
+diff --git a/core/src/guardian/review_session.rs b/core/src/guardian/review_session.rs
+--- a/core/src/guardian/review_session.rs
++++ b/core/src/guardian/review_session.rs
+@@ -1184,6 +1184,7 @@
+         Event {
+             id: turn_id.to_string(),
+             msg: EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn_id.to_string(),
+                 last_agent_message: last_agent_message.map(str::to_string),
+                 completed_at: None,
+diff --git a/core/src/guardian/tests.rs b/core/src/guardian/tests.rs
+--- a/core/src/guardian/tests.rs
++++ b/core/src/guardian/tests.rs
+@@ -2215,6 +2215,7 @@
+         .send_trunk_event_raw_for_test(Event {
+             id: "stale-turn".to_string(),
+             msg: EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "stale-turn".to_string(),
+                 last_agent_message: Some(
+                     "{\"risk_level\":\"high\",\"user_authorization\":\"low\",\"outcome\":\"deny\",\"rationale\":\"stale guardian rationale\"}"
+diff --git a/core/src/session/mod.rs b/core/src/session/mod.rs
+--- a/core/src/session/mod.rs
++++ b/core/src/session/mod.rs
+@@ -1808,7 +1808,10 @@
+         }
+     }
+ 
+-    pub(super) async fn send_event_direct(&self, turn_context: &TurnContext, msg: EventMsg) {
++    pub(super) async fn send_event_direct(&self, turn_context: &TurnContext, mut msg: EventMsg) {
++        if turn_context.config.model_provider_id == "minimax" && turn_context.model_info.slug == "MiniMax-M3" {
++            publication::attach_search_titles(turn_context, &mut msg).await;
++        }
+         if let EventMsg::ItemCompleted(event) = &msg
+             && let TurnItem::AgentMessage(message) = &event.item
+         {
+diff --git a/core/src/session/publication.rs b/core/src/session/publication.rs
+--- a/core/src/session/publication.rs
++++ b/core/src/session/publication.rs
+@@ -88,6 +88,7 @@
+ impl State {
+     fn reserve(&mut self, id: &str) -> PublicMessagePublication {
+         let stamp = PublicMessagePublication {
++            web_search_source_titles: None,
+             item_id: id.to_owned(),
+             order: self.order,
+             after_item_id: self.previous.replace(id.to_owned()),
+@@ -382,6 +383,37 @@
+     }
+ }
+ 
++#[derive(Default)]
++struct PendingSearchTitles(Vec<codex_protocol::items::WebSearchSourceTitle>);
++
++pub(crate) async fn queue_search_titles(
++    turn: &TurnContext,
++    rows: Vec<codex_protocol::items::WebSearchSourceTitle>,
++) {
++    let cell = turn.extension_data.get_or_init(|| Mutex::new(PendingSearchTitles::default()));
++    let mut pending = cell.lock().await;
++    let available = 128usize.saturating_sub(pending.0.len());
++    pending.0.extend(rows.into_iter().take(available));
++}
++
++pub(crate) async fn attach_search_titles(turn: &TurnContext, event: &mut EventMsg) {
++    let target = match event {
++        EventMsg::ItemCompleted(done) => match &mut done.item {
++            TurnItem::AgentMessage(message) => message.publication.as_mut().map(|p| &mut p.web_search_source_titles),
++            _ => None,
++        },
++        EventMsg::TurnComplete(done) => Some(&mut done.web_search_source_titles),
++        _ => None,
++    };
++    if let Some(target) = target {
++        let cell = turn.extension_data.get_or_init(|| Mutex::new(PendingSearchTitles::default()));
++        let mut pending = cell.lock().await;
++        if !pending.0.is_empty() {
++            *target = Some(std::mem::take(&mut pending.0));
++        }
++    }
++}
++
+ pub(crate) async fn dispatch(sess: &Session, turn: &TurnContext, msg: EventMsg) {
+     let success =
+         !matches!(msg, EventMsg::TurnComplete(_)) || turn.terminal_error.lock().await.is_none();
+diff --git a/core/src/session/rollout_reconstruction_tests.rs b/core/src/session/rollout_reconstruction_tests.rs
+--- a/core/src/session/rollout_reconstruction_tests.rs
++++ b/core/src/session/rollout_reconstruction_tests.rs
+@@ -95,6 +95,7 @@
+     rollout_items.extend(items);
+     rollout_items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
+         codex_protocol::protocol::TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id,
+             last_agent_message: None,
+             completed_at: None,
+@@ -263,6 +264,7 @@
+         RolloutItem::TurnContext(previous_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -338,6 +340,7 @@
+         RolloutItem::ResponseItem(turn_one_assistant.clone()),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: first_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -372,6 +375,7 @@
+         RolloutItem::ResponseItem(turn_two_assistant),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: rolled_back_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -451,6 +455,7 @@
+         RolloutItem::ResponseItem(turn_one_assistant.clone()),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: first_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -548,6 +553,7 @@
+         RolloutItem::ResponseItem(turn_one_assistant.clone()),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: first_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -578,6 +584,7 @@
+         RolloutItem::ResponseItem(turn_two_assistant),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: second_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -597,6 +604,7 @@
+         RolloutItem::ResponseItem(standalone_assistant),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: standalone_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -674,6 +682,7 @@
+         RolloutItem::ResponseItem(assistant_message("turn 1 assistant")),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: first_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -695,6 +704,7 @@
+         RolloutItem::ResponseItem(assistant_reply),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: assistant_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -767,6 +777,7 @@
+         RolloutItem::ResponseItem(assistant_message("only assistant")),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: only_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -820,6 +831,7 @@
+         RolloutItem::TurnContext(previous_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: user_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -839,6 +851,7 @@
+         )),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: standalone_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -896,6 +909,7 @@
+         RolloutItem::TurnContext(previous_context_item.clone()),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: previous_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1225,6 +1239,7 @@
+         RolloutItem::TurnContext(current_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: current_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1305,6 +1320,7 @@
+         RolloutItem::TurnContext(previous_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: previous_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1417,6 +1433,7 @@
+         RolloutItem::TurnContext(previous_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: previous_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1539,6 +1556,7 @@
+         RolloutItem::TurnContext(previous_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: previous_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1576,6 +1594,7 @@
+         RolloutItem::TurnContext(current_context_item.clone()),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: current_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1666,6 +1685,7 @@
+         RolloutItem::TurnContext(previous_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: previous_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -1835,6 +1855,7 @@
+         RolloutItem::TurnContext(previous_context_item),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: previous_turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+diff --git a/core/src/session/tests.rs b/core/src/session/tests.rs
+--- a/core/src/session/tests.rs
++++ b/core/src/session/tests.rs
+@@ -3143,6 +3143,7 @@
+         RolloutItem::TurnContext(previous_context_item.clone()),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(
+             codex_protocol::protocol::TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+@@ -3343,6 +3344,7 @@
+         RolloutItem::ResponseItem(turn_one_user.clone()),
+         RolloutItem::ResponseItem(turn_one_assistant.clone()),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: first_turn_id,
+             last_agent_message: None,
+             completed_at: None,
+@@ -3372,6 +3374,7 @@
+         RolloutItem::ResponseItem(turn_two_user),
+         RolloutItem::ResponseItem(turn_two_assistant),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: rolled_back_turn_id,
+             last_agent_message: None,
+             completed_at: None,
+@@ -3461,6 +3464,7 @@
+         RolloutItem::ResponseItem(user_message("turn 1 user")),
+         RolloutItem::ResponseItem(assistant_message("turn 1 assistant")),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: first_turn_id,
+             last_agent_message: None,
+             completed_at: None,
+@@ -3485,6 +3489,7 @@
+             window_id: Some(compacted_window_id.to_string()),
+         }),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: compact_turn_id,
+             last_agent_message: None,
+             completed_at: None,
+@@ -3517,6 +3522,7 @@
+         RolloutItem::ResponseItem(user_message("turn 2 user")),
+         RolloutItem::ResponseItem(assistant_message("turn 2 assistant")),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: rolled_back_turn_id,
+             last_agent_message: None,
+             completed_at: None,
+@@ -3590,6 +3596,7 @@
+         RolloutItem::ResponseItem(user_message("turn 1 user")),
+         RolloutItem::ResponseItem(assistant_message("turn 1 assistant")),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: "turn-1".to_string(),
+             last_agent_message: None,
+             completed_at: None,
+@@ -3617,6 +3624,7 @@
+         RolloutItem::ResponseItem(user_message("turn 2 user")),
+         RolloutItem::ResponseItem(assistant_message("turn 2 assistant")),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: "turn-2".to_string(),
+             last_agent_message: None,
+             completed_at: None,
+@@ -3644,6 +3652,7 @@
+         RolloutItem::ResponseItem(user_message("turn 3 user")),
+         RolloutItem::ResponseItem(assistant_message("turn 3 assistant")),
+         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            web_search_source_titles: None,
+             turn_id: "turn-3".to_string(),
+             last_agent_message: None,
+             completed_at: None,
+diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
+--- a/core/src/session/turn.rs
++++ b/core/src/session/turn.rs
+@@ -2475,6 +2475,14 @@
+                     .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
+                     .await;
+             }
++            ResponseEvent::WebSearchSourceTitles(rows) => {
++                if turn_context.config.model_provider_id == "minimax"
++                    && turn_context.model_info.slug == "MiniMax-M3"
++                    && super::publication::enabled(&turn_context)
++                {
++                    super::publication::queue_search_titles(&turn_context, rows).await;
++                }
++            }
+             ResponseEvent::Completed {
+                 token_usage,
+                 end_turn,
+diff --git a/core/src/tasks/mod.rs b/core/src/tasks/mod.rs
+--- a/core/src/tasks/mod.rs
++++ b/core/src/tasks/mod.rs
+@@ -774,6 +774,7 @@
+             self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
+                 .await;
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: turn_context.sub_id.clone(),
+                 last_agent_message,
+                 completed_at,
+diff --git a/core/src/thread_rollout_truncation_tests.rs b/core/src/thread_rollout_truncation_tests.rs
+--- a/core/src/thread_rollout_truncation_tests.rs
++++ b/core/src/thread_rollout_truncation_tests.rs
+@@ -81,6 +81,7 @@
+ 
+ fn turn_completed(turn_id: &str) -> RolloutItem {
+     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++        web_search_source_titles: None,
+         turn_id: turn_id.to_string(),
+         last_agent_message: None,
+         completed_at: None,
+diff --git a/core/src/tools/handlers/multi_agents_tests.rs b/core/src/tools/handlers/multi_agents_tests.rs
+--- a/core/src/tools/handlers/multi_agents_tests.rs
++++ b/core/src/tools/handlers/multi_agents_tests.rs
+@@ -1557,6 +1557,7 @@
+         .send_event(
+             child_turn.as_ref(),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: child_turn.sub_id.clone(),
+                 last_agent_message: Some("done".to_string()),
+                 completed_at: None,
+@@ -2006,6 +2007,7 @@
+         .send_event(
+             first_turn.as_ref(),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: first_turn.sub_id.clone(),
+                 last_agent_message: Some("first done".to_string()),
+                 completed_at: None,
+@@ -2047,6 +2049,7 @@
+         .send_event(
+             second_turn.as_ref(),
+             EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: second_turn.sub_id.clone(),
+                 last_agent_message: Some("second done".to_string()),
+                 completed_at: None,
+diff --git a/core/src/turn_timing.rs b/core/src/turn_timing.rs
+--- a/core/src/turn_timing.rs
++++ b/core/src/turn_timing.rs
+@@ -337,6 +337,7 @@
+         | ResponseEvent::ReasoningSummaryDone { .. }
+         | ResponseEvent::ReasoningContentDelta { .. } => true,
+         ResponseEvent::Created
++        | ResponseEvent::WebSearchSourceTitles(_)
+         | ResponseEvent::ServerModel(_)
+         | ResponseEvent::ModelVerifications(_)
+         | ResponseEvent::TurnModerationMetadata(_)
+diff --git a/core/tests/suite/resume_warning.rs b/core/tests/suite/resume_warning.rs
+--- a/core/tests/suite/resume_warning.rs
++++ b/core/tests/suite/resume_warning.rs
+@@ -72,6 +72,7 @@
+             })),
+             RolloutItem::TurnContext(turn_ctx),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id,
+                 last_agent_message: None,
+                 completed_at: None,
+diff --git a/exec/src/event_processor_with_human_output_tests.rs b/exec/src/event_processor_with_human_output_tests.rs
+--- a/exec/src/event_processor_with_human_output_tests.rs
++++ b/exec/src/event_processor_with_human_output_tests.rs
+@@ -309,6 +309,7 @@
+ 
+     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+         codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -358,6 +359,7 @@
+ 
+     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+         codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -408,6 +410,7 @@
+ 
+     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+         codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -452,6 +455,7 @@
+ 
+     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+         codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -497,6 +501,7 @@
+ 
+     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+         codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+diff --git a/exec/src/event_processor_with_jsonl_output_tests.rs b/exec/src/event_processor_with_jsonl_output_tests.rs
+--- a/exec/src/event_processor_with_jsonl_output_tests.rs
++++ b/exec/src/event_processor_with_jsonl_output_tests.rs
+@@ -31,6 +31,7 @@
+ 
+     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+         codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: codex_app_server_protocol::Turn {
+                 id: "turn-1".to_string(),
+diff --git a/exec/src/lib_tests.rs b/exec/src/lib_tests.rs
+--- a/exec/src/lib_tests.rs
++++ b/exec/src/lib_tests.rs
+@@ -405,6 +405,7 @@
+ fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
+     let notification =
+         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: codex_app_server_protocol::Turn {
+                 id: "turn-1".to_string(),
+diff --git a/exec/tests/event_processor_with_json_output.rs b/exec/tests/event_processor_with_json_output.rs
+--- a/exec/tests/event_processor_with_json_output.rs
++++ b/exec/tests/event_processor_with_json_output.rs
+@@ -1116,6 +1116,7 @@
+ 
+     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1176,6 +1177,7 @@
+     ));
+     let _ = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1259,6 +1261,7 @@
+ 
+     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1294,6 +1297,7 @@
+ 
+     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1368,6 +1372,7 @@
+ 
+     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1437,6 +1442,7 @@
+ 
+     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1489,6 +1495,7 @@
+ 
+     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1539,6 +1546,7 @@
+ 
+     let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1567,6 +1575,7 @@
+ 
+     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+@@ -1622,6 +1631,7 @@
+ 
+     let failed = processor.collect_thread_events(ServerNotification::TurnCompleted(
+         TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: "turn-1".to_string(),
+diff --git a/external-agent-sessions/src/export.rs b/external-agent-sessions/src/export.rs
+--- a/external-agent-sessions/src/export.rs
++++ b/external-agent-sessions/src/export.rs
+@@ -182,6 +182,7 @@
+ 
+ fn turn_complete_item(turn_id: String, completed_at: Option<i64>) -> RolloutItem {
+     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++        web_search_source_titles: None,
+         turn_id,
+         last_agent_message: None,
+         completed_at,
+diff --git a/otel/src/events/session_telemetry.rs b/otel/src/events/session_telemetry.rs
+--- a/otel/src/events/session_telemetry.rs
++++ b/otel/src/events/session_telemetry.rs
+@@ -1203,6 +1203,7 @@
+             ResponseEvent::ServerModel(_) => "server_model".into(),
+             ResponseEvent::ModelVerifications(_) => "model_verifications".into(),
+             ResponseEvent::TurnModerationMetadata(_) => "turn_moderation_metadata".into(),
++            ResponseEvent::WebSearchSourceTitles(_) => "web_search_source_titles".into(),
+             ResponseEvent::SafetyBuffering(_) => "safety_buffering".into(),
+             ResponseEvent::ServerReasoningIncluded(_) => "server_reasoning_included".into(),
+             ResponseEvent::RateLimits(_) => "rate_limits".into(),
+diff --git a/protocol/src/items.rs b/protocol/src/items.rs
+--- a/protocol/src/items.rs
++++ b/protocol/src/items.rs
+@@ -139,7 +139,18 @@
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
++pub struct WebSearchSourceTitle {
++    pub search_item_id: String,
++    pub url: String,
++    pub title: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
+ pub struct PublicMessagePublication {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub web_search_source_titles: Option<Vec<WebSearchSourceTitle>>,
+     pub item_id: String,
+     pub order: u32,
+     pub source: PublicPhaseSource,
+diff --git a/protocol/src/protocol.rs b/protocol/src/protocol.rs
+--- a/protocol/src/protocol.rs
++++ b/protocol/src/protocol.rs
+@@ -1956,6 +1956,9 @@
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+ pub struct TurnCompleteEvent {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub web_search_source_titles: Option<Vec<crate::items::WebSearchSourceTitle>>,
+     pub turn_id: String,
+     pub last_agent_message: Option<String>,
+     /// Unix timestamp (in seconds) when the turn completed.
+diff --git a/rollout/src/persistence_metrics.rs b/rollout/src/persistence_metrics.rs
+--- a/rollout/src/persistence_metrics.rs
++++ b/rollout/src/persistence_metrics.rs
+@@ -449,6 +449,7 @@
+                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+             })),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                web_search_source_titles: None,
+                 turn_id: "ordinary-turn".into(),
+                 last_agent_message: None,
+                 completed_at: None,
+diff --git a/rollout/src/persistence_metrics_tests.rs b/rollout/src/persistence_metrics_tests.rs
+--- a/rollout/src/persistence_metrics_tests.rs
++++ b/rollout/src/persistence_metrics_tests.rs
+@@ -50,6 +50,7 @@
+ 
+ fn turn_complete(turn_id: &str) -> RolloutItem {
+     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++        web_search_source_titles: None,
+         turn_id: turn_id.to_string(),
+         last_agent_message: None,
+         completed_at: None,
+diff --git a/thread-store/src/local/mod.rs b/thread-store/src/local/mod.rs
+--- a/thread-store/src/local/mod.rs
++++ b/thread-store/src/local/mod.rs
+@@ -538,6 +538,7 @@
+                     },
+                 )),
+                 RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++                    web_search_source_titles: None,
+                     turn_id: "turn-1".to_string(),
+                     last_agent_message: None,
+                     completed_at: None,
+diff --git a/tui/src/app/pending_interactive_replay.rs b/tui/src/app/pending_interactive_replay.rs
+--- a/tui/src/app/pending_interactive_replay.rs
++++ b/tui/src/app/pending_interactive_replay.rs
+@@ -666,6 +666,7 @@
+ 
+     fn turn_completed(turn_id: &str) -> ServerNotification {
+         ServerNotification::TurnCompleted(TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: Turn {
+                 id: turn_id.to_string(),
+diff --git a/tui/src/app/tests.rs b/tui/src/app/tests.rs
+--- a/tui/src/app/tests.rs
++++ b/tui/src/app/tests.rs
+@@ -4634,6 +4634,7 @@
+     status: TurnStatus,
+ ) -> ServerNotification {
+     ServerNotification::TurnCompleted(TurnCompletedNotification {
++        web_search_source_titles: None,
+         thread_id: thread_id.to_string(),
+         turn: Turn {
+             completed_at: Some(0),
+diff --git a/tui/src/app/thread_events.rs b/tui/src/app/thread_events.rs
+--- a/tui/src/app/thread_events.rs
++++ b/tui/src/app/thread_events.rs
+@@ -410,6 +410,7 @@
+         status: TurnStatus,
+     ) -> ServerNotification {
+         ServerNotification::TurnCompleted(TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: thread_id.to_string(),
+             turn: Turn {
+                 completed_at: Some(0),
+diff --git a/tui/src/chatwidget/replay.rs b/tui/src/chatwidget/replay.rs
+--- a/tui/src/chatwidget/replay.rs
++++ b/tui/src/chatwidget/replay.rs
+@@ -37,6 +37,7 @@
+             ) {
+                 self.handle_turn_completed_notification(
+                     TurnCompletedNotification {
++                        web_search_source_titles: None,
+                         thread_id: self.thread_id.map(|id| id.to_string()).unwrap_or_default(),
+                         turn: Turn {
+                             id: turn_id,
+diff --git a/tui/src/chatwidget/tests/app_server.rs b/tui/src/chatwidget/tests/app_server.rs
+--- a/tui/src/chatwidget/tests/app_server.rs
++++ b/tui/src/chatwidget/tests/app_server.rs
+@@ -559,6 +559,7 @@
+ 
+     chat.handle_server_notification(
+         ServerNotification::TurnCompleted(TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: AppServerTurn {
+                 id: "turn-1".to_string(),
+@@ -979,6 +980,7 @@
+ 
+     chat.handle_server_notification(
+         ServerNotification::TurnCompleted(TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: "thread-1".to_string(),
+             turn: AppServerTurn {
+                 id: "turn-1".to_string(),
+diff --git a/tui/src/chatwidget/tests/helpers.rs b/tui/src/chatwidget/tests/helpers.rs
+--- a/tui/src/chatwidget/tests/helpers.rs
++++ b/tui/src/chatwidget/tests/helpers.rs
+@@ -1002,6 +1002,7 @@
+ ) {
+     chat.handle_server_notification(
+         ServerNotification::TurnCompleted(TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: chat.thread_id.map(|id| id.to_string()).unwrap_or_default(),
+             turn: app_server_turn(
+                 turn_id,
+@@ -1017,6 +1018,7 @@
+ pub(super) fn handle_turn_interrupted(chat: &mut ChatWidget, turn_id: &str) {
+     chat.handle_server_notification(
+         ServerNotification::TurnCompleted(TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: chat.thread_id.map(|id| id.to_string()).unwrap_or_default(),
+             turn: app_server_turn(
+                 turn_id,
+diff --git a/tui/src/chatwidget/tests/plan_mode.rs b/tui/src/chatwidget/tests/plan_mode.rs
+--- a/tui/src/chatwidget/tests/plan_mode.rs
++++ b/tui/src/chatwidget/tests/plan_mode.rs
+@@ -1222,6 +1222,7 @@
+ 
+     chat.handle_server_notification(
+         ServerNotification::TurnCompleted(TurnCompletedNotification {
++            web_search_source_titles: None,
+             thread_id: thread_id.to_string(),
+             turn: AppServerTurn {
+                 id: "turn-1".to_string(),
+diff --git a/tui/src/chatwidget/tests/review_mode.rs b/tui/src/chatwidget/tests/review_mode.rs
+--- a/tui/src/chatwidget/tests/review_mode.rs
++++ b/tui/src/chatwidget/tests/review_mode.rs
+@@ -1252,6 +1252,7 @@
+     chat.handle_server_notification(
+         codex_app_server_protocol::ServerNotification::TurnCompleted(
+             codex_app_server_protocol::TurnCompletedNotification {
++                web_search_source_titles: None,
+                 thread_id: "thread-1".to_string(),
+                 turn: codex_app_server_protocol::Turn {
+                     id: "turn-1".to_string(),

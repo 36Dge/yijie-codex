@@ -1,5 +1,7 @@
 # Upstream
 
+2026-11-24 · FEAT-175 · `0038-minimax-search-source-titles.patch` requests per-call URLs on the managed MiniMax-M3 Responses path. The stream matches answer titles against the exact URLs of each search in that response. Public message completion or turn completion carries bounded display metadata. Native history applies the same updates to the original search IDs. Build through `scripts/build-native-skill-marketplace.sh`.
+
 2026-11-24 · FEAT-175 · `0037-idle-review-publication.patch` follows the hosted-search overlay on the fixed upstream. An idle evidence review may return a private, schema-constrained delivery decision or invoke an existing native tool. Native publication checks complete commentary against the updates already sent for this user input. Original provider items remain available to the model and the rollout. Build with `scripts/build-native-skill-marketplace.sh`. Roll back with the previous matching Runtime and consumer pins.
 
 2026-11-24 · FEAT-175 · `0036-hosted-search-followup.patch` follows the scoped Fetch and answer-context overlays on `rust-v0.144.6`. In opted-in Kimi ordinary chat, a completed hosted search moves the next sampling request into evidence review. A native function can name a missing fact and a targeted query to make the existing hosted capability available for one more sampling request. The canonical build is `scripts/build-native-skill-marketplace.sh`. The previous artifact and its matching consumer pins support rollback after normal shutdown.
