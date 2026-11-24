@@ -78,7 +78,7 @@
                  .search_progress
 --- /dev/null
 +++ b/core/src/tools/search_progress/hosted.rs
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,373 @@
 +//! Kimi decides whether to search on the server before generating any local
 +//! tool call. Offer that capability again only for a concrete outstanding fact.
 +use super::History;
@@ -110,6 +110,7 @@
 +    pub(super) searched: bool,
 +    /// Exactly one subsequent provider sampling request may offer hosted search.
 +    pending: Option<(EvidenceNeed, String)>,
++    offered_need: Option<EvidenceNeed>,
 +    gaps: VecDeque<EvidenceNeed>,
 +    queries: VecDeque<String>,
 +    pub(super) last_progress: Option<String>,
@@ -140,7 +141,9 @@
 +            return;
 +        };
 +        self.searched = true;
-+        self.begin_request();
++        if let Some(need) = self.offered_need.take() {
++            remember(&mut self.gaps, need);
++        }
 +        for value in query.iter().chain(queries.iter().flatten()) {
 +            if value.len() <= 4096 {
 +                remember(&mut self.queries, normalized(value));
@@ -176,10 +179,12 @@
 +    }
 +
 +    fn begin_request(&mut self) {
-+        if let Some((fact, query)) = self.pending.take() {
-+            remember(&mut self.gaps, fact);
++        // Offering the capability does not prove that the provider searched.
++        // Close the exact attempt, and mark the fact searched only on its receipt.
++        self.offered_need = self.pending.take().map(|(fact, query)| {
 +            remember(&mut self.queries, query);
-+        }
++            fact
++        });
 +    }
 +
 +    pub(super) fn reviewing(&self) -> bool {
@@ -356,8 +361,7 @@
 +        };
 +        independent.name = "ordinary_work".into();
 +        let specs = vec![web, RequestFollowup.spec(), ToolSpec::Function(independent)];
-+        let mut state = State::default();
-+        for expected_review in [false, true, false] {
++        let check = |state: &State, review: bool| {
 +            let mut offered = specs.clone();
 +            let mut input = Vec::new();
 +            let mut prompt = BaseInstructions {
@@ -366,24 +370,37 @@
 +            state.prepare(&mut offered, &mut input, &mut prompt);
 +            let names: Vec<_> = offered.iter().map(ToolSpec::name).collect();
 +            assert!(names.contains(&"ordinary_work"));
-+            assert_eq!(names.contains(&GAP_TOOL), expected_review);
-+            assert_eq!(names.contains(&"web_search"), !expected_review);
-+            assert_eq!(input.len(), usize::from(expected_review));
-+            if state.searched {
-+                state
-+                    .request(&Gap {
-+                        missing_fact: "population".into(),
-+                        query: "city census".into(),
-+                    })
-+                    .unwrap();
-+            } else {
-+                state.observe(&WebSearchAction::Search {
-+                    query: None,
-+                    queries: None,
-+                    sources: None,
-+                });
-+            }
-+        }
++            assert_eq!(names.contains(&GAP_TOOL), review);
++            assert_eq!(names.contains(&"web_search"), !review);
++            assert_eq!(input.len(), usize::from(review));
++        };
++        let mut state = State::default();
++        check(&state, false);
++        state.observe(&WebSearchAction::Search {
++            query: None,
++            queries: None,
++            sources: None,
++        });
++        check(&state, true);
++        state
++            .request(&Gap {
++                missing_fact: "population".into(),
++                query: "city census".into(),
++            })
++            .unwrap();
++        check(&state, false);
++        state.begin_request();
++        check(&state, true);
++        // This time the provider returned without searching. A better query
++        // for the same still-missing fact remains admissible.
++        assert!(
++            state
++                .request(&Gap {
++                    missing_fact: "population".into(),
++                    query: "municipal statistics office population".into()
++                })
++                .is_ok()
++        );
 +    }
 +
 +    #[test]
@@ -411,6 +428,7 @@
 +        assert!(state.request(&gap).is_ok());
 +        assert!(!state.reviewing());
 +        assert!(state.request(&gap).is_err());
++        state.begin_request();
 +        state.observe(&first);
 +        assert!(state.reviewing());
 +        assert!(state.request(&gap).is_err());
