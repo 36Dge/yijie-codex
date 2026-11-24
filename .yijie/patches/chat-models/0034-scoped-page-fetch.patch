@@ -11,19 +11,28 @@
          } else {
              None
          };
-@@ -186,13 +190,13 @@
+@@ -186,13 +190,22 @@
                  .tool
                  .meta
                  .as_ref()
 -                .and_then(|m| m.get("ai.yijie/searchReceiptVersion"))
-+                .and_then(|m| m.get(if self.tool_info.tool.name == "kimi_web_fetch" { "ai.yijie/fetchReceiptVersion" } else { "ai.yijie/searchReceiptVersion" }))
++                .and_then(|m| {
++                    m.get(if self.tool_info.tool.name == "kimi_web_fetch" {
++                        "ai.yijie/fetchReceiptVersion"
++                    } else {
++                        "ai.yijie/searchReceiptVersion"
++                    })
++                })
                  .and_then(Value::as_u64)
                  == Some(2)
      }
      fn coalesces_pending_calls(&self) -> bool {
          self.tool_info.server_name == "yijie_web"
 -            && self.tool_info.tool.name == "kimi_web_search_pro"
-+            && matches!(self.tool_info.tool.name.as_ref(), "kimi_web_search_pro" | "kimi_web_fetch")
++            && matches!(
++                self.tool_info.tool.name.as_ref(),
++                "kimi_web_search_pro" | "kimi_web_fetch"
++            )
              && self
                  .tool_info
                  .tool
@@ -46,17 +55,45 @@
  }
  #[derive(Debug, PartialEq, Eq)]
  pub(crate) enum Next {
-@@ -41,7 +46,8 @@
+@@ -41,7 +46,10 @@
      }
  
      pub(crate) fn receive(&mut self, meta: Option<&Value>, preview: Option<&Value>) {
 -        let Some(fact) = meta.and_then(|v| v.get("ai.yijie/deep-search-receipt")) else {
 +        let fetch_fact = meta.and_then(|v| v.get("ai.yijie/fetch-receipt"));
-+        let Some(fact) = fetch_fact.or_else(|| meta.and_then(|v| v.get("ai.yijie/deep-search-receipt"))) else {
++        let Some(fact) =
++            fetch_fact.or_else(|| meta.and_then(|v| v.get("ai.yijie/deep-search-receipt")))
++        else {
              return;
          };
          let Some(view) = preview else { return };
-@@ -64,7 +70,20 @@
+@@ -51,20 +59,43 @@
+         else {
+             return;
+         };
++        let unavailable_fetch = fetch_fact.is_some()
++            && fact["availability"] == "unavailable"
++            && view
++                .pointer("/error/code")
++                .and_then(Value::as_str)
++                .is_some();
+         if self.previews.len() >= 64
+             || fact["version"] != 2
+-            || fact["availability"] != "available"
+-            || fact["dispatch"] != "responded"
++            || (!unavailable_fetch && fact["availability"] != "available")
++            || (!unavailable_fetch && fact["dispatch"] != "responded")
+             || (fact["outcome"] == "empty" && view["status"] != "no_matches")
+-            || !matches!(
+-                fact["outcome"].as_str(),
+-                Some("empty" | "results" | "partial")
+-            )
++            || !unavailable_fetch
++                && !matches!(
++                    fact["outcome"].as_str(),
++                    Some("empty" | "results" | "partial")
++                )
+         {
              return;
          }
          let repeated = matches!(fact["relation"].as_str(), Some("joined" | "reused"));
@@ -69,7 +106,10 @@
 +            self.other = true;
 +            return;
 +        };
-+        let empty = output.body.to_text().as_deref()
++        let empty = output
++            .body
++            .to_text()
++            .as_deref()
 +            .and_then(|s| serde_json::from_str::<Value>(s).ok())
 +            .is_some_and(|v| v.get("goal") == Some(&Value::Null));
 +        self.empty_goal |= empty;
@@ -77,7 +117,7 @@
      }
  
      pub(crate) fn output(&mut self, response: ResponseInputItem) {
-@@ -141,6 +160,22 @@
+@@ -141,6 +172,26 @@
          }
          false
      }
@@ -85,8 +125,12 @@
 +        if self.hosted_search && !self.fetch && !history.fetch_correction {
 +            return Next::Ordinary;
 +        }
-+        if history.fetch_correction && self.expected == 0 && !self.other
-+            && (self.empty_goal || commentary.is_some() && commentary == history.last_commentary.as_deref()) {
++        if history.fetch_correction
++            && self.expected == 0
++            && !self.other
++            && (self.empty_goal
++                || commentary.is_some() && commentary == history.last_commentary.as_deref())
++        {
 +            return Next::Finish;
 +        }
 +        let decision = self.advance(history);
@@ -100,7 +144,19 @@
      fn advance(&self, history: &mut History) -> Next {
          if self.other
              || self.previews.is_empty()
-@@ -179,13 +214,13 @@
+@@ -170,6 +221,11 @@
+             }
+         }
+         if !only_repeats {
++            if self.fetch {
++                history.fetch_correction = false;
++                history.correction_sent = false;
++                history.last_commentary = None;
++            }
+             return Next::Ordinary;
+         }
+         if history.correction_sent {
+@@ -179,13 +235,16 @@
          Next::Correct
      }
  }
@@ -112,19 +168,61 @@
      step.lock()
          .unwrap_or_else(PoisonError::into_inner)
 -        .advance(&mut history.lock().unwrap_or_else(PoisonError::into_inner))
-+        .decide_step(&mut history.lock().unwrap_or_else(PoisonError::into_inner), commentary)
++        .decide_step(
++            &mut history.lock().unwrap_or_else(PoisonError::into_inner),
++            commentary,
++        )
  }
  /// Before withdrawing turn tools, honor independent work already in flight.
  pub(crate) async fn work_is_settled(session: &Session) -> bool {
-@@ -236,7 +271,7 @@
+@@ -236,9 +295,44 @@
              expected: 1,
              previews: vec![(id.into(), repeated, p.clone())],
              printed: vec![p],
 -            other: false,
+-        }
+-    }
 +            ..Default::default()
-         }
-     }
++        }
++    }
++    #[test]
++    fn hosted_search_does_not_mask_repeated_fetch_material() {
++        let mut history = History::default();
++        let mut first = search("page", false);
++        first.fetch = true;
++        first.hosted_search = true;
++        assert_eq!(
++            first.decide_step(&mut history, Some("forecast")),
++            Next::Ordinary
++        );
++        let mut repeated = search("page", true);
++        repeated.fetch = true;
++        repeated.hosted_search = true;
++        assert_eq!(
++            repeated.decide_step(&mut history, Some("forecast")),
++            Next::Correct
++        );
++        let mut extra = search("other-page", false);
++        extra.fetch = true;
++        assert_eq!(
++            extra.decide_step(&mut history, Some("another source")),
++            Next::Ordinary
++        );
++        assert_eq!(
++            repeated.decide_step(&mut history, Some("forecast")),
++            Next::Correct
++        );
++        let no_goal = Step {
++            empty_goal: true,
++            hosted_search: true,
++            ..Step::default()
++        };
++        assert_eq!(no_goal.decide_step(&mut history, None), Next::Finish);
++    }
++
      #[test]
+     fn bounded_search_correction_keeps_changed_work_and_material_reads() {
+         let mut h = History::default();
 --- a/core/src/session/turn.rs
 +++ b/core/src/session/turn.rs
 @@ -396,7 +396,7 @@
@@ -178,15 +276,33 @@
                  {
 --- a/core/src/tools/parallel.rs
 +++ b/core/src/tools/parallel.rs
-@@ -62,6 +62,11 @@
+@@ -62,6 +62,14 @@
              tracker,
              parallel_execution: Arc::new(RwLock::new(())),
          }
 +    }
 +
 +    pub(crate) fn observe_hosted_search(&self) {
-+        self.step_context.search_progress.lock()
-+            .unwrap_or_else(std::sync::PoisonError::into_inner).hosted_search = true;
++        self.step_context
++            .search_progress
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .hosted_search = true;
      }
  
      pub(crate) fn create_diff_consumer(
+--- a/code-mode/src/runtime/callbacks.rs
++++ b/code-mode/src/runtime/callbacks.rs
+@@ -61,8 +61,10 @@
+     let id = format!("tool-{}", state.next_tool_call_id);
+     state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
+     let event_tx = state.event_tx.clone();
+-    let deep_search =
+-        state.enabled_tools[tool_index].global_name == "mcp__yijie_web__kimi_web_search_pro";
++    let deep_search = matches!(
++        state.enabled_tools[tool_index].global_name.as_str(),
++        "mcp__yijie_web__kimi_web_search_pro" | "mcp__yijie_web__kimi_web_fetch"
++    );
+     state
+         .pending_tool_calls
+         .insert(id.clone(), (resolver, deep_search));
