@@ -131,7 +131,7 @@ diff --git a/app-server-protocol/src/protocol/thread_history.rs b/app-server-pro
 +            let mut updated = false;
 +            for source in sources {
 +                if let WebSearchSource::Url { url, title } = source
-+                    && title.as_deref().is_none_or(str::is_empty)
++                    && title.as_deref().is_none_or(|s| s.trim().is_empty())
 +                    && let Some(row) = rows.iter().find(|r| r.search_item_id == search.id && r.url == *url)
 +                {
 +                    *title = Some(row.title.clone());
@@ -384,7 +384,7 @@ diff --git a/codex-api/src/sse/responses/search_titles.rs b/codex-api/src/sse/re
 new file mode 100644
 --- /dev/null
 +++ b/codex-api/src/sse/responses/search_titles.rs
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,220 @@
 +//! Match titles to a provider-confirmed search membership inside one Responses stream.
 +use super::ResponsesStreamEvent;
 +use codex_protocol::items::WebSearchSourceTitle;
@@ -395,12 +395,12 @@ new file mode 100644
 +pub(super) struct ResponseTitles {
 +    minimax: bool,
 +    calls: BTreeMap<String, Vec<String>>,
++    source_count: usize,
 +    citations: BTreeMap<String, Option<String>>,
 +}
 +
-+const MAX_CALLS: usize = 32;
++const MAX_SOURCE_PAIRS: usize = 4096;
 +const MAX_SOURCES: usize = 32;
-+const MAX_UPDATES: usize = 128;
 +
 +impl ResponseTitles {
 +    pub(super) fn observe(
@@ -441,9 +441,6 @@ new file mode 100644
 +                                url: url.clone(),
 +                                title: title.clone(),
 +                            });
-+                            if updates.len() == MAX_UPDATES {
-+                                return Some(updates);
-+                            }
 +                        }
 +                    }
 +                }
@@ -471,16 +468,18 @@ new file mode 100644
 +                let Some(rows) = item.pointer("/action/sources").and_then(Value::as_array) else {
 +                    return;
 +                };
-+                if self.calls.len() >= MAX_CALLS && !self.calls.contains_key(id) {
-+                    return;
-+                }
++                let previous = self.calls.get(id).map_or(0, Vec::len);
++                let capacity = MAX_SOURCE_PAIRS.saturating_sub(self.source_count - previous);
 +                let mut urls = Vec::new();
 +                for row in rows.iter().take(MAX_SOURCES) {
++                    if urls.len() == capacity {
++                        break;
++                    }
 +                    if row.get("type").and_then(Value::as_str) == Some("url")
 +                        && row
 +                            .get("title")
 +                            .and_then(Value::as_str)
-+                            .is_none_or(str::is_empty)
++                            .is_none_or(|s| s.trim().is_empty())
 +                        && let Some(url) = row
 +                            .get("url")
 +                            .and_then(Value::as_str)
@@ -490,7 +489,12 @@ new file mode 100644
 +                        urls.push(url.to_owned());
 +                    }
 +                }
-+                self.calls.insert(id.to_owned(), urls);
++                self.source_count = self.source_count - previous + urls.len();
++                if urls.is_empty() {
++                    self.calls.remove(id);
++                } else {
++                    self.calls.insert(id.to_owned(), urls);
++                }
 +            }
 +            Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
 +                let Some(parts) = item.get("content").and_then(Value::as_array) else {
@@ -526,7 +530,7 @@ new file mode 100644
 +                            if old.as_deref() != Some(title) {
 +                                *old = None;
 +                            }
-+                        } else if self.citations.len() < MAX_CALLS * MAX_SOURCES {
++                        } else if self.citations.len() < MAX_SOURCE_PAIRS {
 +                            self.citations
 +                                .insert(url.to_owned(), Some(title.to_owned()));
 +                        }
@@ -568,6 +572,37 @@ new file mode 100644
 +                ("s2", shared, "Both")
 +            ]
 +        );
++    }
++    #[test]
++    fn all_fourteen_searches_keep_their_ten_titles() {
++        let mut output = Vec::new();
++        let mut notes = Vec::new();
++        for call in 0..14 {
++            let urls: Vec<_> = (0..10)
++                .map(|source| format!("https://example.org/city/{call}/{source}"))
++                .collect();
++            let borrowed: Vec<_> = urls.iter().map(String::as_str).collect();
++            output.push(search(&format!("search-{call}"), &borrowed));
++            notes.extend(
++                urls.into_iter()
++                    .map(|url| json!({"type":"url_citation","url":url,"title":"城市资料"})),
++            );
++        }
++        output.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","annotations":notes}]}));
++        let event = serde_json::from_value(
++            json!({"type":"response.completed","response":{"model":"MiniMax-M3","output":output}}),
++        )
++        .unwrap();
++        let rows = ResponseTitles::default().observe(&event).unwrap();
++        assert_eq!(rows.len(), 140);
++        for call in 0..14 {
++            assert_eq!(
++                rows.iter()
++                    .filter(|row| row.search_item_id == format!("search-{call}"))
++                    .count(),
++                10
++            );
++        }
 +    }
 +}
 diff --git a/codex-api/src/sse/responses.rs b/codex-api/src/sse/responses.rs
@@ -746,12 +781,15 @@ diff --git a/core/src/session/publication.rs b/core/src/session/publication.rs
              item_id: id.to_owned(),
              order: self.order,
              after_item_id: self.previous.replace(id.to_owned()),
-@@ -382,6 +383,37 @@
+@@ -382,6 +383,49 @@
      }
  }
  
 +#[derive(Default)]
-+struct PendingSearchTitles(Vec<codex_protocol::items::WebSearchSourceTitle>);
++struct PendingSearchTitles {
++    rows: Vec<codex_protocol::items::WebSearchSourceTitle>,
++    bytes: usize,
++}
 +
 +pub(crate) async fn queue_search_titles(
 +    turn: &TurnContext,
@@ -759,8 +797,17 @@ diff --git a/core/src/session/publication.rs b/core/src/session/publication.rs
 +) {
 +    let cell = turn.extension_data.get_or_init(|| Mutex::new(PendingSearchTitles::default()));
 +    let mut pending = cell.lock().await;
-+    let available = 128usize.saturating_sub(pending.0.len());
-+    pending.0.extend(rows.into_iter().take(available));
++    // Bound optional display data by wire size. A long ordinary research response
++    // can have hundreds of short source rows spread over distinct searches.
++    for row in rows {
++        let Ok(bytes) = serde_json::to_vec(&row) else { continue };
++        let size = bytes.len() + 1;
++        if pending.rows.len() >= 4096 || pending.bytes.saturating_add(size) > 4 * 1024 * 1024 {
++            break;
++        }
++        pending.bytes += size;
++        pending.rows.push(row);
++    }
 +}
 +
 +pub(crate) async fn attach_search_titles(turn: &TurnContext, event: &mut EventMsg) {
@@ -775,8 +822,8 @@ diff --git a/core/src/session/publication.rs b/core/src/session/publication.rs
 +    if let Some(target) = target {
 +        let cell = turn.extension_data.get_or_init(|| Mutex::new(PendingSearchTitles::default()));
 +        let mut pending = cell.lock().await;
-+        if !pending.0.is_empty() {
-+            *target = Some(std::mem::take(&mut pending.0));
++        if !pending.rows.is_empty() {
++            *target = Some(std::mem::take(&mut *pending).rows);
 +        }
 +    }
 +}
@@ -1033,14 +1080,13 @@ diff --git a/core/src/session/tests.rs b/core/src/session/tests.rs
 diff --git a/core/src/session/turn.rs b/core/src/session/turn.rs
 --- a/core/src/session/turn.rs
 +++ b/core/src/session/turn.rs
-@@ -2475,6 +2475,14 @@
+@@ -2475,6 +2475,13 @@
                      .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
                      .await;
              }
 +            ResponseEvent::WebSearchSourceTitles(rows) => {
 +                if turn_context.config.model_provider_id == "minimax"
 +                    && turn_context.model_info.slug == "MiniMax-M3"
-+                    && super::publication::enabled(&turn_context)
 +                {
 +                    super::publication::queue_search_titles(&turn_context, rows).await;
 +                }
