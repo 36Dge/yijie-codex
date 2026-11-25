@@ -16,6 +16,7 @@ def reviewed_patches(patch_dir, profile="input-only"):
         "0035-fetch-answer-context.patch", "0036-hosted-search-followup.patch",
         "0037-idle-review-publication.patch",
         "0038-minimax-search-source-titles.patch",
+        "0039-empty-assistant-replay.patch",
     )]
     if any(not patch.is_file() or patch.is_symlink() for patch in patches):
         raise SystemExit("Reviewed local Runtime patch unavailable")

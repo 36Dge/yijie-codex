@@ -1,0 +1,162 @@
+diff --git a/core/src/client.rs b/core/src/client.rs
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -583,6 +583,9 @@
+             text,
+             ..
+         } = request;
++        if input.is_empty() {
++            return Ok(Vec::new());
++        }
+         self.prepare_response_items_for_request(&mut input, /*store*/ false);
+         let payload = ApiCompactionInput {
+             model: &model,
+@@ -930,6 +933,7 @@
+         );
+         let prompt_cache_key = Some(self.prompt_cache_key());
+         let service_tier = model_info.service_tier_for_request(service_tier);
++        omit_empty_assistant_messages(&mut input);
+         let request = ResponsesApiRequest {
+             model: model_info.slug.clone(),
+             instructions,
+@@ -2479,6 +2483,28 @@
+ #[path = "client_tests.rs"]
+ mod tests;
+-
++
++// Some providers emit empty assistant text between reasoning or tool items and reject
++// it when replayed. Filter only the request copy, keeping the original transcript.
++fn omit_empty_assistant_messages(input: &mut Vec<ResponseItem>) {
++    input.retain_mut(|item| {
++        let ResponseItem::Message { role, content, .. } = item else {
++            return true;
++        };
++        if role != "assistant" {
++            return true;
++        }
++        content.retain(|part| {
++            !matches!(part, ContentItem::InputText { text } | ContentItem::OutputText { text } if text.is_empty())
++        });
++        content.iter().any(|part| match part {
++            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
++                !text.trim().is_empty()
++            }
++            ContentItem::InputImage { .. } => true,
++        })
++    });
++}
++
+ // Only the provider request clone is projected. Native V2 history, mailbox,
+ // scheduler and turn boundaries continue to use ResponseItem::AgentMessage.
+ fn project_native_agent_messages(input: &mut [ResponseItem]) -> Result<()> {
+diff --git a/core/src/client_tests.rs b/core/src/client_tests.rs
+--- a/core/src/client_tests.rs
++++ b/core/src/client_tests.rs
+@@ -899,11 +899,6 @@
+     model: &str,
+     search: bool,
+ ) -> codex_protocol::error::Result<codex_api::ResponsesApiRequest> {
+-    let client = test_model_client(SessionSource::Cli);
+-    let mut info = test_model_info();
+-    info.slug = model.to_string();
+-    info.supports_reasoning_summaries = true;
+-    info.default_reasoning_level = Some(ReasoningEffort::Max);
+     let mut prompt = Prompt::default();
+     prompt
+         .input
+@@ -918,6 +913,19 @@
+             search_content_types: None,
+         });
+     }
++    request_for_profile(model, ReasoningEffort::Max, &prompt)
++}
++
++fn request_for_profile(
++    model: &str,
++    effort: ReasoningEffort,
++    prompt: &Prompt,
++) -> codex_protocol::error::Result<codex_api::ResponsesApiRequest> {
++    let client = test_model_client(SessionSource::Cli);
++    let mut info = test_model_info();
++    info.slug = model.to_string();
++    info.supports_reasoning_summaries = true;
++    info.default_reasoning_level = Some(effort.clone());
+     let provider = codex_api::Provider {
+         name: if model == "MiniMax-M3" { "MiniMax" } else { "Kimi" }.to_string(),
+         base_url: "http://127.0.0.1:1/v1".to_string(),
+@@ -941,9 +949,9 @@
+     );
+     client.build_responses_request(
+         &provider,
+-        &prompt,
++        prompt,
+         &info,
+-        Some(ReasoningEffort::Max),
++        Some(effort),
+         codex_protocol::config_types::ReasoningSummary::None,
+         None,
+         &metadata,
+@@ -1012,3 +1020,63 @@
+     let request = feat164_request("MiniMax-M3", true).expect("M3 request");
+     assert_eq!(request.include, ["reasoning.encrypted_content", "web_search_call.action.sources"]);
+ }
++
++#[test]
++fn empty_assistant_replay_is_filtered_on_every_model_request() {
++    use serde_json::json;
++
++    let expected: Vec<ResponseItem> = serde_json::from_value(json!([
++        {"type":"message","role":"user","content":[{"type":"input_text","text":"350ml"}]},
++        {"type":"reasoning","summary":[{"type":"summary_text","text":"Check length"}]},
++        {"type":"function_call","name":"exec","arguments":"{}","call_id":"read"},
++        {"type":"function_call_output","call_id":"read","output":""},
++        {"type":"message","role":"developer","content":[{"type":"input_text","text":""}]},
++        {"type":"message","role":"assistant","phase":"commentary","content":[
++            {"type":"output_text","text":"  title"},
++            {"type":"output_text","text":"\n"},
++            {"type":"output_text","text":"body  "}
++        ]},
++        {"type":"message","role":"assistant","content":[{"type":"input_image","image_url":"image-ref"}]}
++    ])).unwrap();
++    let mut history = expected.clone();
++    for index in [5, 6] {
++        let ResponseItem::Message { content, .. } = &mut history[index] else {
++            panic!("expected an assistant message");
++        };
++        content.insert(
++            0,
++            ContentItem::InputText {
++                text: String::new(),
++            },
++        );
++        content.push(ContentItem::OutputText {
++            text: String::new(),
++        });
++    }
++    history.splice(
++        2..2,
++        [
++            output_message("empty", ""),
++            output_message("whitespace", " \n\t"),
++            serde_json::from_value(json!({"type":"message","role":"assistant","content":[]}))
++                .unwrap(),
++        ],
++    );
++    let prompt = Prompt {
++        input: history.clone(),
++        ..Default::default()
++    };
++    for (model, effort) in [
++        ("kimi-k3.1-pro", ReasoningEffort::High),
++        ("kimi-k3.1-pro", ReasoningEffort::Max),
++        ("MiniMax-M3", ReasoningEffort::High),
++        ("another-responses-model", ReasoningEffort::High),
++    ] {
++        let request = request_for_profile(model, effort.clone(), &prompt).unwrap();
++        let body = serde_json::to_value(request).unwrap();
++        assert_eq!(body["model"], model);
++        assert_eq!(body["reasoning"]["effort"], json!(effort));
++        assert_eq!(body["input"], json!(expected), "{model}, {effort:?}");
++        assert_eq!(prompt.input, history);
++    }
++}

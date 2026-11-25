@@ -1,5 +1,9 @@
 # Upstream
 
+## 2026-11-25 · Responses 历史输入
+
+日常候选在 0038 之后重放 `0039-empty-assistant-replay.patch`。所有使用共用 Responses 请求构造器的模型均在发送前整理助手文本，原始历史可继续用于恢复与审计。沿用固定上游和 `scripts/build-native-skill-marketplace.sh` 的内容寻址构建流程。
+
 2026-11-24 · FEAT-175 · `0038-minimax-search-source-titles.patch` requests per-call URLs on the managed MiniMax-M3 Responses path. The stream matches answer titles against the exact URLs of each search in that response. Public message completion or turn completion carries bounded display metadata. Native history applies the same updates to the original search IDs. Build through `scripts/build-native-skill-marketplace.sh`.
 
 2026-11-24 · FEAT-175 · `0037-idle-review-publication.patch` follows the hosted-search overlay on the fixed upstream. An idle evidence review may return a private, schema-constrained delivery decision or invoke an existing native tool. Native publication checks complete commentary against the updates already sent for this user input. Original provider items remain available to the model and the rollout. Build with `scripts/build-native-skill-marketplace.sh`. Roll back with the previous matching Runtime and consumer pins.
